@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}手动 Media — {{ series }}{% endblock %}
+{% block content %}
+<h1>📁 手动 Media: {{ series }}</h1>
+
+{% if error %}
+<div class="alert alert-error" style="color:red;border:1px solid red;padding:0.5em;margin:1em 0">
+  ❌ {{ error }}
+</div>
+{% endif %}
+{% if success %}
+<div class="alert alert-success" style="color:green;border:1px solid green;padding:0.5em;margin:1em 0">
+  ✅ Media 已关联
+</div>
+{% endif %}
+
+<div class="form-section">
+  <h2>📊 概览</h2>
+  <table>
+    <tr><th>属性</th><th>值</th></tr>
+    <tr><td>音频质量</td><td><code>{{ quality }}</code></td></tr>
+    <tr><td>metadata JSON 数</td><td>{{ total_meta }}</td></tr>
+    <tr><td>缺失 media 数</td><td>{{ missing_count }}</td></tr>
+  </table>
+</div>
+
+{% if missing %}
+<div class="form-section">
+  <h2>⚠️ 缺失 media（前 50 条）</h2>
+  <p class="text-muted">以下 BVID 有 metadata 但缺少对应的 media 文件。</p>
+  <table class="table">
+    <thead><tr><th>BVID</th><th>标题</th></tr></thead>
+    <tbody>
+    {% for m in missing %}
+      <tr><td><code>{{ m.bvid }}</code></td><td>{{ m.title }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<div class="form-section">
+  <h2>📎 关联 Media</h2>
+  <p class="text-muted">将服务器上已有的 MP3 文件关联到缺失的 BVID。</p>
+  <form method="POST" action="/series/{{ series }}/manual-media">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-group">
+      <label for="bvid">BVID</label>
+      <input type="text" id="bvid" name="bvid" class="form-control" placeholder="BV1xx..." required>
+    </div>
+    <div class="form-group">
+      <label for="server_path">服务器路径</label>
+      <input type="text" id="server_path" name="server_path" class="form-control" placeholder="/data/manual-media/..." required>
+      <small class="text-muted" style="display:block;color:#888;margin-top:0.3em">
+        允许目录：{{ allowed_dirs | join("、") }}
+      </small>
+    </div>
+    <div class="form-group">
+      <label>
+        <input type="checkbox" name="replace" value="1">
+        覆盖已有文件
+      </label>
+    </div>
+    <button type="submit" class="btn btn-primary">📎 关联</button>
+  </form>
+</div>
+
+<div class="actions">
+  <a href="/series/{{ series }}/preview" class="btn btn-outline">🔍 干跑预览</a>
+  <a href="/series/{{ series }}/filters" class="btn btn-outline">过滤规则</a>
+  <a href="/series" class="btn btn-outline">📋 系列列表</a>
+</div>
+{% endblock %}

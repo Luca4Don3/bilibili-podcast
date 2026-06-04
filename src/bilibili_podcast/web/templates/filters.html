@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}过滤规则 — {{ series }}{% endblock %}
+{% block content %}
+<h1>过滤规则: {{ series }}</h1>
+<p class="text-muted">配置内容过滤规则：付费、关键词、BVID、时长等。保存后可执行干跑预览。</p>
+
+{% if rules_detail %}
+<h2>📋 当前规则列表</h2>
+<table class="table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>类型</th>
+      <th>值</th>
+      <th>状态</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rules_detail %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td><code>{{ r.rule_type }}</code></td>
+      <td>{{ r.value }}</td>
+      <td>{% if r.enabled %}✅ 启用{% else %}❌ 禁用{% endif %}</td>
+      <td>
+        <form method="POST" action="/series/{{ series }}/filters/toggle" style="display:inline;">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="rule_id" value="{{ r.id }}">
+          <button type="submit" class="btn btn-sm btn-outline">
+            {% if r.enabled %}禁用{% else %}启用{% endif %}
+          </button>
+        </form>
+        <form method="POST" action="/series/{{ series }}/filters/delete" style="display:inline;" onclick="return confirm('确定删除规则 #{{ r.id }}?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="rule_id" value="{{ r.id }}">
+          <button type="submit" class="btn btn-sm btn-danger">删除</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<div class="form-section">
+  <form method="POST" action="/series/{{ series }}/filters">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <h2>💰 付费与预览</h2>
+    <div class="form-row">
+      <div class="inline-group" style="margin-top:0.5rem;">
+        <input type="checkbox" name="exclude_paid" value="true" {% if filters.exclude_paid %}checked{% endif %}>
+        <label style="margin:0;font-weight:400;">排除付费/充电内容</label>
+      </div>
+    </div>
+    <div class="form-row">
+      <div>
+        <label>付费预览 (paid_preview)</label>
+        <select name="paid_preview_enabled">
+          <option value="false" {% if not paid_preview.enabled %}selected{% endif %}>关闭</option>
+          <option value="true" {% if paid_preview.enabled %}selected{% endif %}>开启</option>
+        </select>
+        <div class="subtitle">开启后，付费抢先看视频不会永久排除，几天后重新检查</div>
+      </div>
+      <div>
+        <label>重试天数 (retry_after_days)</label>
+        <input type="number" name="retry_after_days" value="{{ paid_preview.retry_after_days or 4 }}" min="1">
+      </div>
+    </div>
+
+    <h2>⏱ 时长过滤</h2>
+    <div class="form-row">
+      <div>
+        <label>最小时长 (秒)</label>
+        <input type="number" name="min_duration_seconds" value="{{ sync.min_duration_seconds if sync else 0 }}" min="0">
+        <div class="subtitle">0 = 不限</div>
+      </div>
+      <div>
+        <label>最大时长 (秒)</label>
+        <input type="number" name="max_duration_seconds" value="{{ sync.max_duration_seconds if sync else 0 }}" min="0">
+        <div class="subtitle">0 = 不限。当 max <= min 时跳过时长过滤</div>
+      </div>
+    </div>
+
+    <h2>📝 关键词黑名单</h2>
+    <p class="text-muted">标题或简介包含任一关键词则排除。每行一个。</p>
+    <textarea name="exclude_keywords" rows="4" placeholder="广告&#10;推广">{{ filters.exclude_keywords | join('\n') }}</textarea>
+
+    <h2>✅ 关键词白名单</h2>
+    {% if filters.include_keywords %}
+    <div class="error" style="margin-bottom:0.5rem;">
+      ⚠️ 白名单非空时，<strong>仅保留</strong>标题或简介命中至少一个关键词的视频。其他全部排除。
+    </div>
+    {% else %}
+    <div class="info" style="margin-bottom:0.5rem;">
+      💡 白名单为空 = 不启用白名单模式。填入关键词后将仅保留命中项。
+    </div>
+    {% endif %}
+    <textarea name="include_keywords" rows="4" placeholder="非空时仅保留命中项&#10;每行一个关键词">{{ filters.include_keywords | join('\n') }}</textarea>
+
+    <h2>📢 广告关键词</h2>
+    <p class="text-muted">与普通黑名单分开管理，避免误把广告列表当成黑名单。</p>
+    <textarea name="advertisement_keywords" rows="4" placeholder="合作&#10;赞助">{{ filters.advertisement_keywords | join('\n') }}</textarea>
+
+    <h2>🚫 排除 BVID</h2>
+    <p class="text-muted">精确 BV 号排除。每行一个。</p>
+    <textarea name="exclude_bvids" rows="4" placeholder="BV1xx12345&#10;BV1yy67890">{{ filters.exclude_bvids | join('\n') }}</textarea>
+
+    <h2>📢 广告 BVID</h2>
+    <p class="text-muted">广告 BV 号黑名单。每行一个。</p>
+    <textarea name="advertisement_bvids" rows="4" placeholder="BV1zz99999">{{ filters.advertisement_bvids | join('\n') }}</textarea>
+
+    <div class="actions" style="margin-top:1.5rem;">
+      <button type="submit" class="btn btn-success">💾 保存</button>
+      <a href="/series/{{ series }}/preview" class="btn btn-outline">🔍 干跑预览</a>
+      <a href="/series/{{ series }}/sync" class="btn btn-outline">同步策略</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

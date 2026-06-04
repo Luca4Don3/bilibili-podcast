@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}干跑预览 — {{ series }}{% endblock %}
+{% block content %}
+<h1>干跑预览: {{ series }}</h1>
+
+<div class="actions">
+  <form method="POST" action="/series/{{ series }}/preview" style="display:inline;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn">▶ 执行干跑</button>
+  </form>
+  <a href="/series/{{ series }}" class="btn btn-outline">编辑基础信息</a>
+  <a href="/series/{{ series }}/filters" class="btn btn-outline">过滤规则</a>
+  <a href="/series/{{ series }}/sync" class="btn btn-outline">同步策略</a>
+</div>
+
+<div class="stats">
+  {% if sync_state.last_success_at %}
+  <div class="stat-card">
+    <div class="num">{{ sync_state.last_success_at | timestamp_to_str }}</div>
+    <div class="label">上次成功同步</div>
+  </div>
+  {% endif %}
+  {% if sync_state.rate_limited_until and sync_state.rate_limited_until > 0 %}
+  <div class="stat-card">
+    <div class="num" style="color:#e74c3c;">{{ sync_state.rate_limited_until | timestamp_to_str }}</div>
+    <div class="label">限流至</div>
+  </div>
+  {% endif %}
+  {% if cron_schedules %}
+  <div class="stat-card">
+    <div class="num">{{ cron_schedules | length }}</div>
+    <div class="label">定时任务</div>
+  </div>
+  {% endif %}
+</div>
+
+<div class="form-section">
+  <h2>当前配置</h2>
+  <table>
+    <tr><th style="width:140px;">标题</th><td>{{ data.title }}</td></tr>
+    <tr><th>作者</th><td>{{ data.author }}</td></tr>
+    <tr><th>来源类型</th><td>{{ source.type or 'space' }}</td></tr>
+    <tr><th>UID</th><td>{{ source.uid or '—' }}</td></tr>
+    <tr><th>SID</th><td>{{ source.sid or '—' }}</td></tr>
+    <tr><th>enabled</th><td>{{ '是' if data.enabled else '否' }}</td></tr>
+    <tr><th>keep_last</th><td>{{ sync.keep_last if sync.keep_last is not none else 100 }}{% if sync.keep_last == 0 %} (不限制){% endif %}</td></tr>
+    <tr><th>更新周期</th><td>{{ sync.update_period or '12h' }}</td></tr>
+    <tr><th>音频质量</th><td>{{ sync.quality or '64K' }}</td></tr>
+    <tr><th>抓取策略</th><td>{{ sync.fetch_strategy or 'api_first' }}</td></tr>
+  </table>
+</div>
+
+<div class="form-section">
+  <h2>过滤规则</h2>
+  <table>
+    <tr><th>排除付费</th><td>{{ '是' if filters.exclude_paid else '否' }}</td></tr>
+    {% if filters.exclude_keywords %}
+    <tr><th>黑名单关键词</th><td><code>{{ filters.exclude_keywords | join(', ') }}</code></td></tr>
+    {% endif %}
+    {% if filters.include_keywords %}
+    <tr><th style="background:#fff3cd;">白名单关键词</th><td style="background:#fff3cd;"><code>{{ filters.include_keywords | join(', ') }}</code></td></tr>
+    {% endif %}
+    {% if filters.advertisement_keywords %}
+    <tr><th>广告关键词</th><td><code>{{ filters.advertisement_keywords | join(', ') }}</code></td></tr>
+    {% endif %}
+    {% if filters.exclude_bvids %}
+    <tr><th>排除 BVID</th><td><code>{{ filters.exclude_bvids | join(', ') }}</code></td></tr>
+    {% endif %}
+    {% if filters.advertisement_bvids %}
+    <tr><th>广告 BVID</th><td><code>{{ filters.advertisement_bvids | join(', ') }}</code></td></tr>
+    {% endif %}
+    <tr><th>最小时长</th><td>{{ sync.min_duration_seconds or 0 }} 秒</td></tr>
+    <tr><th>最大时长</th><td>{{ sync.max_duration_seconds or 0 }} 秒</td></tr>
+    <tr><th>付费预览</th><td>{{ '开启' if paid_preview.enabled else '关闭' }}{% if paid_preview.enabled %} ({{ paid_preview.retry_after_days }}天后重试){% endif %}</td></tr>
+  </table>
+</div>
+
+{% if dry_run_output %}
+<div class="form-section">
+  <h2>干跑输出</h2>
+  <pre style="max-height:500px;overflow-y:auto;">{{ dry_run_output }}</pre>
+</div>
+{% endif %}
+
+{% if cron_schedules %}
+<div class="form-section">
+  <h2>定时任务</h2>
+  <ul>
+    {% for s in cron_schedules %}
+    <li><code>{{ s }}</code></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endblock %}

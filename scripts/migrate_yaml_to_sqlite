@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Migrate YAML configs and JSON state files to SQLite.
+
+Usage:
+    python3 scripts/migrate_yaml_to_sqlite \
+        --config-dir configs/series.d \
+        --state-root /path/to/state \
+        --db-path /path/to/bilipod.db
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Ensure the project src is importable (editable install or CWD)
+_HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_HERE / "src"))
+
+import yaml
+
+from bilibili_podcast import db
+from bilibili_podcast.utils.series_config import SeriesConfig
+
+
+def migrate_state(conn, series: str, state_root: str | Path) -> None:
+    """Migrate a single JSON state file to SQLite if it exists."""
+    state_file = Path(state_root) / f"{series}.json"
+    if not state_file.exists():
+        return
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"  [warn] skipping unreadable state file: {state_file}")
+        return
+
+    if not data:
+        return
+
+    db.upsert_sync_state(conn, series, data)
+    print(f"  state: {series} ({len(data)} fields)")
+
+
+def migrate_one(conn, yaml_path: Path, state_root: str | Path) -> SeriesConfig:
+    """Migrate a single YAML config and its state to SQLite."""
+    config = SeriesConfig.from_yaml(yaml_path)
+    raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+    print(f"  config: {config.series}")
+
+    db.upsert_series(conn, config)
+    db.upsert_source(conn, config)
+    db.upsert_sync_policy(conn, config)
+    db.upsert_filters(conn, config)
+    db.upsert_paid_preview(conn, config)
+    cron_cfg = raw.get("cron", {})
+    if isinstance(cron_cfg, dict):
+        schedules = cron_cfg.get("schedules", [])
+    else:
+        schedules = []
+    db.upsert_cron(conn, config.series, schedules)
+    migrate_state(conn, config.series, state_root)
+    return config
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Migrate YAML configs and JSON state to SQLite.")
+    parser.add_argument("--config-dir", default="configs/series.d", help="YAML config directory.")
+    parser.add_argument("--state-root", default="/tmp/bilibili-podcast-state", help="JSON state root directory.")
+    parser.add_argument("--db-path", required=True, help="Output SQLite database path.")
+    parser.add_argument("--series", help="Comma-separated series to migrate (default: all).")
+    parser.add_argument("--force-overwrite", action="store_true", help="Delete and recreate DB (default: upsert into existing).")
+    args = parser.parse_args()
+
+    config_dir = Path(args.config_dir)
+    if not config_dir.is_dir():
+        print(f"error: config directory not found: {config_dir}")
+        return 1
+
+    db_path = Path(args.db_path)
+    if db_path.exists():
+        if args.force_overwrite:
+            db_path.unlink()
+            print(f"  Removed: {db_path}")
+        else:
+            print(f"  DB already exists: {db_path}")
+
+    db.migrate(str(db_path))
+    print(f"Migrating configs from {config_dir} → {db_path}")
+
+    wanted = {s.strip() for s in args.series.split(",")} if args.series else None
+    migrated = 0
+
+    with db.transaction(str(db_path)) as conn:
+        for yaml_path in sorted(config_dir.glob("*.yaml")):
+            if yaml_path.name.startswith("_"):
+                continue
+            config = SeriesConfig.from_yaml(yaml_path)
+            if wanted and config.series not in wanted:
+                continue
+            migrate_one(conn, yaml_path, args.state_root)
+            migrated += 1
+
+    print(f"\nDone. {migrated} configs migrated to {db_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

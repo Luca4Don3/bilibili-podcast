@@ -1,0 +1,48 @@
+[project]
+name = "bilibili-podcast"
+version = "1.0.0"
+description = "Convert Bilibili user uploads and playlists into podcast RSS feeds"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+dependencies = [
+  "bilibili-api-python @ git+https://github.com/Nemo2011/bilibili-api.git@dev",
+  "feedgen==1.0.0",
+  "PyYAML>=6.0",
+  "requests>=2.27.1",
+  "curl_cffi==0.10.0",
+  'aiohttp==3.12.15',
+  "fastapi>=0.110.0",
+  "uvicorn[standard]>=0.29.0",
+  "jinja2>=3.1.0",
+  "python-multipart>=0.0.9",
+  "itsdangerous>=2.1.0",
+]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+]
+
+authors = [{ name = "bilibili-podcast Maintainers" }]
+
+[project.optional-dependencies]
+browser = [
+  "playwright>=1.44",
+]
+
+[project.scripts]
+bilibili-podcast = "bilibili_podcast.sync:main"
+bilipod-admin = "bilibili_podcast.cli_admin:main"
+
+[project.urls]
+homepage = "https://github.com/example/bilibili-podcast"
+
+[build-system]
+requires = ["setuptools>=69.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true

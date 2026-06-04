@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}{{ '新建系列' if is_new else series }} — Bilipod{% endblock %}
+{% block content %}
+
+<h1>{{ '新建系列' if is_new else ('编辑: ' + series) }}</h1>
+
+{% if errors %}
+<div class="error">
+  {% for e in errors %}<div>{{ e }}</div>{% endfor %}
+</div>
+{% endif %}
+
+<div class="form-section">
+  <form method="POST" action="{% if is_new %}/series/new{% else %}/series/{{ series }}{% endif %}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <h2>基础信息</h2>
+    <div class="form-row">
+      <div>
+        <label>系列标识</label>
+        {% if is_new %}
+          <input type="text" name="series" value="{{ data.series or '' }}" required
+                 pattern="[a-z0-9][a-z0-9_-]*"
+                 placeholder="例: demo-series" {% if is_resolve %}readonly style="background:#f5f5f5;"{% endif %}>
+          <div class="subtitle">只允许小写字母、数字、横线和下划线</div>
+        {% else %}
+          <input type="text" value="{{ series }}" readonly style="background:#f5f5f5;">
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div>
+        <label>标题 *</label>
+        <input type="text" name="title" value="{{ data.title or '' }}" required
+               placeholder="RSS 频道标题">
+      </div>
+      <div>
+        <label>作者 *</label>
+        <input type="text" name="author" value="{{ data.author or '' }}" required
+               placeholder="B 站 UP 主名称">
+      </div>
+    </div>
+
+    <div>
+      <label>描述</label>
+      <textarea name="description" rows="3" placeholder="RSS 频道描述（可选）">{{ data.description or '' }}</textarea>
+    </div>
+
+    <div class="form-row">
+      <div style="flex:2;">
+        <label>封面图 URL</label>
+        <input type="url" name="cover_art" value="{{ data.cover_art or up_face_url or '' }}" placeholder="https://">
+        <div class="subtitle">留空则自动使用 B 站 UP 主头像。{% if up_face_url %}当前默认: {{ up_face_url }}{% endif %}</div>
+      </div>
+      <div style="flex:1;">
+        <label>分类</label>
+        <input type="text" name="category" value="{{ data.category or '' }}" placeholder="例: Technology">
+      </div>
+    </div>
+    {% set _cover = data.cover_art or up_face_url %}
+    {% if _cover %}
+    <div style="margin-top:0.5rem;">
+      <img src="{{ _cover }}" referrerpolicy="no-referrer" style="max-height:80px;border-radius:4px;" alt="封面预览">
+    </div>
+    {% endif %}
+
+    <div class="form-row">
+      <div>
+        <label>子分类</label>
+        <input type="text" name="subcategories" value="{{ data.subcategories | replace('\"', '') | replace('[', '') | replace(']', '') | replace(',', ', ') if data.subcategories else '' }}" placeholder="逗号分隔，例: 科技, 科普">
+        <div class="subtitle">逗号分隔</div>
+      </div>
+      <div>
+        <label>语言</label>
+        <input type="text" name="lang" value="{{ data.lang or 'zh-CN' }}">
+      </div>
+    </div>
+
+    <div class="inline-group">
+      <input type="checkbox" name="explicit" value="true" {% if data.explicit %}checked{% endif %}>
+      <label style="margin:0;font-weight:400;">Explicit 内容</label>
+    </div>
+
+    <h2 style="margin-top:2rem;">数据来源</h2>
+    <div class="form-row">
+      <div>
+        <label>来源类型</label>
+        <select name="source_type">
+          <option value="space" {% if source.type == 'space' or not source.type %}selected{% endif %}>UP 主空间</option>
+          <option value="season" {% if source.type == 'season' %}selected{% endif %}>合集</option>
+          <option value="series" {% if source.type == 'series' %}selected{% endif %}>系列</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div>
+        <label>UID</label>
+        <input type="number" name="uid" value="{{ source.uid or '' }}" min="1" placeholder="B 站用户 UID">
+        <div class="subtitle">space 模式需要 UID 或 Space URL</div>
+      </div>
+      <div>
+        <label>SID</label>
+        <input type="number" name="sid" value="{{ source.sid or '' }}" min="1" placeholder="合集/系列 ID">
+        <div class="subtitle">season/series 模式需要 SID</div>
+      </div>
+    </div>
+
+    <div>
+      <label>Space URL</label>
+      <input type="url" name="space_url" value="{{ source.space_url or '' }}"
+             placeholder="https://space.bilibili.com/123456">
+    </div>
+
+    <div class="actions" style="margin-top:1.5rem;">
+      <button type="submit" class="btn btn-success">💾 保存</button>
+      <a href="/series" class="btn-secondary btn">取消</a>
+    </div>
+  </form>
+</div>
+
+{% if not is_new %}
+<div class="actions" style="margin-top:1rem;">
+  <a href="/series/{{ series }}/sync" class="btn btn-outline">同步策略</a>
+  <a href="/series/{{ series }}/filters" class="btn btn-outline">过滤规则</a>
+  <a href="/series/{{ series }}/cron" class="btn btn-outline">定时任务</a>
+  <a href="/series/{{ series }}/preview" class="btn btn-outline">干跑预览</a>
+  <a href="/series/{{ series }}/manual-media" class="btn btn-outline">📁 手动 Media</a>
+</div>
+{% endif %}
+{% endblock %}
