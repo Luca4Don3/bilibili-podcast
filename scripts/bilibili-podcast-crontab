@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""
+bilibili-podcast-crontab — Read series configs and generate/manage cron.
+
+Usage:
+  bilibili-podcast-crontab [--config-dir DIR] [--apply] [--print]
+
+  --config-dir    Config directory (default: configs/series.d)
+  --apply         Write generated crontab and wrapper scripts
+  --print         Print generated crontab entries to stdout (default)
+  --script-dir    Directory for auto-generated wrapper scripts (default: auto)
+  --user          Crontab user (default: bilibili-podcast)
+  --force         Overwrite existing wrapper scripts
+"""
+
+import argparse
+import os
+import re
+import shlex
+import stat
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print("bilibili-podcast-crontab requires PyYAML: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+
+SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+# Markers for auto-generated crontab sections
+AUTO_BEGIN_MARKER = "# BEGIN BILIBILI_PODCAST AUTO"
+AUTO_END_MARKER = "# END BILIBILI_PODCAST AUTO"
+
+
+def cron_marker_title(title, series: str) -> str:
+    """Return a single-line title safe for an auto crontab marker."""
+    normalized = " ".join(str(title or "").splitlines()).strip()
+    return normalized or series
+
+
+def systemd_timer_is_enabled(series: str) -> bool:
+    """Return whether an existing systemd timer should own this series."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-enabled", f"bilibili-podcast-sync@{series}.timer"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "enabled"
+
+
+# Wrapper script template.
+# Shell variables use {{...}} to survive Python .format().
+WRAPPER_TEMPLATE = """#!/bin/sh
+set -eu
+PATH=<server_path>:/usr/local/python3.13/bin:/usr/local/bin:/usr/bin:/bin
+PLAYWRIGHT_BROWSERS_PATH=<server_path>
+export PATH PLAYWRIGHT_BROWSERS_PATH
+
+MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-1}}
+FORCE=${{FORCE:-0}}
+DEBUG=${{DEBUG:-1}}
+CONFIG_DB="{CONFIG_DB}"
+# Allow override via BILIBILI_PODCAST_CONFIG_DB env var at runtime
+if [ -z "$CONFIG_DB" ]; then
+  CONFIG_DB="${{BILIBILI_PODCAST_CONFIG_DB:-}}"
+fi
+FORCE_ARGS=""
+DEBUG_ARGS=""
+CONFIG_SRC_ARGS=""
+if [ "$FORCE" = "1" ]; then
+  FORCE_ARGS="--force"
+fi
+if [ "$DEBUG" = "1" ]; then
+  DEBUG_ARGS="--debug"
+fi
+if [ -n "$CONFIG_DB" ]; then
+  CONFIG_SRC_ARGS="--config-db $CONFIG_DB"
+else
+  CONFIG_SRC_ARGS="--config-dir {CONFIG_DIR}"
+fi
+
+{BILIBILI_PODCAST_SYNC_PATH} \\
+  $CONFIG_SRC_ARGS \\
+  --series {SERIES} \\
+  --cookie-file {COOKIE_FILE} \\
+  --token "__MEDIA_PLACEHOLDER__" \\
+  --media-root {MEDIA_ROOT} \\
+  --json-root {JSON_ROOT} \\
+  --rss-root {RSS_ROOT} \\
+  --state-root {STATE_ROOT} \\
+  --lock-file {LOCK_FILE} \\
+  --log-dir {LOG_DIR} \\
+  --media-base-url {MEDIA_BASE_URL} \\
+  --browser-user-data-root {BROWSER_USER_DATA_ROOT} \\
+  --max-downloads-per-run "$MAX_DOWNLOADS_PER_RUN" \\
+  --min-free-gb {MIN_FREE_GB} \\
+  --apply \\
+  $FORCE_ARGS \\
+  $DEBUG_ARGS
+
+# 分发各用户 RSS 到 /var/lib/bilibili-podcast/published-rss/{{token}}/
+{RSS_PUBLISH_SCRIPT}
+
+# Optional legacy RSS sync target for dual-server compatibility.
+RSYNC_PASSWORD=$(cat {RSYNC_SECRET})
+export RSYNC_PASSWORD
+rsync -qt --port={RSYNC_PORT} --contimeout=10 \\
+  {RSYNC_RSS_SRC} \\
+  {RSYNC_USER}@{RSYNC_HOST}::rss/
+"""
+
+
+def load_configs(config_dir: str | None, db_path: str | None) -> list[dict]:
+    """Load series configs from YAML directory or SQLite DB."""
+    if db_path:
+        return _load_configs_from_db(db_path)
+    if config_dir:
+        return _load_configs_from_yaml(config_dir)
+    return []
+
+
+def _load_configs_from_yaml(config_dir: str) -> list[dict]:
+    configs = []
+    path = Path(config_dir)
+    for yaml_path in sorted(path.glob("*.yaml")):
+        if yaml_path.name.startswith("_"):
+            continue
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        if not data:
+            continue
+        configs.append(data)
+    return configs
+
+
+def _load_configs_from_db(db_path: str) -> list[dict]:
+    """Load configs from SQLite and convert to dict format with cron schedules."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+    from bilibili_podcast import db as _db
+    import sqlite3 as _sqlite3
+
+    configs = []
+    try:
+        cfgs = _db.load_series_configs(db_path)
+    except Exception as exc:
+        print(f"  error loading from DB: {exc}", file=sys.stderr)
+        return configs
+
+    conn = _sqlite3.connect(db_path)
+    conn.row_factory = _sqlite3.Row
+    try:
+        has_backend_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scheduler_backend'"
+        ).fetchone() is not None
+        for cfg in cfgs:
+            backend_row = None
+            if has_backend_table:
+                backend_row = conn.execute(
+                    "SELECT backend FROM scheduler_backend WHERE series=?",
+                    (cfg.series,),
+                ).fetchone()
+            if (
+                backend_row is not None and backend_row["backend"] == "systemd"
+            ) or systemd_timer_is_enabled(cfg.series):
+                continue
+            row = conn.execute(
+                "SELECT schedule FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
+                (cfg.series,),
+            ).fetchall()
+            schedules = [r["schedule"] for r in row]
+            configs.append(_series_config_to_dict(cfg, schedules))
+    finally:
+        conn.close()
+
+    return configs
+
+
+def _series_config_to_dict(cfg, schedules: list[str]) -> dict:
+    """Convert a SeriesConfig + cron schedules back to the plain dict format."""
+    d = {
+        "series": cfg.series,
+        "enabled": cfg.enabled,
+        "title": cfg.title,
+        "description": cfg.description,
+        "author": cfg.author,
+        "cover_art": cfg.cover_art,
+        "category": cfg.category,
+        "subcategories": cfg.subcategories,
+        "explicit": cfg.explicit,
+        "lang": cfg.lang,
+        "source": cfg.source,
+        "sync": cfg.sync,
+        "filters": cfg.filters,
+        "paid_preview": cfg.paid_preview,
+    }
+    if schedules:
+        d["cron"] = {"enabled": True, "schedules": schedules}
+    return d
+
+
+def parse_cron_schedules(config: dict) -> list[str]:
+    """Extract cron schedules from a series config."""
+    cron = config.get("cron") or {}
+    if not cron.get("enabled", False):
+        return []
+
+    schedules = cron.get("schedules")
+    if schedules:
+        return [str(s).strip() for s in schedules if str(s).strip()]
+
+    # Derive from update_period if no explicit schedules
+    sync = config.get("sync") or {}
+    period = str(sync.get("update_period", "")).strip().lower()
+    hours = parse_hours(period)
+    if hours and hours > 0:
+        return derive_cron_from_period(hours, config.get("series", "unknown"))
+
+    return []
+
+
+def parse_hours(period: str) -> int:
+    """Parse update_period like '12h', '8h', '6h' into hours."""
+    if not period:
+        return 0
+    try:
+        period = period.strip().lower()
+        if period.endswith("h"):
+            return max(int(period[:-1]), 1)
+        if period.endswith("d"):
+            return int(period[:-1]) * 24
+        return int(period)
+    except (ValueError, TypeError):
+        return 0
+
+
+def derive_cron_from_period(hours: int, series_name: str) -> list[str]:
+    """Derive cron schedules from update_period, avoiding round minutes."""
+    if hours <= 0 or hours > 24:
+        return []
+
+    # Use series name hash to pick a stable non-round minute
+    minute = (abs(hash(series_name)) % 54) + 2  # 2-55 range
+    # Pick a stable starting hour to avoid :00/:30
+    start_hour = (abs(hash(series_name + "_base")) % 6) + 1  # 1-6
+
+    num_entries = max(24 // hours, 1)
+    if 24 % hours != 0:
+        num_entries += 1
+
+    schedules = []
+    for i in range(num_entries):
+        h = (start_hour + i * hours) % 24
+        schedules.append(f"{minute} {h} * * *")
+
+    return schedules
+
+
+# ── Auto-load bilibili-podcast-env.sh if it exists next to this script ──────────
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_ENV_FILE = _SCRIPT_DIR / "bilibili-podcast-env.sh"
+if _ENV_FILE.exists():
+    _RE_EXPORT = re.compile(r'^export\s+(\w+)=(.*)$')
+    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
+        _m = _RE_EXPORT.match(_line.strip())
+        if _m:
+            _key, _val = _m.group(1), _m.group(2).strip()
+            # Strip surrounding quotes
+            if len(_val) >= 2 and _val[0] == _val[-1] and _val[0] in ('"', "'"):
+                _val = _val[1:-1]
+            if _key not in os.environ:  # existing env vars take precedence
+                os.environ[_key] = _val
+# ────────────────────────────────────────────────────────────────────────
+
+
+def generate_wrapper_script(series_name: str, config_dir: str | None, config_db: str | None, script_dir: str, force: bool) -> Path | None:
+    """Generate a wrapper script for a series if it doesn't exist."""
+    script_path = Path(script_dir) / f"run_{series_name}_sync.sh"
+
+    if script_path.exists() and not force:
+        return script_path  # Already exists, skip
+
+    script_dir_path = Path(script_dir)
+    script_dir_path.mkdir(parents=True, exist_ok=True)
+
+    # Use absolute paths from the environment or sensible defaults
+    bilibili_podcast_sync_path = os.environ.get(
+        "BILIBILI_PODCAST_SYNC_PATH",
+        "<server_path>",
+    )
+    config_dir_abs = str(Path(config_dir).resolve()) if config_dir else ""
+    cookie_file = os.environ.get(
+        "BILIBILI_PODCAST_COOKIE_FILE",
+        "<server_path>",
+    )
+    media_root = os.environ.get("BILIBILI_PODCAST_MEDIA_ROOT", "/var/lib/bilibili-podcast/media")
+    json_root = os.environ.get("BILIBILI_PODCAST_JSON_ROOT", "/var/lib/bilibili-podcast/json")
+    rss_root = os.environ.get("BILIBILI_PODCAST_RSS_ROOT", "/var/lib/bilibili-podcast/rss")
+    state_root = os.environ.get("BILIBILI_PODCAST_STATE_ROOT", "/var/lib/bilibili-podcast/state")
+    lock_file = os.environ.get("BILIBILI_PODCAST_LOCK_FILE", "/var/lib/bilibili-podcast/state/bilibili-podcast.lock")
+    log_dir = os.environ.get("BILIBILI_PODCAST_LOG_DIR", "/var/log/bilibili-podcast")
+    browser_user_data_root = os.environ.get(
+        "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT",
+        "<server_path>",
+    )
+    media_base_url = os.environ.get(
+        "BILIBILI_PODCAST_MEDIA_BASE_URL",
+        "<media_base_url>",
+    )
+    min_free_gb = os.environ.get("BILIBILI_PODCAST_MIN_FREE_GB", "5")
+    rsync_secret = os.environ.get(
+        "BILIBILI_PODCAST_RSYNC_SECRET",
+        "<rsync_secret_file>",
+    )
+    rsync_port = os.environ.get("BILIBILI_PODCAST_RSYNC_PORT", "<rsync_port>")
+    rsync_user = os.environ.get("BILIBILI_PODCAST_RSYNC_USER", "publish")
+    rsync_host = os.environ.get("BILIBILI_PODCAST_RSYNC_HOST", "<rsync_host>")
+    rsync_rss_src = os.environ.get(
+        "BILIBILI_PODCAST_RSYNC_RSS_SRC",
+        "/var/lib/bilibili-podcast/published-rss/<user_token>/*.xml",
+    )
+    rss_publish_script = os.environ.get(
+        "BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT",
+        "<server_path>",
+    )
+
+    # Guard: reject placeholder values in --config-db mode only.
+    # YAML mode wraps inherit placeholders; server bilibili-podcast-env.sh provides runtime values.
+    if config_db:
+        _placeholder_vars = {
+            "media_base_url": media_base_url,
+            "rsync_secret": rsync_secret,
+            "rsync_port": rsync_port,
+            "rsync_host": rsync_host,
+        }
+        for _name, _val in _placeholder_vars.items():
+            if "<" in str(_val) or ">" in str(_val):
+                print(
+                    f"  ERROR: {_name} contains placeholder {_val!r}. "
+                    f"Set BILIBILI_PODCAST_{_name.upper()} env var or create bilibili-podcast-env.sh.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    content = WRAPPER_TEMPLATE.format(
+        BILIBILI_PODCAST_SYNC_PATH=shlex.quote(bilibili_podcast_sync_path),
+        CONFIG_DB=shlex.quote(config_db or ""),
+        CONFIG_DIR=shlex.quote(config_dir_abs),
+        SERIES=shlex.quote(series_name),
+        COOKIE_FILE=shlex.quote(cookie_file),
+        MEDIA_ROOT=shlex.quote(media_root),
+        JSON_ROOT=shlex.quote(json_root),
+        RSS_ROOT=shlex.quote(rss_root),
+        STATE_ROOT=shlex.quote(state_root),
+        LOCK_FILE=shlex.quote(lock_file),
+        LOG_DIR=shlex.quote(log_dir),
+        BROWSER_USER_DATA_ROOT=shlex.quote(browser_user_data_root),
+        MEDIA_BASE_URL=shlex.quote(media_base_url),
+        MIN_FREE_GB=shlex.quote(min_free_gb),
+        RSYNC_SECRET=shlex.quote(rsync_secret),
+        RSYNC_PORT=shlex.quote(rsync_port),
+        RSYNC_USER=shlex.quote(rsync_user),
+        RSYNC_HOST=shlex.quote(rsync_host),
+        RSYNC_RSS_SRC=rsync_rss_src,  # no shlex.quote — wildcard needs shell expansion
+        RSS_PUBLISH_SCRIPT=shlex.quote(rss_publish_script),
+    )
+
+    script_path.write_text(content, encoding="utf-8")
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    print(f"  generated: {script_path}", file=sys.stderr)
+    return script_path
+
+
+def generate_crontab(configs: list[dict], config_dir: str | None, config_db: str | None, script_dir: str) -> str:
+    """Generate crontab entries from configs."""
+    lines = []
+    first = True
+
+    for config in configs:
+        if not config.get("enabled", True):
+            continue
+
+        series = config.get("series", "")
+        if not series:
+            continue
+
+        schedules = parse_cron_schedules(config)
+        if not schedules:
+            continue
+
+        wrapper_name = f"run_{series}_sync.sh"
+        wrapper_path = Path(script_dir) / wrapper_name
+
+        if not first:
+            lines.append("")
+        first = False
+
+        title = cron_marker_title(config.get("title"), series)
+        lines.append(f"{AUTO_BEGIN_MARKER} - {series} ({title})")
+        for sched in schedules:
+            lines.append(f"{sched} {wrapper_path}")
+        lines.append(f"{AUTO_END_MARKER}")
+
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def merge_with_existing_crontab(new_auto: str, user: str) -> str:
+    """Merge auto-generated entries with existing crontab, preserving manual entries."""
+    import getpass
+    current_user = getpass.getuser()
+    try:
+        if user and user != current_user:
+            existing = subprocess.run(
+                ["crontab", "-l", "-u", user],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        else:
+            existing = subprocess.run(
+                ["crontab", "-l"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+    except Exception:
+        existing = ""
+
+    # Remove existing auto sections
+    cleaned = re.sub(
+        rf"^{AUTO_BEGIN_MARKER}(?:\s+-[^\r\n]*)?\r?\n.*?^{AUTO_END_MARKER}\r?\n?",
+        "",
+        existing,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    cleaned = cleaned.strip()
+    if cleaned:
+        cleaned += "\n\n"
+
+    # Append new auto entries
+    new_auto = new_auto.strip()
+    if new_auto:
+        cleaned += new_auto + "\n"
+
+    return cleaned
+
+
+def write_crontab(content: str, user: str):
+    """Write merged crontab.
+
+    If *user* matches the current OS user, omit ``-u`` to avoid
+    "must be privileged to use -u" when running as the target user.
+    """
+    import getpass
+    current_user = getpass.getuser()
+    if user and user != current_user:
+        proc = subprocess.run(
+            ["crontab", "-u", user, "-"],
+            input=content, capture_output=True, text=True, timeout=10,
+        )
+    else:
+        proc = subprocess.run(
+            ["crontab", "-"],
+            input=content, capture_output=True, text=True, timeout=10,
+        )
+    if proc.returncode != 0:
+        print(f"  error writing crontab: {proc.stderr.strip()}", file=sys.stderr)
+        return False
+    print(f"  crontab updated ({len(content.splitlines())} lines)", file=sys.stderr)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate bilibili-podcast crontab from series configs")
+    parser.add_argument("--config-dir", default="configs/series.d", help="Config directory (YAML mode)")
+    parser.add_argument("--config-db", default=None, help="SQLite database path (replaces --config-dir)")
+    parser.add_argument("--apply", action="store_true", help="Write crontab and wrapper scripts")
+    parser.add_argument("--print", action="store_true", help="Print generated crontab (default)")
+    parser.add_argument("--script-dir", default="auto", help="Directory for auto-generated scripts")
+    parser.add_argument("--cron-user", default="bilibili-podcast", help="Crontab user")
+    parser.add_argument("--force", action="store_true", help="Overwrite existing wrapper scripts")
+    args = parser.parse_args()
+
+    # Default: print if neither --apply nor --print
+    do_print = args.print or not args.apply
+    do_apply = args.apply
+
+    config_dir = Path(args.config_dir) if args.config_dir else None
+
+    source_label = args.config_db or str(config_dir)
+    configs = load_configs(args.config_dir, args.config_db)
+    print(f"loaded {len(configs)} configs from {source_label}", file=sys.stderr)
+
+    script_dir = Path(args.script_dir)
+    script_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate wrapper scripts
+    generated_scripts = 0
+    for config in configs:
+        if not config.get("enabled", True):
+            continue
+        series = config.get("series", "")
+        if not series or not SERIES_SLUG_RE.match(series):
+            continue
+        schedules = parse_cron_schedules(config)
+        if not schedules:
+            continue
+        script_path = generate_wrapper_script(series, args.config_dir, args.config_db, str(script_dir), args.force)
+        if script_path:
+            generated_scripts += 1
+
+    print(f"  {generated_scripts} wrapper scripts ready in {script_dir}", file=sys.stderr)
+
+    # Generate crontab
+    crontab_text = generate_crontab(configs, args.config_dir, args.config_db, str(script_dir))
+
+    if do_print:
+        if crontab_text.strip():
+            print(crontab_text)
+        else:
+            print("# (no auto cron entries)")
+
+    if do_apply:
+        merged = merge_with_existing_crontab(crontab_text, args.cron_user)
+        if write_crontab(merged, args.cron_user):
+            print("  ok — run 'crontab -l -u bilibili-podcast' to verify", file=sys.stderr)
+        else:
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

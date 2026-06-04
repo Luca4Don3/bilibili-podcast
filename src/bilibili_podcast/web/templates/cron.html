@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}调度配置 — {{ series }}{% endblock %}
+{% block content %}
+<h1>调度配置: {{ series }}</h1>
+<p class="text-muted">
+  配置 cron 调度计划。修改后仅保存到数据库，不会自动安装到系统调度。
+  生产环境推荐使用 <code>scheduler --backend systemd</code>。
+</p>
+
+{% if sysd_status %}
+<div class="form-section">
+  <h2>⚙️ systemd timer 状态</h2>
+  <table>
+    <tr><th>状态</th><th>值</th></tr>
+    <tr><td>启用</td><td>{% if sysd_status.enabled %}✅ 已启用{% else %}❌ 未启用{% endif %}</td></tr>
+    <tr><td>活跃</td><td>{% if sysd_status.active %}✅ 活跃{% else %}❌ 不活跃{% endif %}</td></tr>
+    <tr><td>下次触发</td><td><code>{{ sysd_status.next_trigger or '—' }}</code></td></tr>
+    <tr><td>上次触发</td><td><code>{{ sysd_status.last_trigger or '—' }}</code></td></tr>
+    <tr><td>timer unit</td><td><code>{{ sysd_status.timer_unit or '—' }}</code></td></tr>
+  </table>
+</div>
+{% endif %}
+
+<div class="form-section">
+  <h2>📝 DB 调度计划</h2>
+  <form method="POST" action="/series/{{ series }}/cron">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p class="text-muted">每行一个标准 5 段 cron 表达式。空表时不生成 cron 任务。</p>
+    <textarea name="schedules" rows="6" placeholder="15 11 * * *&#10;15 13 * * *">{% if schedules %}{{ schedules | join('\n') }}{% endif %}</textarea>
+    <div class="subtitle">保存仅写数据库，不安装到系统调度。</div>
+
+    <div class="actions" style="margin-top:1rem;">
+      <button type="submit" class="btn btn-success">💾 保存</button>
+      <a href="/series/{{ series }}/preview" class="btn btn-outline">干跑预览</a>
+      <a href="/series" class="btn-secondary btn">返回列表</a>
+    </div>
+  </form>
+</div>
+
+<div class="form-section">
+  <h2>📖 常用示例</h2>
+  <table>
+    <tr><th>说明</th><th>表达式</th></tr>
+    <tr><td>每天 11:15</td><td><code>15 11 * * *</code></td></tr>
+    <tr><td>每天 11:15 和 13:15</td><td><code>15 11 * * *</code>（每行一个）</td></tr>
+    <tr><td>每 6 小时</td><td><code>7 */6 * * *</code></td></tr>
+    <tr><td>周末 09:15</td><td><code>15 9 * * 6,0</code></td></tr>
+  </table>
+</div>
+{% endblock %}

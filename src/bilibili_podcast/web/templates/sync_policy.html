@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}同步策略 — {{ series }}{% endblock %}
+{% block content %}
+<h1>同步策略: {{ series }}</h1>
+<p class="text-muted">配置 API 请求行为、下载质量、浏览器回退等同步参数。</p>
+
+<div class="form-section">
+  <form method="POST" action="/series/{{ series }}/sync">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <h2>分页</h2>
+    <div class="form-row">
+      <div>
+        <label>首页每页条数 (page_size)</label>
+        <input type="number" name="page_size" value="{{ data.page_size or 20 }}" min="1" max="50">
+      </div>
+      <div>
+        <label>增量页条数 (incremental_page_size)</label>
+        <input type="number" name="incremental_page_size" value="{{ data.incremental_page_size or 5 }}" min="1">
+      </div>
+      <div>
+        <label>最大页数 (max_pages)</label>
+        <input type="number" name="max_pages" value="{{ data.max_pages or 10 }}" min="1">
+      </div>
+    </div>
+
+    <h2>请求控制</h2>
+    <div class="form-row">
+      <div>
+        <label>每系列最大请求数</label>
+        <input type="number" name="max_requests_per_series" value="{{ data.max_requests_per_series or 8 }}" min="1">
+      </div>
+      <div>
+        <label>请求间隔 (秒)</label>
+        <input type="number" name="request_interval_seconds" value="{{ data.request_interval_seconds if data.request_interval_seconds is not none else 2.0 }}" min="0.1" step="0.1">
+      </div>
+      <div>
+        <label>抖动 (秒)</label>
+        <input type="number" name="request_jitter_seconds" value="{{ data.request_jitter_seconds if data.request_jitter_seconds is not none else 0.5 }}" min="0" step="0.1">
+      </div>
+    </div>
+
+    <h2>限流与更新</h2>
+    <div class="form-row">
+      <div>
+        <label>限流冷却 (秒)</label>
+        <input type="number" name="rate_limit_cooldown_seconds" value="{{ data.rate_limit_cooldown_seconds if data.rate_limit_cooldown_seconds is not none else 21600 }}" min="0">
+        <div class="subtitle">默认 6 小时 (21600 秒)</div>
+      </div>
+      <div>
+        <label>更新周期 (update_period)</label>
+        <input type="text" name="update_period" value="{{ data.update_period or '12h' }}" placeholder="例: 12h, 1h, 30m">
+        <div class="subtitle">两次同步的最小间隔</div>
+      </div>
+    </div>
+
+    <h2>下载</h2>
+    <div class="form-row">
+      <div>
+        <label>输出格式</label>
+        <select name="format">
+          <option value="audio" {% if data.format == 'audio' or not data.format %}selected{% endif %}>音频</option>
+          <option value="video" {% if data.format == 'video' %}selected{% endif %}>视频</option>
+        </select>
+      </div>
+      <div>
+        <label>音频质量</label>
+        <select name="quality">
+          <option value="64K" {% if data.quality == '64K' %}selected{% endif %}>64K</option>
+          <option value="132K" {% if data.quality == '132K' %}selected{% endif %}>132K</option>
+          <option value="192K" {% if data.quality == '192K' %}selected{% endif %}>192K</option>
+        </select>
+      </div>
+      <div>
+        <label>RSS 保留条数 (keep_last)</label>
+        <input type="number" name="keep_last" value="{{ data.keep_last if data.keep_last is not none else 100 }}" min="0">
+        <div class="subtitle">0 = 不限制</div>
+      </div>
+    </div>
+
+    <h2>浏览器回退</h2>
+    <div class="form-row">
+      <div>
+        <label>抓取策略</label>
+        <select name="fetch_strategy">
+          <option value="api_first" {% if data.fetch_strategy == 'api_first' %}selected{% endif %}>API 优先</option>
+          <option value="browser_first" {% if data.fetch_strategy == 'browser_first' %}selected{% endif %}>浏览器优先</option>
+        </select>
+      </div>
+      <div class="inline-group" style="margin-top:1.5rem;">
+        <input type="checkbox" name="browser_fallback" value="true" {% if data.browser_fallback %}checked{% endif %}>
+        <label style="margin:0;font-weight:400;">启用浏览器回退</label>
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div>
+        <label>浏览器最小等待 (秒)</label>
+        <input type="number" name="browser_wait_min_seconds" value="{{ data.browser_wait_min_seconds or 4.0 }}" min="1" step="0.5">
+      </div>
+      <div>
+        <label>浏览器最大等待 (秒)</label>
+        <input type="number" name="browser_wait_max_seconds" value="{{ data.browser_wait_max_seconds or 8.0 }}" min="1" step="0.5">
+      </div>
+      <div>
+        <label>回退冷却 (秒)</label>
+        <input type="number" name="browser_fallback_cooldown_seconds" value="{{ data.browser_fallback_cooldown_seconds if data.browser_fallback_cooldown_seconds is not none else 3600 }}" min="0">
+      </div>
+    </div>
+
+    <h2>其他</h2>
+    <div class="inline-group">
+      <input type="checkbox" name="require_paid_state_confirmation" value="true" {% if data.require_paid_state_confirmation %}checked{% endif %}>
+      <label style="margin:0;font-weight:400;">要求付费状态确认</label>
+    </div>
+
+    <div class="actions" style="margin-top:1.5rem;">
+      <button type="submit" class="btn btn-success">💾 保存</button>
+      <a href="/series/{{ series }}/filters" class="btn btn-outline">过滤规则</a>
+      <a href="/series" class="btn-secondary btn">返回列表</a>
+    </div>
+  </form>
+</div>
+{% endblock %}

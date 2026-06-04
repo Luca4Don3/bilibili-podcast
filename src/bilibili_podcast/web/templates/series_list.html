@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}系列管理 — bilibili-podcast{% endblock %}
+{% block content %}
+<h1>系列管理</h1>
+
+<div class="actions">
+  <a href="/resolve" class="btn btn-success">➕ 添加系列</a>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>系列</th>
+      <th>标题</th>
+      <th>作者</th>
+      <th>来源</th>
+      <th>状态</th>
+      <th>上次同步</th>
+      <th>限流至</th>
+      <th>操作</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in series_list %}
+    <tr>
+      <td><code>{{ s.series }}</code></td>
+      <td>{{ s.title }}</td>
+      <td>{{ s.author }}</td>
+      <td><span class="badge badge-info">{{ s.source_type or '?' }}</span></td>
+      <td>
+        {% if s.enabled %}
+          <span class="badge badge-on">启用</span>
+        {% else %}
+          <span class="badge badge-off">停用</span>
+        {% endif %}
+      </td>
+      <td class="text-muted">
+        {% if s.last_success_at %}
+          {{ s.last_success_at | timestamp_to_str }}
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td class="text-muted">
+        {% if s.rate_limited_until and s.rate_limited_until > 0 %}
+          {{ s.rate_limited_until | timestamp_to_str }}
+        {% else %}
+          —
+        {% endif %}
+      </td>
+      <td>
+        <div class="actions" style="margin:0;">
+          <a href="/series/{{ s.series }}" class="btn btn-sm">编辑</a>
+          <a href="/series/{{ s.series }}/preview" class="btn btn-sm btn-outline">预览</a>
+          <form method="POST" action="/series/{{ s.series }}/toggle" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-sm {% if s.enabled %}btn-danger{% else %}btn-success{% endif %}"
+                    onclick="return confirm('确认{{ '停用' if s.enabled else '启用' }}系列 {{ s.series }}？')">
+              {{ '停用' if s.enabled else '启用' }}
+            </button>
+          </form>
+        </div>
+      </td>
+    </tr>
+    {% else %}
+    <tr>
+      <td colspan="8" style="text-align:center;color:#888;padding:2rem;">
+        暂无系列配置。点击上方「添加系列」开始。
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
