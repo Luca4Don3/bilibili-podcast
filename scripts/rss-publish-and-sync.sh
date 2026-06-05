@@ -2,8 +2,9 @@
 # rss-publish-and-sync.sh — Run local RSS publish + rsync to legacy RSS target.
 #
 # Called as ExecStartPost by systemd service units.
-# Environment variables come from systemd's EnvironmentFile=
-# (<server_path>).
+# Environment variables come from sourcing bilibili-podcast-env.sh below.
+# Do not use bilibili-podcast-env.sh as a systemd EnvironmentFile because it uses
+# shell-style "export KEY=value" syntax.
 #
 # Required env (set in bilibili-podcast-env.sh):
 #   BILIBILI_PODCAST_RSYNC_HOST   e.g. rss.example.com

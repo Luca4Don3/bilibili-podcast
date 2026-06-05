@@ -22,6 +22,7 @@ STATE_DIR="$APP_DIR/state"
 CONFIG_DIR="$CODE_DIR/configs/series.d"
 DB_PATH="$STATE_DIR/bilibili-podcast.db"
 COOKIE_FILE="$APP_DIR/secrets/www.bilibili.com_cookies.txt"
+WEB_ENV_FILE="$APP_DIR/secrets/bilibili-podcast-web.env"
 MEDIA_ROOT="/var/lib/bilibili-podcast/media"
 JSON_ROOT="/var/lib/bilibili-podcast/json"
 RSS_ROOT="$APP_DIR/rss"
@@ -452,7 +453,19 @@ if [ "$APPLY" = true ]; then
         echo "    Environment=PLAYWRIGHT_BROWSERS_PATH=$BROWSER_DIR"
     fi
 
-    # 5c.3 CLI wrapper — source bilibili-podcast-env.sh + 自动切 bilibili-podcast 用户
+    # 5c.3 标准化 systemd/secrets 运行配置
+    STANDARDIZE_SCRIPT="$CODE_DIR/scripts/standardize-runtime-config.sh"
+    if [ -x "$STANDARDIZE_SCRIPT" ]; then
+        BILIBILI_PODCAST_APP_DIR="$APP_DIR" \
+        BILIBILI_PODCAST_ENV_FILE="$APP_DIR/bilibili-podcast-env.sh" \
+        BILIBILI_PODCAST_WEB_ENV_FILE="$WEB_ENV_FILE" \
+        "$STANDARDIZE_SCRIPT" --apply 2>&1 | sed 's/^/  /'
+        echo "  ✓ systemd/secrets 运行配置已标准化"
+    else
+        echo "  ⚠ 标准化脚本不存在或不可执行: $STANDARDIZE_SCRIPT"
+    fi
+
+    # 5c.4 CLI wrapper — source bilibili-podcast-env.sh + 自动切 bilibili-podcast 用户
     CLI_WRAPPER="$APP_DIR/bilibili-podcast-admin"
     cat > "$CLI_WRAPPER" << CLIEOF
 #!/bin/bash
@@ -496,6 +509,7 @@ CLIEOF
 else
     echo "  (干跑，将更新 systemd unit + bilibili-podcast-env.sh + CLI wrapper)"
     echo "    Environment=PLAYWRIGHT_BROWSERS_PATH=$BROWSER_DIR"
+    echo "    scripts/standardize-runtime-config.sh --apply"
 fi
 
 # ── 6. 迁移 YAML → SQLite ────────────────────────────

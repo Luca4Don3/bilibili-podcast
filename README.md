@@ -301,6 +301,7 @@ python3 scripts/bilibili-podcast-crontab \
 | 拉取最新代码 | `git pull --ff-only` |
 | 依赖安装 | `pip install -e .`，GitHub 不可达时自动回退 PyPI 安装 |
 | 模块验证 | 验证 sqlite3/yaml/aiohttp/feedgen/lxml/bilibili-api/yt-dlp 已就绪 |
+| 运行配置标准化 | 清理旧 systemd unit 中无效的 shell env 引用；Web 密码迁入受限 secrets env 文件 |
 | DB 迁移 | YAML 配置 + JSON 状态 → SQLite（自动备份） |
 | wrapper/调度准备 | 生成 auto/run_*.sh；可用于 cron 兼容路径，也可供 scheduler/systemd 使用 |
 | 验证 | DB 配置计数 + `exclude_paid` 语义检查 + Web 健康检查；默认不访问 B 站 API |
@@ -313,7 +314,8 @@ python3 scripts/bilibili-podcast-crontab \
 | Git 仓库 | 代码需已 clone 到服务器，remote origin 已配置 |
 | 系统用户 | `bilibili-podcast` 服务用户（`useradd -r -s /sbin/nologin bilibili-podcast`） |
 | Cookie | `www.bilibili.com_cookies.txt`（Netscape 格式，可选，无则降级浏览器模式） |
-| 磁盘空间 | `/data` 和 `/server` 所在分区至少 5GB 可用 |
+| Web 密码 | 预先创建受限 env 文件，内容为 `BILIBILI_PODCAST_WEB_PASSWORD=<web_password>`；真实值不写入 Git |
+| 磁盘空间 | media/json/rss/state 所在分区至少 5GB 可用 |
 
 ```bash
 # 干跑预览（不修改任何文件）
@@ -332,6 +334,40 @@ ssh <deploy-host> 'sudo SMOKE_SYNC=1 bash -s -- --apply' < scripts/deploy.sh
 ```
 
 生产部署后的进一步验证应以只读检查为主：确认部署版本、timer 状态、日志 warning/error、RSS 中媒体/图片/JSON URL 均包含 token 或占位符。服务器别名、真实路径、访问控制和日志清理等运维动作请放在不提交 git 的运维手册中维护。
+
+#### 运行配置标准化
+
+部署配置遵循以下边界：
+
+- `bilibili-podcast-env.sh` 是 shell 脚本环境文件，可以使用 `export KEY=value`，由 wrapper 和 RSS 发布脚本 `source`。
+- systemd unit 不应把 `bilibili-podcast-env.sh` 当作 `EnvironmentFile`，否则 systemd 会忽略 `export ...` 行并产生 warning。
+- Web 密码不写入 `.service` 文件；应放在受限 env 文件中，例如 `<app_dir>/secrets/bilibili-podcast-web.env`，内容格式为 `BILIBILI_PODCAST_WEB_PASSWORD=<web_password>`。
+- RSS/rsync 目标仍属于后续待清理的 legacy 兼容路径；相关主机、端口、token 必须只放在服务器私有配置里，不提交 Git。
+
+可单独运行标准化脚本：
+
+```bash
+# 干跑
+ssh <deploy-host> 'sudo bash -s' < scripts/standardize-runtime-config.sh
+
+# 实际修复
+ssh <deploy-host> 'sudo bash -s -- --apply' < scripts/standardize-runtime-config.sh
+```
+
+首次执行前，先在服务器私有 secrets 目录创建 `<app_dir>/secrets/bilibili-podcast-web.env`：
+
+```bash
+sudo install -m 640 -o root -g bilibili-podcast /dev/null <app_dir>/secrets/bilibili-podcast-web.env
+sudoedit <app_dir>/secrets/bilibili-podcast-web.env
+```
+
+文件内容为：
+
+```text
+BILIBILI_PODCAST_WEB_PASSWORD=<web_password>
+```
+
+如果是迁移旧 unit，标准化脚本会从现有 `.service` 中提取旧值并迁入 secrets env 文件。不要把真实密码放进命令行、README、handoff 或 Git。
 
 ---
 ## 系列配置文件
@@ -650,6 +686,7 @@ systemd 调度的安全约束：
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
 - 如果使用 RSS 多用户分发，service 的同步成功后应触发发布脚本。
+- 生成的 `.service` 不应包含 `EnvironmentFile=<app_dir>/bilibili-podcast-env.sh`；该文件是 shell env 文件，不是 systemd env 文件。
 - 验证 timer 时只启动/刷新 `.timer`，不要手动启动 `.service`。
 - 不要把启用和立即运行合并成一步；启用和启动 timer 应分开执行，并确认 timer active 后再移除旧调度。
 
@@ -672,7 +709,7 @@ systemd 调度的安全约束：
 RSS 服务节点
          │
          ▼  RSS 服务
-http://rss-host:58743/rss/{token}/{series}.xml
+http://rss-host:58743/rss/<user_token>/{series}.xml
 ```
 
 ### 用户配置文件
@@ -680,11 +717,11 @@ http://rss-host:58743/rss/{token}/{series}.xml
 `rss-publish-users.conf` 每行格式：
 
 ```
-token:series1,series2,series3
-token:all
+<user_token>:series1,series2,series3
+<user_token>:all
 ```
 
-以 `#` 开头的行为注释。token 和系列列表不允许有空格。
+以 `#` 开头的行为注释。用户 token 和系列列表不允许有空格；真实 token 只放在服务器私有配置里，不提交 Git。
 
 ### 路径规范
 
@@ -720,7 +757,7 @@ token:all
 - media / json / rss / state 目录属主：`bilibili-podcast:bilibili-podcast`
 - 目录权限：`755`
 - 文件权限：`644`
-- Cookie 和 token 文件：`600`，属主 `bilibili-podcast:bilibili-podcast`
+- Cookie、token 和 Web 密码 env 文件：`600` 或 `640`，属主限制为部署用户/服务用户可读
 
 ---
 
