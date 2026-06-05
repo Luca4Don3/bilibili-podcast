@@ -2,8 +2,9 @@
 # rss-publish-and-sync.sh — Run local RSS publish + rsync to legacy RSS target.
 #
 # Called as ExecStartPost by systemd service units.
-# Environment variables come from systemd's EnvironmentFile=
-# (/opt/bilipod/bilipod-env.sh).
+# Environment variables come from sourcing bilipod-env.sh below.
+# Do not use bilipod-env.sh as a systemd EnvironmentFile because it uses
+# shell-style "export KEY=value" syntax.
 #
 # Required env (set in bilipod-env.sh):
 #   BILIPOD_RSYNC_HOST   e.g. rss.example.com

@@ -51,13 +51,13 @@ def test_plan_counts_series_artifacts(tmp_path: Path) -> None:
     (tmp_path / "json" / "demo" / "a.json").write_text("{}")
     (tmp_path / "rss").mkdir()
     (tmp_path / "rss" / "demo.xml").write_text("<rss/>")
-    (tmp_path / "published" / "token").mkdir(parents=True)
-    (tmp_path / "published" / "token" / "demo.xml").write_text("<rss/>")
+    (tmp_path / "published" / "<user_token>").mkdir(parents=True)
+    (tmp_path / "published" / "<user_token>" / "demo.xml").write_text("<rss/>")
     (tmp_path / "auto").mkdir()
     (tmp_path / "auto" / "run_demo_sync.sh").write_text("#!/bin/sh")
     (tmp_path / "browser-profiles" / "demo").mkdir(parents=True)
     (tmp_path / "browser-profiles" / "demo" / "Cookies").write_text("x")
-    (tmp_path / "rss-publish-users.conf").write_text("token:demo,other\n")
+    (tmp_path / "rss-publish-users.conf").write_text("<user_token>:demo,other\n")
 
     plan = service.plan("demo")
 
@@ -78,24 +78,24 @@ def test_remove_deletes_database_and_local_artifacts(tmp_path: Path) -> None:
         tmp_path / "media" / "demo" / "a.mp3",
         tmp_path / "json" / "demo" / "a.json",
         tmp_path / "rss" / "demo.xml",
-        tmp_path / "published" / "token" / "demo.xml",
+        tmp_path / "published" / "<user_token>" / "demo.xml",
         tmp_path / "auto" / "run_demo_sync.sh",
         tmp_path / "browser-profiles" / "demo" / "Default" / "Cookies",
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x")
     users_conf = tmp_path / "rss-publish-users.conf"
-    users_conf.write_text("token:demo,other\nonly:demo\nall-token:all\n")
+    users_conf.write_text("<user_token>:demo,other\n<another_user_token>:demo\n<all_user_token>:all\n")
 
     service.remove("demo")
 
     assert not (tmp_path / "media" / "demo").exists()
     assert not (tmp_path / "json" / "demo").exists()
     assert not (tmp_path / "rss" / "demo.xml").exists()
-    assert not (tmp_path / "published" / "token" / "demo.xml").exists()
+    assert not (tmp_path / "published" / "<user_token>" / "demo.xml").exists()
     assert not (tmp_path / "auto" / "run_demo_sync.sh").exists()
     assert not (tmp_path / "browser-profiles" / "demo").exists()
-    assert users_conf.read_text() == "token:other\nall-token:all\n"
+    assert users_conf.read_text() == "<user_token>:other\n<all_user_token>:all\n"
     with db.transaction(db_path) as conn:
         for table in (
             "series", "series_source", "sync_policy", "filter_rule",
