@@ -2,4 +2,21 @@
 
 from .server import app
 
-__all__ = ["app"]
+
+class _ResolverProxy:
+    async def resolve_url(self, url: str) -> dict:
+        import importlib
+
+        module = importlib.import_module(f"{__name__}.resolver")
+        return await module.resolve_url(url)
+
+    def __getattr__(self, name: str):
+        import importlib
+
+        module = importlib.import_module(f"{__name__}.resolver")
+        return getattr(module, name)
+
+
+resolver = _ResolverProxy()
+
+__all__ = ["app", "resolver"]
