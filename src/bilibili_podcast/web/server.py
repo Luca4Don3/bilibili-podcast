@@ -413,10 +413,10 @@ async def resolve_url(request: Request, url: str = Form(""),
             "csrf_token": csrf_token(),
         })
 
-    from .resolver import resolve_url as _resolve
+    from . import resolver as _resolver
 
     try:
-        result = await _resolve(url.strip())
+        result = await _resolver.resolve_url(url.strip())
     except Exception as e:
         result = {"error": f"解析出错: {e}"}
 
