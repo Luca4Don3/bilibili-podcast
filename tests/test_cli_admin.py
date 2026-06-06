@@ -1251,6 +1251,20 @@ def test_paid_rebuild_rss_preserves_existing_channel_cover(tmp_path: Path) -> No
     assert "images/cover.jpg?token=__MEDIA_PLACEHOLDER__" in content
 
 
+def test_placeholder_media_token_leaves_external_images_unchanged() -> None:
+    """External absolute image URLs should not get internal media tokens."""
+    from bilibili_podcast import cli_admin as ca
+
+    assert ca._placeholder_media_token(
+        "https://cdn.example.invalid/images/cover.jpg",
+        "http://test:8080",
+    ) == "https://cdn.example.invalid/images/cover.jpg"
+    assert ca._placeholder_media_token(
+        "http://test:8080/images/cover.jpg",
+        "http://test:8080",
+    ) == "http://test:8080/images/cover.jpg?token=__MEDIA_PLACEHOLDER__"
+
+
 def test_paid_add_item_converts_media_and_writes_single_metadata(tmp_path: Path, monkeypatch) -> None:
     """add-item should convert arbitrary media, write one metadata JSON, and rebuild RSS."""
     import json
@@ -1346,6 +1360,113 @@ def test_paid_add_item_existing_media_fails_before_network_or_transcode(tmp_path
         else:
             raise AssertionError("expected validation failure")
         run.assert_not_called()
+
+
+def test_paid_add_item_metadata_failure_cleans_new_media(tmp_path: Path, monkeypatch) -> None:
+    """If metadata writing fails after media copy, add-item must remove the new media."""
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('manualfail','ManualFail','T')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('manualfail','space',1)")
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('manualfail','64K')")
+
+    upload_dir = tmp_path / "manual-media"
+    upload_dir.mkdir()
+    src = upload_dir / "input.mp3"
+    src.write_bytes(b"new-media")
+    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    bvid = "BV1234567894"
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == [sys.executable, "-m", "yt_dlp"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({
+                "id": bvid,
+                "title": "Metadata fail item",
+                "duration": 60,
+            }), stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    media_file = tmp_path / "media" / "manualfail" / f"{bvid}_64K.mp3"
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        with patch.object(ca, "_write_metadata_file", side_effect=OSError("disk full")):
+            p = ca.build_parser()
+            ns = p.parse_args(["--config-db", db_path, "paid", "add-item", "manualfail",
+                               "--url", f"https://www.bilibili.com/video/{bvid}/",
+                               "--media-path", str(src),
+                               "--json-root", str(tmp_path / "json"),
+                               "--media-root", str(tmp_path / "media"),
+                               "--rss-root", str(tmp_path / "rss"),
+                               "--media-base-url", "http://test:8080"])
+            try:
+                ca.cmd_paid_add_item(ns)
+            except SystemExit as exc:
+                assert exc.code == ca.EXIT_SYNC_FAIL
+            else:
+                raise AssertionError("expected sync failure")
+
+    assert not media_file.exists()
+
+
+def test_paid_add_item_rebuild_failure_restores_replaced_files(tmp_path: Path, monkeypatch) -> None:
+    """If RSS rebuild fails under --replace, previous media/json/RSS files are restored."""
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('manualrestore','ManualRestore','T')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('manualrestore','space',1)")
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('manualrestore','64K')")
+
+    upload_dir = tmp_path / "manual-media"
+    upload_dir.mkdir()
+    src = upload_dir / "input.mp3"
+    src.write_bytes(b"new-media")
+    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    bvid = "BV1234567895"
+    media_file = tmp_path / "media" / "manualrestore" / f"{bvid}_64K.mp3"
+    json_file = tmp_path / "json" / "manualrestore" / f"{bvid}_64K.info.json"
+    rss_file = tmp_path / "rss" / "manualrestore.xml"
+    media_file.parent.mkdir(parents=True)
+    json_file.parent.mkdir(parents=True)
+    rss_file.parent.mkdir(parents=True)
+    media_file.write_bytes(b"old-media")
+    json_file.write_text('{"bvid":"old"}')
+    rss_file.write_text("<rss>old</rss>")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == [sys.executable, "-m", "yt_dlp"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({
+                "id": bvid,
+                "title": "Restore item",
+                "duration": 60,
+            }), stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        with patch.object(ca, "rebuild_paid_rss", side_effect=RuntimeError("rss failed")):
+            p = ca.build_parser()
+            ns = p.parse_args(["--config-db", db_path, "paid", "add-item", "manualrestore",
+                               "--url", f"https://www.bilibili.com/video/{bvid}/",
+                               "--media-path", str(src),
+                               "--json-root", str(tmp_path / "json"),
+                               "--media-root", str(tmp_path / "media"),
+                               "--rss-root", str(tmp_path / "rss"),
+                               "--media-base-url", "http://test:8080",
+                               "--replace"])
+            try:
+                ca.cmd_paid_add_item(ns)
+            except SystemExit as exc:
+                assert exc.code == ca.EXIT_SYNC_FAIL
+            else:
+                raise AssertionError("expected sync failure")
+
+    assert media_file.read_bytes() == b"old-media"
+    assert json_file.read_text() == '{"bvid":"old"}'
+    assert rss_file.read_text() == "<rss>old</rss>"
 
 
 def test_paid_refresh_metadata_writes_192K_json(tmp_path: Path, monkeypatch) -> None:

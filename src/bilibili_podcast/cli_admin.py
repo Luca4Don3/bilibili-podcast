@@ -11,6 +11,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from . import db
 from .services import validation
@@ -1831,19 +1832,22 @@ def _normalize_duration(value: object) -> int:
         return 0
 
 
-def _placeholder_media_token(url: str) -> str:
+def _placeholder_media_token(url: str, media_base_url: str = "") -> str:
     if not url:
         return ""
     normalized = re.sub(r"([?&]token=)[^&]+", r"\1__MEDIA_PLACEHOLDER__", url)
     if "token=" in normalized:
         return normalized
-    if "/media/" in normalized or "/images/" in normalized:
+    parsed = urlparse(normalized)
+    base = urlparse(media_base_url) if media_base_url else None
+    internal_url = not parsed.netloc or bool(base and parsed.netloc == base.netloc)
+    if internal_url and ("/media/" in parsed.path or "/images/" in parsed.path):
         sep = "&" if "?" in normalized else "?"
         return f"{normalized}{sep}token=__MEDIA_PLACEHOLDER__"
     return normalized
 
 
-def _read_existing_channel_image(rss_path: Path) -> str:
+def _read_existing_channel_image(rss_path: Path, media_base_url: str = "") -> str:
     if not rss_path.exists():
         return ""
     try:
@@ -1855,10 +1859,10 @@ def _read_existing_channel_image(rss_path: Path) -> str:
             return ""
         itunes_image = channel.find("itunes:image", ns)
         if itunes_image is not None and itunes_image.get("href"):
-            return _placeholder_media_token(itunes_image.get("href", ""))
+            return _placeholder_media_token(itunes_image.get("href", ""), media_base_url)
         image = channel.find("image")
         if image is not None and image.findtext("url"):
-            return _placeholder_media_token(image.findtext("url") or "")
+            return _placeholder_media_token(image.findtext("url") or "", media_base_url)
     except Exception:
         return ""
     return ""
@@ -1890,6 +1894,22 @@ def _write_metadata_file(json_root: Path, series: str, bvid: str, quality: str, 
     dst.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     dst.chmod(0o644)
     return dst
+
+
+def _file_backup(path: Path) -> tuple[bool, bytes]:
+    if not path.exists():
+        return False, b""
+    return True, path.read_bytes()
+
+
+def _restore_file(path: Path, backup: tuple[bool, bytes]) -> None:
+    existed, data = backup
+    if existed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o644)
+    else:
+        path.unlink(missing_ok=True)
 
 
 def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
@@ -2106,11 +2126,16 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
     json_root = Path(args.json_root) if args.json_root else Path("/var/lib/bilipod/json")
     rss_root = Path(args.rss_root) if args.rss_root else Path("/var/lib/bilipod/rss")
     media_dst = media_root / args.series / f"{bvid}_{quality}.mp3"
+    json_dst = json_root / args.series / f"{bvid}_{quality}.info.json"
+    rss_dst = rss_root / f"{args.series}.xml"
     if media_dst.exists() and not args.replace:
         print(f"❌ 目标文件已存在: {media_dst}")
         print("   使用 --replace 覆盖")
         sys.exit(EXIT_VALIDATION)
 
+    media_backup = _file_backup(media_dst)
+    json_backup = _file_backup(json_dst)
+    rss_backup = _file_backup(rss_dst)
     try:
         metadata = _fetch_single_video_metadata(args.url, args.cookie_file or os.environ.get("BILIPOD_COOKIE_FILE"))
         meta_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id") or bvid
@@ -2127,7 +2152,7 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         metadata["duration"] = _normalize_duration(metadata.get("duration"))
         metadata.setdefault("webpage_url", args.url)
         metadata.setdefault("link", args.url)
-        json_dst = _write_metadata_file(json_root, args.series, bvid, quality, metadata)
+        _write_metadata_file(json_root, args.series, bvid, quality, metadata)
 
         rss_path, item_count = rebuild_paid_rss(
             db_path,
@@ -2137,14 +2162,16 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
             rss_root=rss_root,
             media_base_url=args.media_base_url or "http://localhost:58743",
         )
+    except (ValueError, RuntimeError, OSError) as exc:
+        _restore_file(media_dst, media_backup)
+        _restore_file(json_dst, json_backup)
+        _restore_file(rss_dst, rss_backup)
+        print(f"❌ {exc}")
+        sys.exit(EXIT_VALIDATION if isinstance(exc, ValueError) else EXIT_SYNC_FAIL)
+
+    try:
         if args.publish_script:
             subprocess.run([args.publish_script], check=True)
-    except ValueError as exc:
-        print(f"❌ {exc}")
-        sys.exit(EXIT_VALIDATION)
-    except RuntimeError as exc:
-        print(f"❌ {exc}")
-        sys.exit(EXIT_SYNC_FAIL)
     except subprocess.CalledProcessError as exc:
         print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
         sys.exit(EXIT_SYNC_FAIL)
@@ -2222,7 +2249,7 @@ def rebuild_paid_rss(
         rss_root=rss_root, media_base_url=media_base_url,
     )
 
-    existing_cover = _read_existing_channel_image(rss_root / f"{series}.xml")
+    existing_cover = _read_existing_channel_image(rss_root / f"{series}.xml", media_base_url)
     with transaction(db_path) as conn:
         row = conn.execute("SELECT * FROM series WHERE series=?", (series,)).fetchone()
         sp_row = conn.execute("SELECT * FROM sync_policy WHERE series=?", (series,)).fetchone()
@@ -2232,7 +2259,9 @@ def rebuild_paid_rss(
 
     quality = sp_row["quality"] if sp_row and sp_row["quality"] else "64K"
     source_dict = dict(src_row) if src_row else {"uid": 1}
-    cover_art = row["cover_art"] or existing_cover
+    if not source_dict.get("space_url") and source_dict.get("uid"):
+        source_dict["space_url"] = f"https://space.bilibili.com/{source_dict['uid']}"
+    cover_art = _placeholder_media_token(row["cover_art"] or "", media_base_url) or existing_cover
     cfg = SeriesConfig(
         series=series, enabled=True, title=row["title"],
         description=row["description"] or "",
