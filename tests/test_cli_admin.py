@@ -1174,7 +1174,7 @@ def test_paid_rebuild_rss_accepts_ytdlp_metadata(tmp_path: Path) -> None:
         "id": bvid,
         "title": "Raw paid metadata",
         "timestamp": 1_800_000_000,
-        "duration": 600,
+        "duration": 600.4,
         "thumbnail": "http://example.invalid/cover.jpg",
         "webpage_url": f"https://www.bilibili.com/video/{bvid}",
     }
@@ -1197,6 +1197,155 @@ def test_paid_rebuild_rss_accepts_ytdlp_metadata(tmp_path: Path) -> None:
     assert "Raw paid metadata" in content
     assert f"https://www.bilibili.com/video/{bvid}" in content
     assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in content
+    assert "<itunes:duration>600</itunes:duration>" in content
+
+
+def test_paid_rebuild_rss_preserves_existing_channel_cover(tmp_path: Path) -> None:
+    """Manual RSS rebuild should not drop an existing channel cover."""
+    import json
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('coverraw','CoverRaw','T')")
+        conn.execute(
+            "INSERT INTO series_source(series,space_url,type,uid) "
+            "VALUES('coverraw','https://space.bilibili.com/1','space',1)"
+        )
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('coverraw','64K')")
+
+    bvid = "BV1234567891"
+    json_dir = tmp_path / "json" / "coverraw"
+    json_dir.mkdir(parents=True)
+    (json_dir / f"{bvid}_64K.info.json").write_text(json.dumps({
+        "bvid": bvid,
+        "title": "Cover item",
+        "pubdate": 100,
+        "duration": 300,
+        "link": f"https://www.bilibili.com/video/{bvid}",
+    }))
+    media_dir = tmp_path / "media" / "coverraw"
+    media_dir.mkdir(parents=True)
+    (media_dir / f"{bvid}_64K.mp3").write_text("data")
+    rss_root = tmp_path / "rss"
+    rss_root.mkdir()
+    (rss_root / "coverraw.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">'
+        '<channel><title>CoverRaw</title>'
+        '<itunes:image href="http://test:8080/images/cover.jpg" />'
+        '</channel></rss>'
+    )
+
+    p = ca.build_parser()
+    ns = p.parse_args(["--config-db", db_path, "paid", "rebuild-rss", "coverraw",
+                       "--json-root", str(tmp_path / "json"),
+                       "--media-root", str(tmp_path / "media"),
+                       "--rss-root", str(rss_root),
+                       "--media-base-url", "http://test:8080"])
+    ca.cmd_paid_rebuild_rss(ns)
+
+    content = (rss_root / "coverraw.xml").read_text()
+    assert "itunes:image" in content
+    assert "images/cover.jpg?token=__MEDIA_PLACEHOLDER__" in content
+
+
+def test_paid_add_item_converts_media_and_writes_single_metadata(tmp_path: Path, monkeypatch) -> None:
+    """add-item should convert arbitrary media, write one metadata JSON, and rebuild RSS."""
+    import json
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author,cover_art) VALUES('manualadd','ManualAdd','T','')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('manualadd','space',1)")
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('manualadd','64K')")
+
+    upload_dir = tmp_path / "manual-media"
+    upload_dir.mkdir()
+    src = upload_dir / "input.mp4"
+    src.write_text("video")
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
+    bvid = "BV1234567892"
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == [sys.executable, "-m", "yt_dlp"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({
+                "id": bvid,
+                "title": "Single manual item",
+                "timestamp": 1_800_000_000,
+                "duration": 2180.885,
+                "thumbnail": "http://example.invalid/thumb.jpg",
+                "webpage_url": f"https://www.bilibili.com/video/{bvid}/",
+            }), stderr="")
+        if cmd[0] == "ffmpeg":
+            assert Path(cmd[-1]).parent == tmp_path / "media" / "manualadd"
+            Path(cmd[-1]).write_bytes(b"mp3")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        p = ca.build_parser()
+        ns = p.parse_args(["--config-db", db_path, "paid", "add-item", "manualadd",
+                           "--url", f"https://www.bilibili.com/video/{bvid}/",
+                           "--media-path", str(src),
+                           "--json-root", str(tmp_path / "json"),
+                           "--media-root", str(tmp_path / "media"),
+                           "--rss-root", str(tmp_path / "rss"),
+                           "--media-base-url", "http://test:8080"])
+        ca.cmd_paid_add_item(ns)
+
+    media_file = tmp_path / "media" / "manualadd" / f"{bvid}_64K.mp3"
+    json_file = tmp_path / "json" / "manualadd" / f"{bvid}_64K.info.json"
+    rss_file = tmp_path / "rss" / "manualadd.xml"
+    assert media_file.read_bytes() == b"mp3"
+    meta = json.loads(json_file.read_text())
+    assert meta["bvid"] == bvid
+    assert meta["duration"] == 2181
+    content = rss_file.read_text()
+    assert "Single manual item" in content
+    assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in content
+
+
+def test_paid_add_item_existing_media_fails_before_network_or_transcode(tmp_path: Path, monkeypatch) -> None:
+    """Existing target media should fail before yt-dlp or ffmpeg is invoked."""
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('manualexists','ManualExists','T')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('manualexists','space',1)")
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('manualexists','64K')")
+
+    upload_dir = tmp_path / "manual-media"
+    upload_dir.mkdir()
+    src = upload_dir / "input.mp4"
+    src.write_text("video")
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
+    bvid = "BV1234567893"
+    target = tmp_path / "media" / "manualexists" / f"{bvid}_64K.mp3"
+    target.parent.mkdir(parents=True)
+    target.write_text("existing")
+
+    with patch.object(subprocess, "run") as run:
+        p = ca.build_parser()
+        ns = p.parse_args(["--config-db", db_path, "paid", "add-item", "manualexists",
+                           "--url", f"https://www.bilibili.com/video/{bvid}/",
+                           "--media-path", str(src),
+                           "--json-root", str(tmp_path / "json"),
+                           "--media-root", str(tmp_path / "media"),
+                           "--rss-root", str(tmp_path / "rss"),
+                           "--media-base-url", "http://test:8080"])
+        try:
+            ca.cmd_paid_add_item(ns)
+        except SystemExit as exc:
+            assert exc.code == ca.EXIT_VALIDATION
+        else:
+            raise AssertionError("expected validation failure")
+        run.assert_not_called()
 
 
 def test_paid_refresh_metadata_writes_192K_json(tmp_path: Path, monkeypatch) -> None:

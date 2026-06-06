@@ -1817,6 +1817,81 @@ def _get_series_quality(db_path: str, series: str) -> str:
     return quality if quality in ("64K", "132K", "192K") else "64K"
 
 
+def _bvid_from_text(text: str) -> str:
+    match = re.search(r"(BV[0-9A-Za-z]+)", text or "")
+    return match.group(1) if match else ""
+
+
+def _normalize_duration(value: object) -> int:
+    if value in (None, ""):
+        return 0
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _placeholder_media_token(url: str) -> str:
+    if not url:
+        return ""
+    normalized = re.sub(r"([?&]token=)[^&]+", r"\1__MEDIA_PLACEHOLDER__", url)
+    if "token=" in normalized:
+        return normalized
+    if "/media/" in normalized or "/images/" in normalized:
+        sep = "&" if "?" in normalized else "?"
+        return f"{normalized}{sep}token=__MEDIA_PLACEHOLDER__"
+    return normalized
+
+
+def _read_existing_channel_image(rss_path: Path) -> str:
+    if not rss_path.exists():
+        return ""
+    try:
+        import xml.etree.ElementTree as ET
+        ns = {"itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd"}
+        root = ET.parse(rss_path).getroot()
+        channel = root.find("channel")
+        if channel is None:
+            return ""
+        itunes_image = channel.find("itunes:image", ns)
+        if itunes_image is not None and itunes_image.get("href"):
+            return _placeholder_media_token(itunes_image.get("href", ""))
+        image = channel.find("image")
+        if image is not None and image.findtext("url"):
+            return _placeholder_media_token(image.findtext("url") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _ensure_channel_itunes_image(rss_path: Path, image_url: str) -> None:
+    if not image_url:
+        return
+    import xml.etree.ElementTree as ET
+    ET.register_namespace("itunes", "http://www.itunes.com/dtds/podcast-1.0.dtd")
+    tree = ET.parse(rss_path)
+    root = tree.getroot()
+    channel = root.find("channel")
+    if channel is None:
+        return
+    tag = "{http://www.itunes.com/dtds/podcast-1.0.dtd}image"
+    for node in list(channel.findall(tag)):
+        channel.remove(node)
+    node = ET.Element(tag)
+    node.set("href", image_url)
+    channel.insert(4, node)
+    tree.write(rss_path, encoding="utf-8", xml_declaration=True)
+    rss_path.chmod(0o644)
+
+
+def _write_metadata_file(json_root: Path, series: str, bvid: str, quality: str, metadata: dict[str, Any]) -> Path:
+    dst = json_root / series / f"{bvid}_{quality}.info.json"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    dst.chmod(0o644)
+    return dst
+
+
 def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
     """Refresh metadata for a manual media series (no download)."""
     db_path = _get_db(args)
@@ -1957,6 +2032,139 @@ def cmd_paid_attach_media(args: argparse.Namespace) -> None:
     print(f"  ✅ media 已关联: {dst.name} ({dst.stat().st_size} bytes)")
 
 
+def _fetch_single_video_metadata(video_url: str, cookie_file: str | None) -> dict[str, Any]:
+    cmd = [sys.executable, "-m", "yt_dlp", "--dump-json", "--skip-download"]
+    if cookie_file:
+        cmd.extend(["--cookies", cookie_file])
+    cmd.append(video_url)
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        err = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"metadata 获取失败: {_sanitize(err)}") from exc
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("metadata 输出不是有效 JSON") from exc
+
+
+def _convert_media_to_mp3(src: Path, dst_dir: Path, bvid: str, quality: str, ffmpeg_bin: str) -> tuple[Path, bool]:
+    if src.suffix.lower() == ".mp3":
+        return src, False
+    bitrate = quality.lower()
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dst_dir / f".{bvid}_{quality}.{os.getpid()}.mp3"
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(src),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        str(tmp),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        tmp.unlink(missing_ok=True)
+        err = (exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg 转码失败: {_sanitize(err)}") from exc
+    tmp.chmod(0o644)
+    return tmp, True
+
+
+def _copy_attached_media(src: Path, dst: Path, replace: bool) -> None:
+    if dst.exists() and not replace:
+        raise ValueError(f"目标文件已存在: {dst}")
+    import shutil
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src), str(dst))
+    dst.chmod(0o644)
+
+
+def cmd_paid_add_item(args: argparse.Namespace) -> None:
+    """Add one manual media item from a user-provided media file and video URL."""
+    db_path = _get_db(args)
+    _require_series(db_path, args.series)
+
+    src = Path(args.media_path)
+    if not is_allowed_manual_media_path(src):
+        print(f"❌ 路径不在白名单内: {src}")
+        print("   设置 BILIBILI_PODCAST_MANUAL_MEDIA_DIRS 环境变量配置允许目录")
+        sys.exit(EXIT_VALIDATION)
+    src = src.resolve()
+    if not src.exists() or not src.is_file():
+        print(f"❌ 文件不存在: {src}")
+        sys.exit(EXIT_VALIDATION)
+
+    bvid = _bvid_from_text(args.url)
+    if not bvid or not validation.validate_bvid(bvid):
+        print(f"❌ URL 中未找到有效 BVID: {args.url}")
+        sys.exit(EXIT_VALIDATION)
+
+    quality = _get_series_quality(db_path, args.series)
+    media_root = Path(args.media_root) if args.media_root else Path("/var/lib/bilibili-podcast/media")
+    json_root = Path(args.json_root) if args.json_root else Path("/var/lib/bilibili-podcast/json")
+    rss_root = Path(args.rss_root) if args.rss_root else Path("/var/lib/bilibili-podcast/rss")
+    media_dst = media_root / args.series / f"{bvid}_{quality}.mp3"
+    if media_dst.exists() and not args.replace:
+        print(f"❌ 目标文件已存在: {media_dst}")
+        print("   使用 --replace 覆盖")
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        metadata = _fetch_single_video_metadata(args.url, args.cookie_file or os.environ.get("BILIBILI_PODCAST_COOKIE_FILE"))
+        meta_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id") or bvid
+        if meta_bvid != bvid:
+            raise ValueError(f"metadata BVID 与 URL 不一致: {meta_bvid} != {bvid}")
+        converted, is_temp = _convert_media_to_mp3(src, media_dst.parent, bvid, quality, args.ffmpeg_bin)
+        try:
+            _copy_attached_media(converted, media_dst, args.replace)
+        finally:
+            if is_temp:
+                converted.unlink(missing_ok=True)
+
+        metadata["bvid"] = bvid
+        metadata["duration"] = _normalize_duration(metadata.get("duration"))
+        metadata.setdefault("webpage_url", args.url)
+        metadata.setdefault("link", args.url)
+        json_dst = _write_metadata_file(json_root, args.series, bvid, quality, metadata)
+
+        rss_path, item_count = rebuild_paid_rss(
+            db_path,
+            args.series,
+            json_root=json_root,
+            media_root=media_root,
+            rss_root=rss_root,
+            media_base_url=args.media_base_url or "http://localhost:58743",
+        )
+        if args.publish_script:
+            subprocess.run([args.publish_script], check=True)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        sys.exit(EXIT_VALIDATION)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        sys.exit(EXIT_SYNC_FAIL)
+    except subprocess.CalledProcessError as exc:
+        print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
+        sys.exit(EXIT_SYNC_FAIL)
+
+    result = {
+        "series": args.series,
+        "bvid": bvid,
+        "media_path": str(media_dst),
+        "json_path": str(json_dst),
+        "rss_path": str(rss_path),
+        "rss_items": item_count,
+    }
+    if _should_json(args):
+        _run_json(args, result)
+    print(f"  ✅ 手动条目已新增: {bvid}")
+    print(f"  media: {media_dst}")
+    print(f"  metadata: {json_dst}")
+    print(f"  RSS 已生成: {rss_path} ({item_count} 条)")
+
+
 def _episode_from_metadata(meta: dict[str, Any], bvid: str) -> dict[str, Any]:
     """Normalize sync or yt-dlp metadata into the RSS episode shape."""
     episode = dict(meta)
@@ -1964,7 +2172,7 @@ def _episode_from_metadata(meta: dict[str, Any], bvid: str) -> dict[str, Any]:
     episode["title"] = episode.get("title") or episode.get("fulltitle") or bvid
     episode["description"] = episode.get("description") or ""
     episode["pubdate"] = int(episode.get("pubdate") or episode.get("timestamp") or 0)
-    episode["duration"] = episode.get("duration") or 0
+    episode["duration"] = _normalize_duration(episode.get("duration"))
     episode["image"] = episode.get("image") or episode.get("thumbnail") or ""
     episode["link"] = episode.get("link") or episode.get("webpage_url") or f"https://www.bilibili.com/video/{bvid}"
     return episode
@@ -2014,6 +2222,7 @@ def rebuild_paid_rss(
         rss_root=rss_root, media_base_url=media_base_url,
     )
 
+    existing_cover = _read_existing_channel_image(rss_root / f"{series}.xml")
     with transaction(db_path) as conn:
         row = conn.execute("SELECT * FROM series WHERE series=?", (series,)).fetchone()
         sp_row = conn.execute("SELECT * FROM sync_policy WHERE series=?", (series,)).fetchone()
@@ -2023,18 +2232,20 @@ def rebuild_paid_rss(
 
     quality = sp_row["quality"] if sp_row and sp_row["quality"] else "64K"
     source_dict = dict(src_row) if src_row else {"uid": 1}
+    cover_art = row["cover_art"] or existing_cover
     cfg = SeriesConfig(
         series=series, enabled=True, title=row["title"],
         description=row["description"] or "",
-        author=row["author"], cover_art=row["cover_art"] or "",
+        author=row["author"], cover_art=cover_art,
         category=row["category"] or "", subcategories=[],
         explicit=bool(row["explicit"]), lang=row["lang"] or "zh-CN",
         source=source_dict, sync={"quality": quality},
         filters={}, paid_preview={}, keep_last=0,
     )
 
-    up_info = {"name": row["author"], "face": row["cover_art"], "sign": row["description"]}
+    up_info = {"name": row["author"], "face": cover_art, "sign": row["description"]}
     rss_path = generate_rss(cfg, paths, up_info, episodes, "__MEDIA_PLACEHOLDER__", dry_run=False)
+    _ensure_channel_itunes_image(rss_path, cover_art)
     return rss_path, len(episodes)
 
 
@@ -2342,6 +2553,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_attach.add_argument("--media-root", default="/var/lib/bilibili-podcast/media")
     p_attach.add_argument("--replace", action="store_true", help="覆盖已有 media")
     p_attach.set_defaults(handler=cmd_paid_attach_media)
+
+    p_add_item = paid_sub.add_parser("add-item", help="从用户提供 media + B 站视频页面新增手动条目")
+    p_add_item.add_argument("series")
+    p_add_item.add_argument("--url", required=True, help="B 站视频页面 URL")
+    p_add_item.add_argument("--media-path", required=True, help="服务器上的用户 media 文件路径")
+    p_add_item.add_argument("--media-root", default="/var/lib/bilibili-podcast/media")
+    p_add_item.add_argument("--json-root", default="/var/lib/bilibili-podcast/json")
+    p_add_item.add_argument("--rss-root", default="/var/lib/bilibili-podcast/rss")
+    p_add_item.add_argument("--media-base-url", default="http://localhost:58743")
+    p_add_item.add_argument("--cookie-file", help="Netscape cookie 文件路径")
+    p_add_item.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg 可执行文件路径")
+    p_add_item.add_argument("--replace", action="store_true", help="覆盖已有 media")
+    p_add_item.add_argument("--publish-script", help="重建 RSS 后执行的发布脚本")
+    p_add_item.set_defaults(handler=cmd_paid_add_item)
 
     p_rebuild = paid_sub.add_parser("rebuild-rss", help="从已有 metadata + media 重建 RSS")
     p_rebuild.add_argument("series")
