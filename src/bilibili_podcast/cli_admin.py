@@ -2552,6 +2552,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched_set.set_defaults(handler=cmd_scheduler_set)
 
     p_sched_disable = sched_sub.add_parser("disable", help="禁用试点 systemd timer，恢复 cron 调度")
+    p_sched_disable.add_argument("--backend", dest="scheduler_backend", default="systemd",
+                                 choices=["systemd"], help="调度后端（disable 仅支持 systemd）")
     p_sched_disable.add_argument("--series", required=True, help="系列标识")
     p_sched_disable.add_argument("--cron-script-dir", help="wrapper 输出目录（生产环境必填如 /opt/bilipod/auto）")
     p_sched_disable.add_argument("--delete-units", action="store_true", help="同时删除 unit 文件")

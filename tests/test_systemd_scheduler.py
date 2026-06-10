@@ -334,6 +334,17 @@ class TestCLIParsing:
         assert ns.series == "demo-series"
         assert ns.scheduler_yes is True
 
+    def test_scheduler_disable_backend_systemd_series_yes(self):
+        from bilibili_podcast.cli_admin import build_parser
+
+        p = build_parser()
+        ns = p.parse_args(
+            ["scheduler", "disable", "--backend", "systemd", "--series", "demo-series", "--yes"]
+        )
+        assert ns.scheduler_backend == "systemd"
+        assert ns.series == "demo-series"
+        assert ns.scheduler_disable_yes is True
+
     def test_cron_compat_still_works(self):
         from bilibili_podcast.cli_admin import build_parser
 

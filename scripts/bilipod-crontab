@@ -3,13 +3,14 @@
 bilipod-crontab — Read series configs and generate/manage cron.
 
 Usage:
-  bilipod-crontab [--config-dir DIR] [--apply] [--print]
+  bilipod-crontab [--config-dir DIR | --config-db DB] [--apply] [--print]
 
   --config-dir    Config directory (default: configs/series.d)
+  --config-db     SQLite database path (replaces --config-dir)
   --apply         Write generated crontab and wrapper scripts
   --print         Print generated crontab entries to stdout (default)
   --script-dir    Directory for auto-generated wrapper scripts (default: auto)
-  --user          Crontab user (default: bilipod)
+  --cron-user     Crontab user (default: bilipod)
   --force         Overwrite existing wrapper scripts
 """
 

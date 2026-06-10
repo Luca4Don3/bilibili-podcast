@@ -125,8 +125,10 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 | `--yes` | 跳过低风险确认 |
 | `--dry-run` | 只预览，不写 DB、不执行同步 |
 | `--json` | JSON 格式输出，方便脚本消费 |
-| `--quiet` | 减少输出，但错误仍清楚显示 |
-| `--debug` | 输出诊断信息 |
+| `--quiet` | 预留的安静输出开关，错误仍清楚显示 |
+| `--debug` | 预留的诊断输出开关；`preview` 会固定用 `--debug` 调用同步命令 |
+
+全局参数放在子命令前，例如 `bilipod-admin --config-db /path/to/bilipod.db list`。部分高频确认参数也支持放在子命令后，见下方命令说明。
 
 **系列管理：**
 
@@ -161,9 +163,13 @@ bilipod-admin add \
 
 非交互模式下需要 `--series` 和 `--title`/`--author`（或通过 `--url` 自动解析）。缺少必要参数且非 TTY 时报错退出。默认不覆盖已有系列，使用 `--update-existing` 允许更新。
 
+`add` 支持的非交互参数包括：`--url`、`--series`、`--title`、`--author`、`--description`、`--cover-art`、`--category`、`--lang`、`--exclude-keyword`、`--include-keyword`、`--ad-keyword`、`--exclude-bvid`、`--ad-bvid`、`--keep-last`、`--update-period`、`--quality`、`--fetch-strategy`、`--format`、`--page-size`、`--incremental-page-size`、`--max-pages`、`--max-requests-per-series`、`--request-interval-seconds`、`--request-jitter-seconds`、`--rate-limit-cooldown-seconds`、`--cron`、`--exclude-paid`、`--update-existing`、`--dry-run`、`--yes`。
+
 移除命令默认只预览，必须显式传入 `--apply` 才会执行。执行时会获取与同步进程相同的锁，再逐个系列移除 cron/systemd 调度；调度清理失败时不会继续删除该系列数据。成功后会删除 SQLite 中的系列及关联记录、本地 media/JSON 目录、master RSS、已发布的本地用户 RSS、cron wrapper、浏览器 profile，并从 `rss-publish-users.conf` 的显式系列列表中移除该系列。
 
 远端 RSS 节点不在该命令的控制范围内，远端 XML 不会自动删除。
+
+`remove-series` 和 `remove-up` 还支持：`--apply`、`--yes`、`--media-root`、`--json-root`、`--rss-root`、`--published-rss-root`、`--cron-script-dir`、`--browser-user-data-root`、`--lock-file`、`--users-conf`。这些路径参数默认读取对应 `BILIPOD_*` / `RSS_USERS_CONF` 环境变量，未设置时使用生产默认路径。
 
 **过滤规则管理：**
 
@@ -180,6 +186,8 @@ bilipod-admin add \
 | `bilipod-admin filters-disable <series> --rule-id 123` | 按 ID 禁用规则（别名: `fd`） |
 | `bilipod-admin filters-enable <series> --rule-id 123` | 按 ID 启用规则（别名: `fe`） |
 | `bilipod-admin filters-import <series> --type exclude_keyword --file keywords.txt` | 从文件批量导入。`--type` 可选: `exclude_keyword`, `include_keyword`, `ad_keyword`, `exclude_bvid`, `ad_bvid`（别名: `fi`） |
+
+`filters-add` 额外支持子命令级 `--yes`；`filters-remove` 支持 `--delete` 物理删除，否则默认只禁用匹配规则。
 
 **同步策略管理：**
 
@@ -217,6 +225,7 @@ bilipod-admin add \
 | `bilipod-admin scheduler status --backend systemd` | 显示 systemd timer 状态（enabled/active） |
 | `bilipod-admin scheduler set <series> --schedule "15 3 * * *" --yes` | 设置系列调度（仅写 DB，不安装） |
 | `bilipod-admin scheduler disable --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 禁用指定 series 的 systemd timer，并按需要恢复 cron 调度 |
+| `bilipod-admin scheduler disable --backend systemd --series <series> --delete-units --yes` | 禁用并删除对应 systemd unit 文件 |
 
 > **安全约束**：systemd backend 只应管理 `.timer`，不要手动触发生成的 `.service` 作为测试手段；不要把启用和立即运行合并成一步；timer 应保持 `Persistent=false`，避免补跑错过任务并触发额外 API 请求。需要验证时使用 `scheduler plan/status`、timer 状态、只读日志和 RSS token 扫描。
 
@@ -227,10 +236,12 @@ bilipod-admin add \
 | 命令 | 说明 |
 |------|------|
 | `bilipod-admin paid refresh-metadata <series> --json-root /path/to/json` | 刷新 metadata JSON，不下载媒体 |
+| `bilipod-admin paid refresh-metadata <series> --cookie-file /path/to/cookies.txt` | 使用指定 cookie 刷新 metadata |
 | `bilipod-admin paid list-missing <series> --json-root /path/to/json --media-root /path/to/media` | 列出已有 metadata 但缺少媒体的条目，只读 |
 | `bilipod-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --media-root /path/to/media` | 关联人工上传的 MP3 文件 |
 | `bilipod-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --replace` | 覆盖已有媒体文件 |
 | `bilipod-admin paid add-item <series> --url <bilibili-video-url> --media-path /path/to/uploaded-media` | 从用户提供的媒体文件和 B 站视频页面新增一条手动媒体 |
+| `bilipod-admin paid add-item <series> --ffmpeg-bin /path/to/ffmpeg --publish-script /path/to/publish.sh` | 指定转码命令和 RSS 重建后的发布脚本 |
 | `bilipod-admin paid rebuild-rss <series> --json-root /path/to/json --media-root /path/to/media --rss-root /path/to/rss` | 从现有 metadata + media 重建 master RSS |
 
 `attach-media` 只接受 MP3 文件，并校验 BVID。上传源文件必须位于部署环境配置的白名单目录内。`add-item` 可接受视频或其他 ffmpeg 支持的媒体格式，会调用 `ffmpeg` 转为当前 series 的 MP3 quality，使用视频页面拉取单条 metadata，并重建 master RSS。手动媒体文件名会使用该 series 当前 `sync.quality`，即 `{BVID}_{quality}.mp3`，不要对非 64K series 固定写 `_64K`。`rebuild-rss` 生成 master RSS 时使用 `__MEDIA_PLACEHOLDER__`，由 RSS 发布流程替换为用户专属 token。
@@ -631,10 +642,17 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 
 ### 日志级别
 
-| 级别 | 触发方式 | 内容 |
+当前主同步 CLI 暴露的是 `--debug` 开关，不是任意 `--log-level` 选择器。实际日志仍使用 Python 标准级别：
+
+| 级别 | 触发方式/来源 | 内容 |
 |------|----------|------|
-| INFO（默认） | 正常启动 | 运行开始/完成、系列开始/完成、API 抓取汇总、过滤统计（total/kept/各类排除数）、下载开始/完成/跳过、RSS 写入、清理汇总、错误/警告 |
-| DEBUG | `--debug` | 在此基础上增加：每页 API 请求 URL 和页码、每条剧集元数据写入、JSON 读写路径、磁盘空间检查、浏览器回退状态详情、合并/限制详情 |
+| DEBUG | `--debug` | 在 INFO 基础上增加：每页 API 请求 URL 和页码、每条剧集元数据写入、JSON 读写路径、磁盘空间检查、浏览器回退状态详情、合并/限制详情 |
+| INFO（默认） | 正常启动 | 运行开始/完成、系列开始/完成、API 抓取汇总、过滤统计（total/kept/各类排除数）、下载开始/完成/跳过、RSS 写入、清理汇总 |
+| WARNING | 运行时自动产生 | 可恢复异常、降级路径、浏览器/网络请求警告等；写入 `sync.log` 或 `playwright.log` |
+| ERROR | 运行时自动产生 | 同步失败、系列处理失败、发布结果错误；同时写入 `sync.error.log` |
+| CRITICAL | 运行时自动产生 | 预留给不可恢复的进程级故障；当前代码路径很少直接使用 |
+
+`sync.error.log` 只接收 `ERROR` 及以上级别，方便监控；`sync.log` 和 `playwright.log` 在默认模式记录 `INFO` 及以上，传 `--debug` 后记录 `DEBUG` 及以上。
 
 ---
 
