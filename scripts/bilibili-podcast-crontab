@@ -68,6 +68,7 @@ export PATH PLAYWRIGHT_BROWSERS_PATH
 MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-1}}
 FORCE=${{FORCE:-0}}
 DEBUG=${{DEBUG:-1}}
+LOG_LEVEL=${{LOG_LEVEL:-INFO}}
 CONFIG_DB="{CONFIG_DB}"
 # Allow override via BILIBILI_PODCAST_CONFIG_DB env var at runtime
 if [ -z "$CONFIG_DB" ]; then
@@ -75,6 +76,7 @@ if [ -z "$CONFIG_DB" ]; then
 fi
 FORCE_ARGS=""
 DEBUG_ARGS=""
+LOG_LEVEL_ARGS="--log-level $LOG_LEVEL"
 CONFIG_SRC_ARGS=""
 if [ "$FORCE" = "1" ]; then
   FORCE_ARGS="--force"
@@ -104,6 +106,7 @@ fi
   --max-downloads-per-run "$MAX_DOWNLOADS_PER_RUN" \\
   --min-free-gb {MIN_FREE_GB} \\
   --apply \\
+  $LOG_LEVEL_ARGS \\
   $FORCE_ARGS \\
   $DEBUG_ARGS
 
