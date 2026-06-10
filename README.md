@@ -97,7 +97,8 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 | `--browser-login-check` | off | 启动时用 Playwright 验证 cookie 登录状态 |
 | `--browser-login-wait-seconds` | `5.0` | 登录检查页面等待时间 |
 | `--log-dir` | `/var/log/bilipod` | 日志输出目录 |
-| `--debug` | off | 开启 DEBUG 级别日志 |
+| `--log-level` | `INFO` | 日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`（大小写不敏感） |
+| `--debug` | off | `--log-level DEBUG` 的兼容快捷方式，优先级高于 `--log-level` |
 | `--force` | off | 跳过更新周期和 rate-limit cooldown 门控 |
 | `--apply` | off | 实际写入文件和下载媒体，不带则为干跑 |
 
@@ -642,17 +643,17 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 
 ### 日志级别
 
-当前主同步 CLI 暴露的是 `--debug` 开关，不是任意 `--log-level` 选择器。实际日志仍使用 Python 标准级别：
+主同步 CLI 支持 `--log-level` 选择日志级别；`--debug` 保留为兼容快捷方式，等价于 `--log-level DEBUG` 且优先级更高。
 
 | 级别 | 触发方式/来源 | 内容 |
 |------|----------|------|
-| DEBUG | `--debug` | 在 INFO 基础上增加：每页 API 请求 URL 和页码、每条剧集元数据写入、JSON 读写路径、磁盘空间检查、浏览器回退状态详情、合并/限制详情 |
-| INFO（默认） | 正常启动 | 运行开始/完成、系列开始/完成、API 抓取汇总、过滤统计（total/kept/各类排除数）、下载开始/完成/跳过、RSS 写入、清理汇总 |
-| WARNING | 运行时自动产生 | 可恢复异常、降级路径、浏览器/网络请求警告等；写入 `sync.log` 或 `playwright.log` |
-| ERROR | 运行时自动产生 | 同步失败、系列处理失败、发布结果错误；同时写入 `sync.error.log` |
-| CRITICAL | 运行时自动产生 | 预留给不可恢复的进程级故障；当前代码路径很少直接使用 |
+| DEBUG | `--log-level DEBUG` 或 `--debug` | 在 INFO 基础上增加：每页 API 请求 URL 和页码、每条剧集元数据写入、JSON 读写路径、磁盘空间检查、浏览器回退状态详情、合并/限制详情 |
+| INFO（默认） | `--log-level INFO` 或不传 | 运行开始/完成、系列开始/完成、API 抓取汇总、过滤统计（total/kept/各类排除数）、下载开始/完成/跳过、RSS 写入、清理汇总 |
+| WARNING | `--log-level WARNING` | 只记录 warning/error/critical，适合降低常规同步噪声 |
+| ERROR | `--log-level ERROR` | 只记录失败级别事件；`sync.error.log` 也会接收这些记录 |
+| CRITICAL | `--log-level CRITICAL` | 只记录不可恢复的进程级故障；当前代码路径很少直接使用 |
 
-`sync.error.log` 只接收 `ERROR` 及以上级别，方便监控；`sync.log` 和 `playwright.log` 在默认模式记录 `INFO` 及以上，传 `--debug` 后记录 `DEBUG` 及以上。
+`sync.error.log` 始终只接收 `ERROR` 及以上级别，方便监控；`sync.log` 和 `playwright.log` 按 `--log-level` 控制最低记录级别。
 
 ---
 

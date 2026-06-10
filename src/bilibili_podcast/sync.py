@@ -42,15 +42,35 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 21600
 DEFAULT_UPDATE_PERIOD_GRACE_SECONDS = 120
 DEFAULT_BROWSER_USER_DATA_ROOT = "/tmp/bilibili-podcast-browser-profiles"
 DEFAULT_LOG_DIR = "/var/log/bilipod"
+LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
 
 LOGGER = logging.getLogger("bilibili_podcast.sync")
 PLAYWRIGHT_LOGGER = logging.getLogger("bilibili_podcast.sync.playwright")
 
 
-def setup_logging(log_dir: str, debug: bool = False) -> Path:
-    requested_log_root = Path(log_dir)
+def parse_log_level(value: str) -> str:
+    level = value.upper()
+    if level not in LOG_LEVELS:
+        choices = ", ".join(LOG_LEVELS)
+        raise argparse.ArgumentTypeError(f"invalid log level {value!r}; choose one of: {choices}")
+    return level
 
-    def configure_handlers(log_root: Path, debug: bool = False) -> None:
+
+def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) -> Path:
+    if isinstance(log_level, bool):
+        debug = log_level
+        log_level = "INFO"
+    requested_log_root = Path(log_dir)
+    effective_level_name = "DEBUG" if debug else parse_log_level(log_level)
+    effective_level = LOG_LEVELS[effective_level_name]
+
+    def configure_handlers(log_root: Path) -> None:
         formatter = logging.Formatter(
             "%(asctime)s %(levelname)s [%(name)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
@@ -59,7 +79,7 @@ def setup_logging(log_dir: str, debug: bool = False) -> Path:
             (LOGGER, "sync.log"),
             (PLAYWRIGHT_LOGGER, "playwright.log"),
         ):
-            logger.setLevel(logging.DEBUG if debug else logging.INFO)
+            logger.setLevel(effective_level)
             logger.propagate = False
             logger.handlers.clear()
             handler = RotatingFileHandler(
@@ -85,7 +105,7 @@ def setup_logging(log_dir: str, debug: bool = False) -> Path:
     log_root = requested_log_root
     try:
         log_root.mkdir(parents=True, exist_ok=True)
-        configure_handlers(log_root, debug)
+        configure_handlers(log_root)
     except OSError as exc:
         fallback = Path("/tmp/bilibili-podcast-logs")
         fallback.mkdir(parents=True, exist_ok=True)
@@ -94,9 +114,15 @@ def setup_logging(log_dir: str, debug: bool = False) -> Path:
             file=sys.stderr,
         )
         log_root = fallback
-        configure_handlers(log_root, debug)
+        configure_handlers(log_root)
 
-    LOGGER.info("logging initialized log_dir=%s pid=%s debug=%s", log_root, os.getpid(), debug)
+    LOGGER.info(
+        "logging initialized log_dir=%s pid=%s log_level=%s debug=%s",
+        log_root,
+        os.getpid(),
+        effective_level_name,
+        debug,
+    )
     return log_root
 
 
@@ -1842,7 +1868,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-login-check", action="store_true", help="Open Bilibili once with Playwright and loaded cookies to verify browser login.")
     parser.add_argument("--browser-login-wait-seconds", type=float, default=5.0)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Directory for bilibili-podcast and Playwright logs.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug-level logging (per-item details).")
+    parser.add_argument("--log-level", type=parse_log_level, default="INFO", help="Log level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
+    parser.add_argument("--debug", action="store_true", help="Shortcut for --log-level DEBUG (per-item details).")
     parser.add_argument("--force", action="store_true", help="Ignore per-series update and rate-limit cooldown gates.")
     parser.add_argument("--apply", action="store_true", help="Write files and download missing media.")
     return parser
@@ -1850,7 +1877,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    setup_logging(args.log_dir, args.debug)
+    setup_logging(args.log_dir, args.log_level, args.debug)
     with process_lock(args.lock_file):
         return asyncio.run(run(args))
 
