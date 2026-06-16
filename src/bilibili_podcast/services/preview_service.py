@@ -50,7 +50,7 @@ class PreviewService:
                 error="未配置 BILIBILI_PODCAST_SYNC_PATH，无法执行干跑。",
             )
 
-        cmd = [sync_bin, "--config-db", self.db_path, "--series", series, "--debug"]
+        cmd = [sync_bin, "--config-db", self.db_path, "--series", series, "--log-level", "DEBUG"]
         if extra_args:
             cmd.extend(extra_args)
 
