@@ -67,7 +67,7 @@ export PATH PLAYWRIGHT_BROWSERS_PATH
 
 MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-1}}
 FORCE=${{FORCE:-0}}
-DEBUG=${{DEBUG:-1}}
+DEBUG=${{DEBUG:-0}}
 LOG_LEVEL=${{LOG_LEVEL:-INFO}}
 CONFIG_DB="{CONFIG_DB}"
 # Allow override via BILIPOD_CONFIG_DB env var at runtime
@@ -75,20 +75,21 @@ if [ -z "$CONFIG_DB" ]; then
   CONFIG_DB="${{BILIPOD_CONFIG_DB:-}}"
 fi
 FORCE_ARGS=""
-DEBUG_ARGS=""
-LOG_LEVEL_ARGS="--log-level $LOG_LEVEL"
 CONFIG_SRC_ARGS=""
 if [ "$FORCE" = "1" ]; then
   FORCE_ARGS="--force"
-fi
-if [ "$DEBUG" = "1" ]; then
-  DEBUG_ARGS="--debug"
 fi
 if [ -n "$CONFIG_DB" ]; then
   CONFIG_SRC_ARGS="--config-db $CONFIG_DB"
 else
   CONFIG_SRC_ARGS="--config-dir {CONFIG_DIR}"
 fi
+
+LOG_LEVEL_VAL=$LOG_LEVEL
+if [ "$DEBUG" = "1" ]; then
+  LOG_LEVEL_VAL="DEBUG"
+fi
+LOG_LEVEL_ARGS="--log-level $LOG_LEVEL_VAL"
 
 {BILIPOD_SYNC_PATH} \\
   $CONFIG_SRC_ARGS \\
@@ -107,8 +108,7 @@ fi
   --min-free-gb {MIN_FREE_GB} \\
   --apply \\
   $LOG_LEVEL_ARGS \\
-  $FORCE_ARGS \\
-  $DEBUG_ARGS
+  $FORCE_ARGS
 
 # 分发各用户 RSS 到 /var/lib/bilipod/published-rss/{{token}}/
 {RSS_PUBLISH_SCRIPT}

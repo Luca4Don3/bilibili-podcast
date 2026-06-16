@@ -1061,7 +1061,7 @@ def cmd_preview(args: argparse.Namespace) -> None:
         print("❌ 找不到 bilibili-podcast 命令")
         sys.exit(EXIT_SYNC_FAIL)
 
-    cmd = [sync_bin, "--config-db", db_path, "--series", args.series, "--debug"]
+    cmd = [sync_bin, "--config-db", db_path, "--series", args.series, "--log-level", "DEBUG"]
 
     print(f"🔍 执行干跑: {args.series} ...\n")
     try:
