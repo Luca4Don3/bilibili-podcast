@@ -127,7 +127,7 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 | `--dry-run` | 只预览，不写 DB、不执行同步 |
 | `--json` | JSON 格式输出，方便脚本消费 |
 | `--quiet` | 预留的安静输出开关，错误仍清楚显示 |
-| `--debug` | 预留的诊断输出开关；`preview` 会固定用 `--debug` 调用同步命令 |
+| `--debug` | 预留的诊断输出开关；`preview` 会固定用 `--log-level DEBUG` 调用同步命令 |
 
 全局参数放在子命令前，例如 `bilipod-admin --config-db /path/to/bilipod.db list`。部分高频确认参数也支持放在子命令后，见下方命令说明。
 
@@ -654,6 +654,10 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 | CRITICAL | `--log-level CRITICAL` | 只记录不可恢复的进程级故障；当前代码路径很少直接使用 |
 
 `sync.error.log` 始终只接收 `ERROR` 及以上级别，方便监控；`sync.log` 和 `playwright.log` 按 `--log-level` 控制最低记录级别。
+
+systemd 用户可通过环境变量 `BILIPOD_SYNC_LOG_LEVEL` 控制生成 service 时的日志级别（默认 `INFO`）。当设为 `DEBUG` 时，生成的 unit 使用 `--debug`（兼容旧行为）；其它值使用 `--log-level <LEVEL>`。
+
+cron wrapper 用户可通过环境变量 `LOG_LEVEL`（默认 `INFO`）和 `DEBUG=1` 控制日志级别，`DEBUG=1` 优先级更高。
 
 ---
 
