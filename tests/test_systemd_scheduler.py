@@ -76,6 +76,17 @@ class TestUnitGeneration:
         env_file.write_text('export BILIPOD_MEDIA_BASE_URL="http://media.example"\n')
         assert sysd._env_file_value(env_file, "BILIPOD_MEDIA_BASE_URL") == "http://media.example"
 
+    def test_generate_service_no_debug_by_default(self, monkeypatch):
+        # 清除可能干扰的环境变量，默认 level=INFO 不应产生 --debug
+        monkeypatch.delenv("BILIPOD_SYNC_LOG_LEVEL", raising=False)
+        content = sysd.generate_service("testseries")
+        assert "--debug" not in content
+
+    def test_generate_service_log_level_warning(self, monkeypatch):
+        monkeypatch.setenv("BILIPOD_SYNC_LOG_LEVEL", "WARNING")
+        content = sysd.generate_service("testseries")
+        assert "--log-level WARNING" in content
+
     def test_timer_contains_oncalendar(self):
         content = sysd.generate_timer("testseries", ["*-*-* 03:15:00"])
         assert "OnCalendar=*-*-* 03:15:00" in content

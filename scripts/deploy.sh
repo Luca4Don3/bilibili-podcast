@@ -628,7 +628,7 @@ for r in rows: print(r['series'])
             --lock-file "$LOCK_FILE" \
             --log-dir "$LOG_DIR" \
             --browser-user-data-root "$APP_DIR/browser-profiles" \
-            --debug 2>&1 | tail -15 | sed 's/^/  /'
+            --log-level DEBUG 2>&1 | tail -15 | sed 's/^/  /'
     else
         echo "  (跳过，设 SMOKE_SYNC=1 执行真实 API 测试)"
     fi
