@@ -56,6 +56,7 @@ MEDIA_BASE_URL = (
     or _env_file_value(ENV_FILE, "BILIBILI_PODCAST_MEDIA_BASE_URL")
     or "http://localhost:58743"
 )
+SYNC_LOG_LEVEL = os.environ.get("BILIBILI_PODCAST_SYNC_LOG_LEVEL", "INFO")
 
 # ── service unit template ──────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ User=bilibili-podcast
 Group=bilibili-podcast
 WorkingDirectory={app_dir}
 Environment=PLAYWRIGHT_BROWSERS_PATH={pw_browsers}
-ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply --debug
+ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply{log_level_args}
 ExecStartPost={rss_publish}
 Restart=no
 TimeoutStartSec=1800
@@ -136,6 +137,18 @@ _RSS_PUBLISH = Path(os.environ.get("BILIBILI_PODCAST_RSS_PUBLISH",
                                      "<server_path>"))
 
 
+def _log_level_args() -> str:
+    """Return the log-level CLI args for the sync ExecStart line."""
+    level = (os.environ.get("BILIBILI_PODCAST_SYNC_LOG_LEVEL", SYNC_LOG_LEVEL) or "INFO").upper()
+    if level == "DEBUG":
+        # Keep the historical --debug flag so existing tooling continues to work.
+        return " --debug"
+    if level in ("INFO", "WARNING", "ERROR", "CRITICAL"):
+        return f" --log-level {level}"
+    # Unknown level: fall back to INFO to avoid breaking the unit.
+    return " --log-level INFO"
+
+
 def generate_service(series: str) -> str:
     """Return the service unit content for *series*."""
     return SERVICE_TEMPLATE.format(
@@ -154,6 +167,7 @@ def generate_service(series: str) -> str:
         media_base_url=MEDIA_BASE_URL,
         browser_data_root=BROWSER_DATA_ROOT,
         rss_publish=_RSS_PUBLISH,
+        log_level_args=_log_level_args(),
     )
 
 
