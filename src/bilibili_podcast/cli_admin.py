@@ -21,6 +21,7 @@ from .services.sync_policy_service import SyncPolicyService, SYNC_POLICY_DEFAULT
 from .services.preview_service import PreviewService
 from .services.scheduler_service import SchedulerService
 from .services.series_removal_service import SeriesRemovalPlan, SeriesRemovalService
+from .utils.bilibili_url import parse_space_source
 
 DB_ENV_VAR = "BILIBILI_PODCAST_CONFIG_DB"
 
@@ -80,6 +81,24 @@ def _ts_str(ts: int) -> str:
 def _load_full_config(conn, series: str) -> dict[str, Any]:
     cs = ConfigService(conn)
     return cs.load_full_config(series) or {}
+
+
+def _resolve_bilibili_url(url: str) -> dict[str, Any]:
+    import asyncio
+    from .web.resolver import resolve_url
+
+    return asyncio.run(resolve_url(url))
+
+
+def _with_fallback_source(result: dict[str, Any], fallback_source: dict[str, Any] | None) -> dict[str, Any]:
+    if not fallback_source:
+        return result
+    source = dict(result.get("source") or {})
+    source["type"] = source.get("type") or fallback_source["type"]
+    source["uid"] = source.get("uid") or fallback_source["uid"]
+    source["sid"] = source.get("sid")
+    source["space_url"] = source.get("space_url") or fallback_source["space_url"]
+    return {**result, "source": source}
 
 
 # ── Subcommand handlers ────────────────────────────────────────────────
@@ -301,16 +320,15 @@ def cmd_add(args: argparse.Namespace) -> None:
     url = input("B 站 URL / UID: ").strip()
 
     draft = None
+    fallback_source = parse_space_source(url)
     if url:
         try:
-            import asyncio
-            from .web.resolver import resolve_url
-            result = asyncio.run(resolve_url(url))
+            result = _resolve_bilibili_url(url)
             if result.get("error"):
                 print(f"⚠️ 解析失败: {result['error']}")
                 print("将进入手动模式。\n")
             else:
-                draft = result
+                draft = _with_fallback_source(result, fallback_source)
                 print(f"\n✅ 解析成功！发现: {draft.get('title', '?')}")
                 if draft.get("videos"):
                     print(f"   最近 {len(draft['videos'])} 个视频:")
@@ -319,6 +337,9 @@ def cmd_add(args: argparse.Namespace) -> None:
                 print()
         except Exception as e:
             print(f"⚠️ 解析异常: {e}，进入手动模式\n")
+        if draft is None and fallback_source:
+            print(f"⚠️ 使用本地 URL 解析结果: UID={fallback_source['uid']}\n")
+            draft = {"source": fallback_source}
 
     # Collect series data
     data = _interactive_collect_series(draft)
@@ -474,19 +495,22 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
             print("❌ 非交互模式下需要 --yes 参数以确认保存")
             sys.exit(EXIT_ARGS_ERROR)
 
-    # Resolve URL if provided
+    # Resolve URL if provided. UID/source extraction is local and must not
+    # depend on Bilibili API availability.
     draft = None
+    fallback_source = parse_space_source(args.url)
     if args.url:
         try:
-            import asyncio
-            from .web.resolver import resolve_url
-            result = asyncio.run(resolve_url(args.url))
+            result = _resolve_bilibili_url(args.url)
             if result.get("error"):
                 print(f"⚠️ 解析失败: {result['error']}")
             else:
-                draft = result
+                draft = _with_fallback_source(result, fallback_source)
         except Exception as e:
             print(f"⚠️ 解析异常: {e}")
+        if draft is None and fallback_source:
+            print(f"⚠️ 使用本地 URL 解析结果: UID={fallback_source['uid']}")
+            draft = {"source": fallback_source}
 
     # Check slug uniqueness / load existing config for --update-existing
     existing_series: dict[str, Any] = {}

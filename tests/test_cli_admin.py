@@ -1642,3 +1642,73 @@ def test_is_allowed_path_rejects_symlink_escape(tmp_path):
             del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
             os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
+
+
+# ── add --url 非交互模式本地 UID 解析 ────────────────────────────────
+
+
+def test_with_fallback_source_fills_missing_uid() -> None:
+    from bilibili_podcast.utils.bilibili_url import parse_space_source
+
+    merged = cli_admin._with_fallback_source(
+        {"source": {"uid": 0, "space_url": ""}},
+        parse_space_source("https://space.bilibili.com/123456"),
+    )
+    assert merged["source"]["uid"] == 123456
+
+
+def test_add_url_fallback_extracts_uid_when_resolver_fails(tmp_path: Path) -> None:
+    """resolve_url failure must not leave series_source.uid as 0."""
+    import sqlite3
+
+    db_path = _migrate(tmp_path)
+    ns = cli_admin.build_parser().parse_args([
+        "--config-db", db_path,
+        "add",
+        "--series", "fallbackuid",
+        "--url", "https://space.bilibili.com/123456",
+        "--title", "Fallback UID Test",
+        "--author", "Tester",
+        "--yes",
+    ])
+
+    with patch.object(
+        cli_admin, "_resolve_bilibili_url", side_effect=RuntimeError("API unavailable"),
+    ), patch.object(sys, "stdout"):
+        cli_admin.cmd_add(ns)
+
+    with sqlite3.connect(db_path) as conn:
+        src = conn.execute(
+            "SELECT uid, space_url FROM series_source WHERE series='fallbackuid'"
+        ).fetchone()
+    assert src == (123456, "https://space.bilibili.com/123456")
+
+
+# ── generate_rss channel 级 itunes:image ──────────────────────────────
+
+
+def test_generate_rss_has_channel_itunes_image(tmp_path: Path) -> None:
+    from bilibili_podcast.sync import SyncPaths, generate_rss
+    from bilibili_podcast.utils.series_config import SeriesConfig
+
+    cfg = SeriesConfig(
+        series="imgtest", enabled=True, title="ImageTest",
+        description="desc", author="A", cover_art="https://example.invalid/cover.jpg",
+        category="Music", subcategories=[], explicit=False, lang="zh-CN",
+        source={"uid": 1, "space_url": "https://space.bilibili.com/1"},
+        sync={"quality": "64K"}, filters={}, paid_preview={}, keep_last=0,
+    )
+    paths = SyncPaths(
+        media_root=tmp_path / "media",
+        json_root=tmp_path / "json",
+        rss_root=tmp_path / "rss",
+        media_base_url="http://test:8080",
+    )
+
+    rss_path = generate_rss(
+        cfg, paths, {"name": "A", "face": "", "sign": ""}, [],
+        "__MEDIA_PLACEHOLDER__", dry_run=False,
+    )
+    content = rss_path.read_text(encoding="utf-8")
+    assert "itunes:image" in content
+    assert "https://example.invalid/cover.jpg" in content
