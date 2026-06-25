@@ -21,6 +21,7 @@ from .services.sync_policy_service import SyncPolicyService, SYNC_POLICY_DEFAULT
 from .services.preview_service import PreviewService
 from .services.scheduler_service import SchedulerService
 from .services.series_removal_service import SeriesRemovalPlan, SeriesRemovalService
+from .utils.bilibili_url import parse_space_source
 
 DB_ENV_VAR = "BILIPOD_CONFIG_DB"
 
@@ -87,31 +88,6 @@ def _resolve_bilibili_url(url: str) -> dict[str, Any]:
     from .web.resolver import resolve_url
 
     return asyncio.run(resolve_url(url))
-
-
-def _space_source_from_text(text: str | None) -> dict[str, Any] | None:
-    """Extract a Bilibili space UID without network/API dependencies."""
-    value = (text or "").strip()
-    if not value:
-        return None
-    uid: int | None = None
-    if re.fullmatch(r"\d{5,}", value):
-        uid = int(value)
-    else:
-        match = re.search(
-            r"(?:https?://)?(?:space\.|www\.)?bilibili\.com/(?:space/)?(\d+)(?=$|[/?#])",
-            value,
-        )
-        if match:
-            uid = int(match.group(1))
-    if uid is None:
-        return None
-    return {
-        "type": "space",
-        "uid": uid,
-        "sid": None,
-        "space_url": f"https://space.bilibili.com/{uid}",
-    }
 
 
 def _with_fallback_source(result: dict[str, Any], fallback_source: dict[str, Any] | None) -> dict[str, Any]:
@@ -344,7 +320,7 @@ def cmd_add(args: argparse.Namespace) -> None:
     url = input("B 站 URL / UID: ").strip()
 
     draft = None
-    fallback_source = _space_source_from_text(url)
+    fallback_source = parse_space_source(url)
     if url:
         try:
             result = _resolve_bilibili_url(url)
@@ -522,7 +498,7 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
     # Resolve URL if provided. UID/source extraction is local and must not
     # depend on Bilibili API availability.
     draft = None
-    fallback_source = _space_source_from_text(args.url)
+    fallback_source = parse_space_source(args.url)
     if args.url:
         try:
             result = _resolve_bilibili_url(args.url)

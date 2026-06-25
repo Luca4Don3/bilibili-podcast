@@ -1647,27 +1647,12 @@ def test_is_allowed_path_rejects_symlink_escape(tmp_path):
 # ── add --url 非交互模式本地 UID 解析 ────────────────────────────────
 
 
-def test_space_source_from_text_extracts_uid_without_api() -> None:
-    assert cli_admin._space_source_from_text(
-        "https://space.bilibili.com/123456?spm=x"
-    ) == {
-        "type": "space",
-        "uid": 123456,
-        "sid": None,
-        "space_url": "https://space.bilibili.com/123456",
-    }
-    assert cli_admin._space_source_from_text(
-        "https://www.bilibili.com/space/654321/"
-    )["uid"] == 654321
-    assert cli_admin._space_source_from_text("123456")["space_url"] == (
-        "https://space.bilibili.com/123456"
-    )
-    assert cli_admin._space_source_from_text(
-        "https://www.bilibili.com/video/BV1xx411c7mD"
-    ) is None
+def test_with_fallback_source_fills_missing_uid() -> None:
+    from bilibili_podcast.utils.bilibili_url import parse_space_source
+
     merged = cli_admin._with_fallback_source(
         {"source": {"uid": 0, "space_url": ""}},
-        cli_admin._space_source_from_text("https://space.bilibili.com/123456"),
+        parse_space_source("https://space.bilibili.com/123456"),
     )
     assert merged["source"]["uid"] == 123456
 

@@ -49,9 +49,23 @@ LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+EXIT_SYNC_ERROR = 1
+EXIT_PUBLISH_ERROR = 3
+MAX_PUBLISH_ERROR_CHARS = 4000
 
 LOGGER = logging.getLogger("bilibili_podcast.sync")
 PLAYWRIGHT_LOGGER = logging.getLogger("bilibili_podcast.sync.playwright")
+
+
+def sanitize_external_output(text: str) -> str:
+    """Redact common credentials and bound external command output for logs."""
+    sanitized = re.sub(r"(?i)Bearer\s+\S+", "Bearer ***", text or "")
+    sanitized = re.sub(
+        r"(?i)(token|secret|password|authorization)\s*[=:]\s*\S+",
+        r"\1=***",
+        sanitized,
+    )
+    return sanitized[-MAX_PUBLISH_ERROR_CHARS:]
 
 
 def parse_log_level(value: str) -> str:
@@ -1858,7 +1872,7 @@ async def run(args: argparse.Namespace) -> int:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             LOGGER.error("publish script failed: %s", exc)
-            return 3
+            return EXIT_PUBLISH_ERROR
         if result.stdout:
             LOGGER.info(
                 "publish script stdout bytes=%s", len(result.stdout.encode("utf-8")),
@@ -1868,10 +1882,15 @@ async def run(args: argparse.Namespace) -> int:
                 "publish script stderr bytes=%s", len(result.stderr.encode("utf-8")),
             )
         if result.returncode != 0:
-            LOGGER.error("publish script failed with code %s", result.returncode)
-            return 3
+            details = sanitize_external_output(result.stderr or result.stdout)
+            LOGGER.error(
+                "publish script failed with code %s: %s",
+                result.returncode,
+                details or "(no output)",
+            )
+            return EXIT_PUBLISH_ERROR
 
-    return 0
+    return EXIT_SYNC_ERROR if had_error else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

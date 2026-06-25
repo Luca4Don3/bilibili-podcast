@@ -12,9 +12,8 @@ from urllib.parse import urlparse, parse_qs
 
 import bilibili_api
 
-_SPACE_RE = re.compile(
-    r"(?:https?://)?(?:space\.|www\.)?bilibili\.com/(?:space/)?(\d+)(?=$|[/?#])"
-)
+from ..utils.bilibili_url import parse_space_source
+
 _SEASON_RE = re.compile(
     r"(?:https?://)?(?:www\.)?bilibili\.com/bangumi/play/ss(\d+)"
 )
@@ -24,7 +23,6 @@ _SERIES_RE = re.compile(
 _MEDIA_RE = re.compile(
     r"(?:https?://)?(?:www\.)?bilibili\.com/(?:video/)?(BV[a-zA-Z0-9]+)"
 )
-_UID_RE = re.compile(r"^\d{5,}$")
 _SID_RE = re.compile(r"^\d+$")
 
 
@@ -52,18 +50,17 @@ async def resolve_url(url: str) -> dict:
     if m:
         return await _resolve_series(m.group(1))
 
-    m = _SPACE_RE.match(url)
-    if m:
-        return await _resolve_space(m.group(1), url)
+    space_source = parse_space_source(url)
+    if space_source:
+        return await _resolve_space(
+            str(space_source["uid"]),
+            space_source["space_url"],
+        )
 
     m = _MEDIA_RE.match(url)
     if m:
         # Single video — try to extract UID from video info
         return await _resolve_video(m.group(1))
-
-    # Plain UID
-    if _UID_RE.match(url):
-        return await _resolve_space(url, f"https://space.bilibili.com/{url}")
 
     # Plain sid — user must specify type
     if _SID_RE.match(url):
