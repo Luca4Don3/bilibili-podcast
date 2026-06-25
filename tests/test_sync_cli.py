@@ -4,7 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from bilibili_podcast import sync as sync_mod
-from bilibili_podcast.sync import LOGGER, build_parser, setup_logging
+from bilibili_podcast.sync import (
+    EXIT_PUBLISH_ERROR,
+    EXIT_SYNC_ERROR,
+    LOGGER,
+    build_parser,
+    sanitize_external_output,
+    setup_logging,
+)
 from bilibili_podcast.utils.series_config import SeriesConfig
 
 
@@ -122,7 +129,7 @@ def test_publish_script_skipped_after_sync_error(tmp_path) -> None:
             patch.object(sync_mod.subprocess, "run") as run:
         rc = asyncio.run(sync_mod.run(_sync_args(tmp_path)))
 
-    assert rc == 0
+    assert rc == EXIT_SYNC_ERROR
     run.assert_not_called()
 
 
@@ -133,11 +140,27 @@ def test_publish_script_failure_returns_nonzero(tmp_path) -> None:
         return {"series": "synctest"}
 
     def fake_run(cmd, **kwargs):
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="publish error")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="publish error token=real-value",
+        )
 
     with patch.object(sync_mod, "make_store", return_value=_sync_store()), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series), \
-            patch.object(sync_mod.subprocess, "run", side_effect=fake_run):
+            patch.object(sync_mod.subprocess, "run", side_effect=fake_run), \
+            patch.object(sync_mod.LOGGER, "error") as log_error:
         rc = asyncio.run(sync_mod.run(_sync_args(tmp_path)))
 
-    assert rc == 3
+    assert rc == EXIT_PUBLISH_ERROR
+    logged = " ".join(str(arg) for arg in log_error.call_args.args)
+    assert "publish error" in logged
+    assert "real-value" not in logged
+
+
+def test_publish_failure_output_is_redacted_and_bounded() -> None:
+    output = "x" * 5000 + " token=real-value Authorization:Bearer secret-value"
+
+    sanitized = sanitize_external_output(output)
+
+    assert len(sanitized) <= sync_mod.MAX_PUBLISH_ERROR_CHARS
+    assert "real-value" not in sanitized
+    assert "secret-value" not in sanitized
