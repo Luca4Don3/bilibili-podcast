@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs
 import bilibili_api
 
 _SPACE_RE = re.compile(
-    r"(?:https?://)?(?:www\.)?bilibili\.com/(?:space/)?(\d+)"
+    r"(?:https?://)?(?:space\.|www\.)?bilibili\.com/(?:space/)?(\d+)(?=$|[/?#])"
 )
 _SEASON_RE = re.compile(
     r"(?:https?://)?(?:www\.)?bilibili\.com/bangumi/play/ss(\d+)"

@@ -55,7 +55,7 @@ bilibili-podcast \
   --apply
 ```
 
-不带 `--apply` 时为干跑模式，仅获取和过滤数据，不写入任何文件。
+不带 `--apply` 时为干跑模式，仅获取和过滤数据，不写入任何文件。手动全量同步需要同步成功后分发用户 RSS 时，追加 `--publish-script /path/to/rss-publish.sh`。
 
 ### 配置来源选择
 
@@ -101,6 +101,7 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 | `--debug` | off | `--log-level DEBUG` 的兼容快捷方式，优先级高于 `--log-level` |
 | `--force` | off | 跳过更新周期和 rate-limit cooldown 门控 |
 | `--apply` | off | 实际写入文件和下载媒体，不带则为干跑 |
+| `--publish-script` | (none) | 发布脚本路径，仅在 `--apply` 且全部系列同步成功后执行 |
 
 ### bilibili-podcast-crontab
 
@@ -756,6 +757,8 @@ http://rss-host:58743/rss/<user_token>/{series}.xml
 ```
 
 以 `#` 开头的行为注释。用户 token 和系列列表不允许有空格；真实 token 只放在服务器私有配置里，不提交 Git。
+
+如果 RSS 服务 Nginx 还使用 `$rss_perm` 白名单 map，`<user_token>:all` 应对应通配规则（例如匹配该 token 下任意 series），避免每新增系列都手动追加白名单。
 
 ### 路径规范
 
