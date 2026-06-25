@@ -49,9 +49,23 @@ LOG_LEVELS = {
     "ERROR": logging.ERROR,
     "CRITICAL": logging.CRITICAL,
 }
+EXIT_SYNC_ERROR = 1
+EXIT_PUBLISH_ERROR = 3
+MAX_PUBLISH_ERROR_CHARS = 4000
 
 LOGGER = logging.getLogger("bilibili_podcast.sync")
 PLAYWRIGHT_LOGGER = logging.getLogger("bilibili_podcast.sync.playwright")
+
+
+def sanitize_external_output(text: str) -> str:
+    """Redact common credentials and bound external command output for logs."""
+    sanitized = re.sub(r"(?i)Bearer\s+\S+", "Bearer ***", text or "")
+    sanitized = re.sub(
+        r"(?i)(token|secret|password|authorization)\s*[=:]\s*\S+",
+        r"\1=***",
+        sanitized,
+    )
+    return sanitized[-MAX_PUBLISH_ERROR_CHARS:]
 
 
 def parse_log_level(value: str) -> str:
@@ -1096,6 +1110,7 @@ def generate_rss(
     image = config.cover_art or up_info.get("face")
     if image:
         fg.image(url=image, title=config.title, link=config.source.get("space_url"))
+        fg.podcast.itunes_image(image)
     if config.category:
         fg.podcast.itunes_category(config.category)
     fg.podcast.itunes_author(config.author)
@@ -1772,6 +1787,7 @@ async def run(args: argparse.Namespace) -> int:
     )
     credential = load_cookie_file(args.cookie_file)
     dry_run = not args.apply
+    had_error = False
 
     for config in configs:
         state = store.read_state(config.series)
@@ -1812,6 +1828,7 @@ async def run(args: argparse.Namespace) -> int:
                 browser_user_data_root=args.browser_user_data_root,
             )
         except Exception as exc:
+            had_error = True
             result = {
                 "series": config.series,
                 "title": config.title,
@@ -1845,7 +1862,35 @@ async def run(args: argparse.Namespace) -> int:
 
     elapsed = time.time() - run_start
     LOGGER.info("run complete elapsed_seconds=%.1f", elapsed)
-    return 0
+
+    # After successful sync with --apply, optionally run publish script.
+    if args.apply and getattr(args, "publish_script", None) and configs and not had_error:
+        LOGGER.info("running publish script: %s", args.publish_script)
+        try:
+            result = subprocess.run(
+                [args.publish_script], capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            LOGGER.error("publish script failed: %s", exc)
+            return EXIT_PUBLISH_ERROR
+        if result.stdout:
+            LOGGER.info(
+                "publish script stdout bytes=%s", len(result.stdout.encode("utf-8")),
+            )
+        if result.stderr:
+            LOGGER.info(
+                "publish script stderr bytes=%s", len(result.stderr.encode("utf-8")),
+            )
+        if result.returncode != 0:
+            details = sanitize_external_output(result.stderr or result.stdout)
+            LOGGER.error(
+                "publish script failed with code %s: %s",
+                result.returncode,
+                details or "(no output)",
+            )
+            return EXIT_PUBLISH_ERROR
+
+    return EXIT_SYNC_ERROR if had_error else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1872,6 +1917,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="Shortcut for --log-level DEBUG (per-item details).")
     parser.add_argument("--force", action="store_true", help="Ignore per-series update and rate-limit cooldown gates.")
     parser.add_argument("--apply", action="store_true", help="Write files and download missing media.")
+    parser.add_argument("--publish-script", help="发布脚本路径；仅 --apply 全部成功后执行，失败返回非零。")
     return parser
 
 
