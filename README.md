@@ -321,10 +321,10 @@ python3 scripts/bilibili-podcast-crontab \
 | 步骤 | 处理内容 |
 |------|----------|
 | 环境检查 | 检查 Git 仓库/remote、系统用户 `bilibili-podcast`、secrets、日志/数据目录 |
-| Python 检测 + `_sqlite3` 编译 | 检测系统 Python 3.13/3.12/3.11/3.10/3.9；3.13 缺失 `_sqlite3` 时自动编译 |
+| Python 检测 + `_sqlite3` 编译 | 优先 Python 3.14，允许 3.13 回退；低于 3.13 时中止；缺失 `_sqlite3` 时尝试修复 |
 | 拉取最新代码 | `git pull --ff-only` |
-| 依赖安装 | `pip install -e .`，GitHub 不可达时自动回退 PyPI 安装 |
-| 模块验证 | 验证 sqlite3/yaml/aiohttp/feedgen/lxml/bilibili-api/yt-dlp 已就绪 |
+| 依赖安装 | `pip install -c requirements.lock -e .`；GitHub 不可达时自动回退 PyPI 安装 |
+| 模块验证 | 验证 sqlite3/yaml/aiohttp/curl_cffi/feedgen/lxml/bilibili-api/yt-dlp 已就绪 |
 | 运行配置标准化 | 清理旧 systemd unit 中无效的 shell env 引用；Web 密码迁入受限 secrets env 文件 |
 | DB 迁移 | YAML 配置 + JSON 状态 → SQLite（自动备份） |
 | wrapper/调度准备 | 生成 auto/run_*.sh；可用于 cron 兼容路径，也可供 scheduler/systemd 使用 |
@@ -832,24 +832,29 @@ http://rss-host:58743/rss/<user_token>/{series}.xml
 ### Python 包
 
 ```bash
-pip install -e .                    # 核心依赖
-pip install -e ".[browser]"         # 含 Playwright 浏览器回退支持
+pip install -c requirements.lock -e .             # 核心依赖（含 yt-dlp）
+pip install -c requirements.lock -e ".[browser]"  # 含 Playwright 浏览器回退支持
 ```
+
+项目主运行时为 Python 3.14，Python 3.13 作为回退；3.12 及以下不再支持。`uv.lock` 用于开发侧锁定和审计，生产部署仍使用 pip 与 `requirements.lock`。
 
 ### 外部工具
 
 | 工具 | 用途 | 安装方式 |
 |------|------|----------|
-| `yt-dlp` | B 站音频下载 | `pip install yt-dlp`（建议装在同一 venv） |
-| Playwright (Chromium) | 浏览器回退抓取 | `pip install playwright && playwright install chromium` |
+| `ffmpeg` | 手动媒体转码 | 系统包或显式传 `--ffmpeg-bin` |
+| `rsync` | legacy RSS 同步 | 系统包 |
+| Playwright (Chromium) | 浏览器回退抓取 | `pip install -c requirements.lock -e ".[browser]" && playwright install chromium` |
 
 `yt-dlp` 必须是项目专用的 yt-dlp 版本（与 bilibili-podcast 使用同一 Python 环境的 pip 包），不要依赖系统级 `yt-dlp` 命令。
 
 ### 开发测试
 
 ```bash
-pip install pytest
+pip install -c requirements.lock -e ".[browser,dev]"
 python -m pytest tests/
+python -m pip check
+pip-audit
 ```
 
 ---

@@ -1,0 +1,160 @@
+aiohappyeyeballs==2.6.2
+    # via aiohttp
+aiohttp==3.14.1
+    # via bilibili-podcast
+aiosignal==1.4.0
+    # via aiohttp
+annotated-doc==0.0.4
+    # via fastapi
+annotated-types==0.7.0
+    # via pydantic
+anyio==4.14.1
+    # via
+    #   starlette
+    #   watchfiles
+apscheduler==3.11.2
+    # via bilibili-api-python
+attrs==26.1.0
+    # via aiohttp
+beautifulsoup4==4.15.0
+    # via bilibili-api-python
+brotli==1.2.0
+    # via bilibili-api-python
+certifi==2026.6.17
+    # via
+    #   curl-cffi
+    #   requests
+cffi==2.0.0
+    # via curl-cffi
+charset-normalizer==3.4.7
+    # via requests
+click==8.4.2
+    # via uvicorn
+colorama==0.4.6
+    # via
+    #   bilibili-api-python
+    #   click
+    #   qrcode
+    #   uvicorn
+curl-cffi==0.15.0
+    # via bilibili-podcast
+fastapi==0.138.1
+    # via bilibili-podcast
+feedgen==1.0.0
+    # via bilibili-podcast
+frozenlist==1.8.0
+    # via
+    #   aiohttp
+    #   aiosignal
+greenlet==3.5.3
+    # via playwright
+h11==0.16.0
+    # via uvicorn
+httptools==0.8.0
+    # via uvicorn
+idna==3.18
+    # via
+    #   anyio
+    #   requests
+    #   yarl
+itsdangerous==2.2.0
+    # via bilibili-podcast
+jinja2==3.1.6
+    # via bilibili-podcast
+lxml==6.1.1
+    # via
+    #   bilibili-api-python
+    #   feedgen
+markdown-it-py==4.2.0
+    # via rich
+markupsafe==3.0.3
+    # via jinja2
+mdurl==0.1.2
+    # via markdown-it-py
+multidict==6.7.1
+    # via
+    #   aiohttp
+    #   yarl
+pillow==12.2.0
+    # via
+    #   bilibili-api-python
+    #   qrcode-terminal
+playwright==1.60.0
+    # via bilibili-podcast
+propcache==0.5.2
+    # via
+    #   aiohttp
+    #   yarl
+pycparser==3.0 ; implementation_name != 'PyPy'
+    # via cffi
+pycryptodomex==3.23.0
+    # via bilibili-api-python
+pydantic==2.13.4
+    # via fastapi
+pydantic-core==2.46.4
+    # via pydantic
+pyee==13.0.1
+    # via playwright
+pygments==2.20.0
+    # via rich
+pyjwt==2.13.0
+    # via bilibili-api-python
+python-dateutil==2.9.0.post0
+    # via feedgen
+python-dotenv==1.2.2
+    # via uvicorn
+python-multipart==0.0.32
+    # via bilibili-podcast
+pyyaml==6.0.3
+    # via
+    #   bilibili-api-python
+    #   bilibili-podcast
+    #   uvicorn
+qrcode==8.2
+    # via
+    #   bilibili-api-python
+    #   qrcode-terminal
+qrcode-terminal==0.8
+    # via bilibili-api-python
+requests==2.34.2
+    # via bilibili-podcast
+rich==15.0.0
+    # via curl-cffi
+six==1.17.0
+    # via python-dateutil
+soupsieve==2.8.4
+    # via beautifulsoup4
+starlette==1.3.1
+    # via fastapi
+typing-extensions==4.15.0
+    # via
+    #   beautifulsoup4
+    #   fastapi
+    #   pydantic
+    #   pydantic-core
+    #   pyee
+    #   typing-inspection
+typing-inspection==0.4.2
+    # via
+    #   fastapi
+    #   pydantic
+tzdata==2026.2 ; sys_platform == 'win32'
+    # via tzlocal
+tzlocal==5.4.3
+    # via apscheduler
+urllib3==2.7.0
+    # via requests
+uvicorn==0.49.0
+    # via bilibili-podcast
+uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
+    # via uvicorn
+watchfiles==1.2.0
+    # via uvicorn
+websockets==16.0
+    # via uvicorn
+yarl==1.24.2
+    # via
+    #   aiohttp
+    #   bilibili-api-python
+yt-dlp==2026.6.9
+    # via bilibili-podcast

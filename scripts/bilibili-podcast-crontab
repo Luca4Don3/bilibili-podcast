@@ -61,7 +61,7 @@ def systemd_timer_is_enabled(series: str) -> bool:
 # Shell variables use {{...}} to survive Python .format().
 WRAPPER_TEMPLATE = """#!/bin/sh
 set -eu
-PATH=<server_path>:/usr/local/python3.13/bin:/usr/local/bin:/usr/bin:/bin
+PATH=<server_path>:/usr/local/python3.14/bin:/usr/local/python3.13/bin:/usr/local/bin:/usr/bin:/bin
 PLAYWRIGHT_BROWSERS_PATH=<server_path>
 export PATH PLAYWRIGHT_BROWSERS_PATH
 
