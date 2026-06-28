@@ -32,6 +32,14 @@ LOG_DIR="/var/log/bilipod"
 SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
 PYTHON_BIN="$VENV_DIR/bin/python3"
 CONSTRAINTS_FILE="$CODE_DIR/requirements.lock"
+SUPPORTED_PYTHON_CANDIDATES=(
+    /usr/local/bin/python3.14
+    /usr/bin/python3.14
+    /usr/local/bin/python3.13
+    /usr/bin/python3.13
+    /usr/local/bin/python3
+    /usr/bin/python3
+)
 
 echo "========================================"
 echo " Phase 2: SQLite 迁移部署"
@@ -129,16 +137,35 @@ _python_supported() {
         >/dev/null 2>&1
 }
 
+_supported_python_candidates() {
+    printf '%s\n' "${SUPPORTED_PYTHON_CANDIDATES[@]}"
+}
+
 _find_system_python() {
-    for p in /usr/local/bin/python3.14 /usr/bin/python3.14 \
-             /usr/local/bin/python3.13 /usr/bin/python3.13 \
-             /usr/local/bin/python3 /usr/bin/python3; do
+    local p
+    while IFS= read -r p; do
         if [ -x "$p" ] && _python_supported "$p"; then
             echo "$p"
             return 0
         fi
-    done
+    done < <(_supported_python_candidates)
     return 1
+}
+
+_pip_install() {
+    if [ -f "$CONSTRAINTS_FILE" ]; then
+        "$VENV_DIR/bin/pip" install -c "$CONSTRAINTS_FILE" "$@"
+    else
+        "$VENV_DIR/bin/pip" install "$@"
+    fi
+}
+
+_log_constraints_status() {
+    if [ -f "$CONSTRAINTS_FILE" ]; then
+        echo "  使用依赖约束: $CONSTRAINTS_FILE"
+    else
+        echo "  ⚠ 未找到依赖约束文件: $CONSTRAINTS_FILE"
+    fi
 }
 
 # 下载并编译 Python 3.14.6
@@ -245,12 +272,12 @@ else
         if [ "$SQLITE3_OK" != true ]; then
             echo "  ⚠ _sqlite3 编译失败，尝试用其他 Python 3.14/3.13 重建 venv"
             ALT_PY=""
-            for p in /usr/local/bin/python3.14 /usr/bin/python3.14 /usr/local/bin/python3.13 /usr/bin/python3.13; do
+            while IFS= read -r p; do
                 if [ -x "$p" ] && _python_supported "$p" && "$p" -c "import sqlite3" 2>/dev/null; then
                     ALT_PY="$p"
                     break
                 fi
-            done
+            done < <(_supported_python_candidates)
             if [ -z "$ALT_PY" ]; then
                 echo "  ✗ 未找到支持 sqlite3 的 Python 3.14/3.13，中止"
                 exit 1
@@ -291,17 +318,11 @@ fi
 echo "▶ [4/9] 安装 Python 包 ..."
 
 if [ "$APPLY" = true ]; then
-    PIP_CONSTRAINT_ARGS=()
-    if [ -f "$CONSTRAINTS_FILE" ]; then
-        PIP_CONSTRAINT_ARGS=(-c "$CONSTRAINTS_FILE")
-        echo "  使用依赖约束: $CONSTRAINTS_FILE"
-    else
-        echo "  ⚠ 未找到依赖约束文件: $CONSTRAINTS_FILE"
-    fi
+    _log_constraints_status
 
     # 先尝试正常安装（含固定 commit 的 bilibili-api-python）
     INSTALL_OK=false
-    if PIP_OUTPUT=$("$VENV_DIR/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" -e "$CODE_DIR" 2>&1); then
+    if PIP_OUTPUT=$(_pip_install -e "$CODE_DIR" 2>&1); then
         INSTALL_OK=true
         echo "$PIP_OUTPUT" | tail -3 | sed 's/^/  /'
     else
@@ -311,8 +332,7 @@ if [ "$APPLY" = true ]; then
 
     # 失败时手动安装所有依赖，bilibili-api-python 走 PyPI
     if [ "$INSTALL_OK" != true ]; then
-        "$VENV_DIR/bin/pip" install \
-            "${PIP_CONSTRAINT_ARGS[@]}" \
+        _pip_install \
             "aiohttp>=3.14.1,<4" PyYAML feedgen lxml pillow requests pycryptodomex \
             "curl_cffi>=0.15.0,<0.16" "yt-dlp>=2026.6.9,<2027" \
             bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
@@ -365,12 +385,7 @@ fi
 
 if [ "$ALL_OK" != true ] && [ "$APPLY" = true ]; then
     echo "  ⚠ 部分模块缺失，尝试安装缺失项 ..."
-    PIP_CONSTRAINT_ARGS=()
-    if [ -f "$CONSTRAINTS_FILE" ]; then
-        PIP_CONSTRAINT_ARGS=(-c "$CONSTRAINTS_FILE")
-    fi
-    "$VENV_DIR/bin/pip" install \
-        "${PIP_CONSTRAINT_ARGS[@]}" \
+    _pip_install \
         "aiohttp>=3.14.1,<4" "curl_cffi>=0.15.0,<0.16" PyYAML feedgen lxml \
         "yt-dlp>=2026.6.9,<2027" bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
 
@@ -395,12 +410,8 @@ if "$PYTHON_BIN" -c "import playwright" 2>/dev/null; then
 else
     if [ "$APPLY" = true ]; then
         echo "  安装 playwright 包（优先国内镜像）..."
-        PIP_CONSTRAINT_ARGS=()
-        if [ -f "$CONSTRAINTS_FILE" ]; then
-            PIP_CONSTRAINT_ARGS=(-c "$CONSTRAINTS_FILE")
-        fi
-        PIP_OUT="$( "$VENV_DIR/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" -i https://pypi.tuna.tsinghua.edu.cn/simple "playwright>=1.60,<2" 2>&1 )" || \
-        PIP_OUT="$( "$VENV_DIR/bin/pip" install "${PIP_CONSTRAINT_ARGS[@]}" "playwright>=1.60,<2" 2>&1 )" || {
+        PIP_OUT="$( _pip_install -i https://pypi.tuna.tsinghua.edu.cn/simple "playwright>=1.60,<2" 2>&1 )" || \
+        PIP_OUT="$( _pip_install "playwright>=1.60,<2" 2>&1 )" || {
             echo "  ✗ playwright 安装失败"
             echo "$PIP_OUT" | tail -5 | sed 's/^/  /'
             exit 1
