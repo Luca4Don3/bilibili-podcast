@@ -32,6 +32,8 @@ LOG_DIR="/var/log/bilibili-podcast"
 SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
 PYTHON_BIN="$VENV_DIR/bin/python3"
 CONSTRAINTS_FILE="$CODE_DIR/requirements.lock"
+PYTHON_SOURCE_VERSION="3.14.6"
+PLAYWRIGHT_PACKAGE_SPEC="playwright>=1.60,<2"
 SUPPORTED_PYTHON_CANDIDATES=(
     /usr/local/bin/python3.14
     /usr/bin/python3.14
@@ -39,6 +41,27 @@ SUPPORTED_PYTHON_CANDIDATES=(
     /usr/bin/python3.13
     /usr/local/bin/python3
     /usr/bin/python3
+)
+FALLBACK_RUNTIME_PACKAGES=(
+    "aiohttp>=3.14.1,<4"
+    PyYAML
+    feedgen
+    lxml
+    pillow
+    requests
+    pycryptodomex
+    "curl_cffi>=0.15.0,<0.16"
+    "yt-dlp>=2026.6.9,<2027"
+    bilibili-api-python
+)
+REQUIRED_PYTHON_MODULES=(
+    sqlite3:sqlite3
+    yaml:PyYAML
+    aiohttp:aiohttp
+    curl_cffi:curl_cffi
+    feedgen:feedgen
+    lxml:lxml
+    bilibili_api:bilibili-api
 )
 
 echo "========================================"
@@ -170,21 +193,33 @@ _log_constraints_status() {
 
 # 下载并编译 Python 3.14.6
 _install_python_314() {
-    echo "  未找到 Python 3.14/3.13，下载编译 Python 3.14.6 ..."
-    local SRC="/tmp/Python-3.14.6"
-    if [ ! -d "$SRC" ]; then
-        curl -sL "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tgz" \
-            | tar xz -C /tmp 2>&1 | tail -1
-    fi
-    cd "$SRC"
-    echo "  配置 (--enable-shared --prefix=/usr/local) ..."
-    ./configure --enable-shared --prefix=/usr/local --quiet 2>&1 | tail -1 | sed 's/^/  /'
-    echo "  编译 ..."
-    make -j$(nproc) 2>&1 | tail -3 | sed 's/^/  /'
-    echo "  安装到 /usr/local ..."
-    make install 2>&1 | tail -3 | sed 's/^/  /'
-    ldconfig
+    {
+        echo "  未找到 Python 3.14/3.13，下载编译 Python ${PYTHON_SOURCE_VERSION} ..."
+        local SRC="/tmp/Python-${PYTHON_SOURCE_VERSION}"
+        if [ ! -d "$SRC" ]; then
+            curl -sL "https://www.python.org/ftp/python/${PYTHON_SOURCE_VERSION}/Python-${PYTHON_SOURCE_VERSION}.tgz" \
+                | tar xz -C /tmp 2>&1 | tail -1
+        fi
+        cd "$SRC"
+        echo "  配置 (--enable-shared --prefix=/usr/local) ..."
+        ./configure --enable-shared --prefix=/usr/local --quiet 2>&1 | tail -1 | sed 's/^/  /'
+        echo "  编译 ..."
+        make -j$(nproc) 2>&1 | tail -3 | sed 's/^/  /'
+        echo "  安装到 /usr/local ..."
+        make install 2>&1 | tail -3 | sed 's/^/  /'
+        ldconfig
+    } >&2
     echo "/usr/local/bin/python3.14"
+}
+
+_verify_required_modules() {
+    local entry mod label
+    ALL_OK=true
+    for entry in "${REQUIRED_PYTHON_MODULES[@]}"; do
+        mod="${entry%%:*}"
+        label="${entry#*:}"
+        _verify_module "$mod" "$label" || ALL_OK=false
+    done
 }
 
 # 如果 venv 不存在，自动创建
@@ -207,22 +242,38 @@ if [ ! -f "$PYTHON_BIN" ]; then
         echo "  ✓ venv 已创建: $VENV_DIR"
         PYTHON_BIN="$VENV_DIR/bin/python3"
         SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
+    else
+        PYTHON_BIN="$SYSTEM_PY"
     fi
 fi
 
-echo "  ✓ Python: $("$PYTHON_BIN" --version 2>&1)"
-if ! _python_supported "$PYTHON_BIN"; then
+if [ -x "$PYTHON_BIN" ]; then
+    echo "  ✓ Python: $("$PYTHON_BIN" --version 2>&1)"
+elif [ "$APPLY" = true ]; then
+    echo "  ✗ Python 不存在或不可执行: $PYTHON_BIN"
+    exit 1
+else
+    echo "  (干跑，目标 Python 尚不存在，将在 --apply 时创建)"
+fi
+
+if [ -x "$PYTHON_BIN" ] && ! _python_supported "$PYTHON_BIN"; then
     echo "  ✗ Python 版本不受支持，需 3.13.x 或 3.14.x"
     exit 1
 fi
 
 # ── 2. _sqlite3 编译 ──────────────────────────────
 echo "▶ [2/9] Python 版本检测 + _sqlite3 编译 ..."
-PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [ -x "$PYTHON_BIN" ]; then
+    PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+else
+    PY_VER="planned"
+fi
 echo "  版本: $PY_VER"
 
 SQLITE3_OK=false
-if "$PYTHON_BIN" -c "import sqlite3" 2>/dev/null; then
+if [ ! -x "$PYTHON_BIN" ] && [ "$APPLY" != true ]; then
+    echo "  (干跑，将在目标 Python 创建后验证 sqlite3)"
+elif "$PYTHON_BIN" -c "import sqlite3" 2>/dev/null; then
     SQLITE3_OK=true
     echo "  ✓ sqlite3"
 else
@@ -332,10 +383,7 @@ if [ "$APPLY" = true ]; then
 
     # 失败时手动安装所有依赖，bilibili-api-python 走 PyPI
     if [ "$INSTALL_OK" != true ]; then
-        _pip_install \
-            "aiohttp>=3.14.1,<4" PyYAML feedgen lxml pillow requests pycryptodomex \
-            "curl_cffi>=0.15.0,<0.16" "yt-dlp>=2026.6.9,<2027" \
-            bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
+        _pip_install "${FALLBACK_RUNTIME_PACKAGES[@]}" 2>&1 | tail -3 | sed 's/^/  /'
 
         # 装回项目本身（不需依赖解析）
         "$VENV_DIR/bin/pip" install -e "$CODE_DIR" --no-deps 2>&1 | tail -3 | sed 's/^/  /'
@@ -365,15 +413,7 @@ _verify_module() {
     return 1
 }
 
-ALL_OK=true
-
-_verify_module sqlite3 || ALL_OK=false
-_verify_module yaml PyYAML || ALL_OK=false
-_verify_module aiohttp || ALL_OK=false
-_verify_module curl_cffi || ALL_OK=false
-_verify_module feedgen || ALL_OK=false
-_verify_module lxml || ALL_OK=false
-_verify_module "bilibili_api" "bilibili-api" || ALL_OK=false
+_verify_required_modules
 
 # yt-dlp 单独验证
 if "$VENV_DIR/bin/yt-dlp" --version >/dev/null 2>&1; then
@@ -385,20 +425,13 @@ fi
 
 if [ "$ALL_OK" != true ] && [ "$APPLY" = true ]; then
     echo "  ⚠ 部分模块缺失，尝试安装缺失项 ..."
-    _pip_install \
-        "aiohttp>=3.14.1,<4" "curl_cffi>=0.15.0,<0.16" PyYAML feedgen lxml \
-        "yt-dlp>=2026.6.9,<2027" bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
+    _pip_install "${FALLBACK_RUNTIME_PACKAGES[@]}" 2>&1 | tail -3 | sed 's/^/  /'
 
     # 最终确认
-    _verify_module sqlite3 || true
-    _verify_module yaml || true
-    _verify_module aiohttp || true
-    _verify_module curl_cffi || true
-    _verify_module feedgen || true
-    _verify_module lxml || true
-    _verify_module "bilibili_api" "bilibili-api" || {
+    _verify_required_modules
+    if ! "$PYTHON_BIN" -c "import bilibili_api" 2>/dev/null; then
         echo "  ✗ 严重: bilibili-api-python 安装失败，后续步骤可能出错"
-    }
+    fi
 fi
 
 # ── 5b. Playwright/Chromium ──────────────────────────
@@ -410,8 +443,8 @@ if "$PYTHON_BIN" -c "import playwright" 2>/dev/null; then
 else
     if [ "$APPLY" = true ]; then
         echo "  安装 playwright 包（优先国内镜像）..."
-        PIP_OUT="$( _pip_install -i https://pypi.tuna.tsinghua.edu.cn/simple "playwright>=1.60,<2" 2>&1 )" || \
-        PIP_OUT="$( _pip_install "playwright>=1.60,<2" 2>&1 )" || {
+        PIP_OUT="$( _pip_install -i https://pypi.tuna.tsinghua.edu.cn/simple "$PLAYWRIGHT_PACKAGE_SPEC" 2>&1 )" || \
+        PIP_OUT="$( _pip_install "$PLAYWRIGHT_PACKAGE_SPEC" 2>&1 )" || {
             echo "  ✗ playwright 安装失败"
             echo "$PIP_OUT" | tail -5 | sed 's/^/  /'
             exit 1
