@@ -15,11 +15,11 @@ Usage:
 """
 
 import argparse
+import getpass
 import os
 import re
 import shlex
 import stat
-import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -417,7 +417,6 @@ def generate_crontab(configs: list[dict], config_dir: str | None, config_db: str
 
 def merge_with_existing_crontab(new_auto: str, user: str) -> str:
     """Merge auto-generated entries with existing crontab, preserving manual entries."""
-    import getpass
     current_user = getpass.getuser()
     try:
         if user and user != current_user:
@@ -458,7 +457,6 @@ def write_crontab(content: str, user: str):
     If *user* matches the current OS user, omit ``-u`` to avoid
     "must be privileged to use -u" when running as the target user.
     """
-    import getpass
     current_user = getpass.getuser()
     if user and user != current_user:
         proc = subprocess.run(
