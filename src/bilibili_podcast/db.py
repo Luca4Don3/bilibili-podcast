@@ -7,6 +7,8 @@ from typing import Any
 
 from .utils.series_config import SeriesConfig
 from .services.filter_service import list_filter_entries
+from .services.sync_policy_service import SyncPolicyService
+from .config.schema import QUALITY_ALIASES, SERIES_SYNC_DEFAULTS
 
 
 SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -34,6 +36,8 @@ def migrate(db_path: str | Path) -> None:
     conn.executescript(SCHEMA_SQL)
     _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
     _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "sync_policy", "update_period_grace_seconds", "INTEGER NOT NULL DEFAULT 120")
+    _ensure_column(conn, "sync_policy", "media_mode", "TEXT NOT NULL DEFAULT 'auto'")
     conn.commit()
     conn.close()
 
@@ -80,7 +84,9 @@ CREATE TABLE IF NOT EXISTS sync_policy (
     request_jitter_seconds REAL NOT NULL DEFAULT 0.5,
     rate_limit_cooldown_seconds INTEGER NOT NULL DEFAULT 21600,
     update_period TEXT NOT NULL DEFAULT '12h',
+    update_period_grace_seconds INTEGER NOT NULL DEFAULT 120,
     format TEXT NOT NULL DEFAULT 'audio',
+    media_mode TEXT NOT NULL DEFAULT 'auto',
     quality TEXT NOT NULL DEFAULT '64K',
     fetch_strategy TEXT NOT NULL DEFAULT 'api_first',
     keep_last INTEGER NOT NULL DEFAULT 100 CHECK(keep_last >= 0),
@@ -186,53 +192,10 @@ def upsert_source(conn, config: SeriesConfig) -> None:
 
 
 def upsert_sync_policy(conn, config: SeriesConfig) -> None:
-    s = config.sync
-    conn.execute(
-        """INSERT INTO sync_policy (
-               series, page_size, incremental_page_size, max_pages,
-               max_requests_per_series, request_interval_seconds,
-               request_jitter_seconds, rate_limit_cooldown_seconds,
-               update_period, format, quality, fetch_strategy, keep_last,
-               browser_fallback, browser_wait_min_seconds,
-               browser_wait_max_seconds, browser_fallback_cooldown_seconds,
-               require_paid_state_confirmation,
-               min_duration_seconds, max_duration_seconds)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(series) DO UPDATE SET
-               page_size=excluded.page_size,
-               incremental_page_size=excluded.incremental_page_size,
-               max_pages=excluded.max_pages,
-               max_requests_per_series=excluded.max_requests_per_series,
-               request_interval_seconds=excluded.request_interval_seconds,
-               request_jitter_seconds=excluded.request_jitter_seconds,
-               rate_limit_cooldown_seconds=excluded.rate_limit_cooldown_seconds,
-               update_period=excluded.update_period,
-               format=excluded.format, quality=excluded.quality,
-               fetch_strategy=excluded.fetch_strategy,
-               keep_last=excluded.keep_last,
-               browser_fallback=excluded.browser_fallback,
-               browser_wait_min_seconds=excluded.browser_wait_min_seconds,
-               browser_wait_max_seconds=excluded.browser_wait_max_seconds,
-               browser_fallback_cooldown_seconds=excluded.browser_fallback_cooldown_seconds,
-               require_paid_state_confirmation=excluded.require_paid_state_confirmation,
-               min_duration_seconds=excluded.min_duration_seconds,
-               max_duration_seconds=excluded.max_duration_seconds""",
-        (config.series,
-         s.get("page_size", 20), s.get("incremental_page_size", 5),
-         s.get("max_pages", 10), s.get("max_requests_per_series", 8),
-         s.get("request_interval_seconds", 2.0),
-         s.get("request_jitter_seconds", 0.5),
-         s.get("rate_limit_cooldown_seconds", 21600),
-         s.get("update_period", "12h"), s.get("format", "audio"),
-         s.get("quality", "64K"), s.get("fetch_strategy", "api_first"),
-         config.keep_last, int(bool(s.get("browser_fallback", False))),
-         s.get("browser_wait_min_seconds", 4.0),
-         s.get("browser_wait_max_seconds", 8.0),
-         s.get("browser_fallback_cooldown_seconds", 3600),
-         int(bool(s.get("require_paid_state_confirmation", False))),
-         s.get("min_duration_seconds", 0),
-         s.get("max_duration_seconds", 0)),
-    )
+    sync = dict(config.sync)
+    sync["keep_last"] = config.keep_last
+    sync["quality"] = QUALITY_ALIASES.get(sync.get("quality"), sync.get("quality", "64K"))
+    SyncPolicyService(conn).upsert(config.series, sync)
 
 
 def upsert_filters(conn, config: SeriesConfig) -> None:
@@ -363,26 +326,12 @@ def _row_to_config(conn: sqlite3.Connection, row) -> SeriesConfig:
     }
 
     sync = {
-        "page_size": _row_value(sp, "page_size", 20),
-        "incremental_page_size": _row_value(sp, "incremental_page_size", 5),
-        "max_pages": _row_value(sp, "max_pages", 10),
-        "max_requests_per_series": _row_value(sp, "max_requests_per_series", 8),
-        "request_interval_seconds": _row_value(sp, "request_interval_seconds", 2.0),
-        "request_jitter_seconds": _row_value(sp, "request_jitter_seconds", 0.5),
-        "rate_limit_cooldown_seconds": _row_value(sp, "rate_limit_cooldown_seconds", 21600),
-        "update_period": _row_value(sp, "update_period", "12h"),
-        "format": _row_value(sp, "format", "audio"),
-        "quality": _row_value(sp, "quality", "64K"),
-        "fetch_strategy": _row_value(sp, "fetch_strategy", "api_first"),
-        "keep_last": _row_value(sp, "keep_last", 100),
-        "browser_fallback": bool(_row_value(sp, "browser_fallback", 0)),
-        "browser_wait_min_seconds": _row_value(sp, "browser_wait_min_seconds", 4.0),
-        "browser_wait_max_seconds": _row_value(sp, "browser_wait_max_seconds", 8.0),
-        "browser_fallback_cooldown_seconds": _row_value(sp, "browser_fallback_cooldown_seconds", 3600),
-        "require_paid_state_confirmation": bool(_row_value(sp, "require_paid_state_confirmation", 0)),
-        "min_duration_seconds": _row_value(sp, "min_duration_seconds", 0),
-        "max_duration_seconds": _row_value(sp, "max_duration_seconds", 0),
+        key: _row_value(sp, key, default)
+        for key, default in SERIES_SYNC_DEFAULTS.items()
     }
+    sync["quality"] = QUALITY_ALIASES.get(sync["quality"], sync["quality"])
+    sync["browser_fallback"] = bool(sync["browser_fallback"])
+    sync["require_paid_state_confirmation"] = bool(sync["require_paid_state_confirmation"])
 
     filters: dict[str, Any] = {
         "exclude_paid": True,

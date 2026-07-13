@@ -1,0 +1,15 @@
+[runtime]
+user = "bilipod"
+group = "bilipod"
+
+[paths]
+systemd_dir = "<server_path>/systemd"
+cron_script_dir = "<server_path>/cron"
+wrapper_dir = "<server_path>/wrappers"
+
+[units]
+web = "bilipod-web.service"
+sync_glob = "bilipod-sync@*.service"
+
+[timeouts]
+command_seconds = 30

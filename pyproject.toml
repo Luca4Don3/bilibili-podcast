@@ -42,6 +42,8 @@ dev = [
 [project.scripts]
 bilibili-podcast = "bilibili_podcast.sync:main"
 bilipod-admin = "bilibili_podcast.cli_admin:main"
+bilipod-config = "bilibili_podcast.config.cli:main"
+bilipod-web = "bilibili_podcast.web.runner:main"
 
 [project.urls]
 homepage = "https://github.com/example/bilibili-podcast"

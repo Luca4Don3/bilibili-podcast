@@ -22,8 +22,9 @@ from .services.preview_service import PreviewService
 from .services.scheduler_service import ScheduleEntry, SchedulerService, validate_schedules
 from .services.series_removal_service import SeriesRemovalPlan, SeriesRemovalService
 from .utils.bilibili_url import parse_space_source
+from .config import ConfigError, ConfigManager, ConfigSnapshot
 
-DB_ENV_VAR = "BILIPOD_CONFIG_DB"
+_CONFIG: ConfigSnapshot | None = None
 
 # Exit codes per HANDOFF spec
 EXIT_SUCCESS = 0
@@ -32,6 +33,12 @@ EXIT_VALIDATION = 1
 EXIT_ARGS_ERROR = 2
 EXIT_DB_ERROR = 4
 EXIT_SYNC_FAIL = 5
+
+
+def _require_config() -> ConfigSnapshot:
+    if _CONFIG is None:
+        raise ConfigError("admin configuration was not injected")
+    return _CONFIG
 
 
 def _sanitize(text: str) -> str:
@@ -1156,8 +1163,13 @@ def cmd_preview(args: argparse.Namespace) -> None:
 
     print(f"🔍 执行干跑: {args.series} ...\n")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
-                                env={**os.environ, "BILIPOD_CONFIG_DB": db_path})
+        child_env = dict(os.environ)
+        child_env.pop("BILIPOD_CONFIG_DB", None)
+        if _CONFIG is not None:
+            child_env["BILIPOD_CONFIG_ROOT"] = str(_CONFIG.root)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=_CONFIG.sync.timeouts.preview_seconds if _CONFIG else 120,
+                                env=child_env)
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         print(_sanitize(output))
         if result.returncode != 0:
@@ -1184,19 +1196,16 @@ def cmd_sync(args: argparse.Namespace) -> None:
         sys.exit(EXIT_SYNC_FAIL)
 
     # Build production-safe command (matches systemd template params)
-    cookie_file = os.environ.get("BILIPOD_COOKIE_FILE",
-        "/opt/bilipod/secrets/www.bilibili.com_cookies.txt")
-    media_root = os.environ.get("BILIPOD_MEDIA_ROOT", "/var/lib/bilipod/media")
-    json_root = os.environ.get("BILIPOD_JSON_ROOT", "/var/lib/bilipod/json")
-    rss_root = os.environ.get("BILIPOD_RSS_ROOT", "/var/lib/bilipod/rss")
-    state_root = os.environ.get("BILIPOD_STATE_ROOT", "/var/lib/bilipod/state")
-    lock_file = os.environ.get("BILIPOD_LOCK_FILE",
-        "/var/lib/bilipod/state/bilibili-podcast.lock")
-    log_dir = os.environ.get("BILIPOD_LOG_DIR", "/var/log/bilipod")
-    media_base_url = os.environ.get("BILIPOD_MEDIA_BASE_URL",
-        "http://localhost:58743")
-    browser_root = os.environ.get("BILIPOD_BROWSER_USER_DATA_ROOT",
-        "/opt/bilipod/browser-profiles")
+    config = _require_config()
+    cookie_file = str(config.sync.paths.cookie_file)
+    media_root = str(config.app.paths.media_root)
+    json_root = str(config.app.paths.json_root)
+    rss_root = str(config.app.paths.rss_root)
+    state_root = str(config.app.paths.state_root)
+    lock_file = str(config.sync.paths.lock_file)
+    log_dir = str(config.app.paths.log_dir)
+    media_base_url = config.publish.publish.media_base_url
+    browser_root = str(config.sync.browser.user_data_root)
 
     cmd = [
         sync_bin, "--config-db", db_path, "--series", args.series,
@@ -1209,8 +1218,8 @@ def cmd_sync(args: argparse.Namespace) -> None:
         "--log-dir", log_dir,
         "--media-base-url", media_base_url,
         "--browser-user-data-root", browser_root,
-        "--max-downloads-per-run", "1",
-        "--min-free-gb", "5",
+        "--max-downloads-per-run", str(config.sync.downloads.scheduled_max_per_run),
+        "--min-free-gb", str(config.sync.downloads.min_free_gb),
         "--token", "__MEDIA_PLACEHOLDER__",
     ]
     if args.apply:
@@ -1225,8 +1234,12 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
     print(f"{'🔄 同步' if args.apply else '🔍 干跑'}: {args.series} ...\n")
     try:
+        child_env = dict(os.environ)
+        child_env.pop("BILIPOD_CONFIG_DB", None)
+        if _CONFIG is not None:
+            child_env["BILIPOD_CONFIG_ROOT"] = str(_CONFIG.root)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
-                                env={**os.environ, "BILIPOD_CONFIG_DB": db_path})
+                                env=child_env)
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         print(_sanitize(output))
         if result.returncode != 0:
@@ -1240,11 +1253,15 @@ def cmd_sync(args: argparse.Namespace) -> None:
         sys.exit(EXIT_SYNC_FAIL)
 
     # After successful apply: publish RSS
-    if args.apply:
-        publish = os.environ.get("BILIPOD_RSS_PUBLISH",
-            "/opt/bilipod/rss-publish-and-sync.sh")
+    publish = (
+        str(_CONFIG.publish.publish.script)
+        if _CONFIG and _CONFIG.publish.publish.enabled and _CONFIG.publish.publish.script
+        else None
+    )
+    if args.apply and publish:
         pub_result = subprocess.run(
-            [publish], capture_output=True, text=True, timeout=60,
+            [publish], capture_output=True, text=True,
+            timeout=_CONFIG.sync.timeouts.publish_seconds if _CONFIG else 60,
         )
         pub_out = (pub_result.stdout or "") + "\n" + (pub_result.stderr or "")
         print(_sanitize(pub_out))
@@ -1275,7 +1292,8 @@ def cmd_sync_policy_show(args: argparse.Namespace) -> None:
     print(f"  请求: max_requests={spd['max_requests_per_series']}, interval={spd['request_interval_seconds']}s, jitter={spd['request_jitter_seconds']}s")
     print(f"  限流冷却: {spd['rate_limit_cooldown_seconds']}s")
     print(f"  更新周期: {spd['update_period']}")
-    print(f"  输出: {spd['format']} / {spd['quality']}")
+    print(f"  周期容差: {spd['update_period_grace_seconds']}s")
+    print(f"  输出: {spd['format']} / {spd['quality']} / media_mode={spd['media_mode']}")
     print(f"  保留: keep_last={spd['keep_last']}")
     print(f"  策略: {spd['fetch_strategy']}, browser_fallback={bool(spd['browser_fallback'])}")
     print(f"  浏览器等待: {spd['browser_wait_min_seconds']}s ~ {spd['browser_wait_max_seconds']}s")
@@ -1300,7 +1318,9 @@ def cmd_sync_policy_set(args: argparse.Namespace) -> None:
         "request_jitter_seconds": args.request_jitter_seconds,
         "rate_limit_cooldown_seconds": args.rate_limit_cooldown_seconds,
         "update_period": args.update_period,
+        "update_period_grace_seconds": args.update_period_grace_seconds,
         "format": args.format,
+        "media_mode": args.media_mode,
         "quality": args.quality,
         "fetch_strategy": args.fetch_strategy,
         "keep_last": args.keep_last,
@@ -1822,17 +1842,15 @@ def _interactive_collect_cron(existing: list[str] | None = None) -> list[str] | 
 
 # ── CLI utilities ───────────────────────────────────────────────────────
 
-DEFAULT_CONFIG_DB = "/var/lib/bilipod/state/bilipod.db"
-
-
 def _get_db(args: argparse.Namespace) -> str:
-    """Resolve DB path from args, env var, or default."""
-    db_path = args.config_db or os.environ.get(DB_ENV_VAR) or DEFAULT_CONFIG_DB
-    return db_path
+    """Resolve DB path from an explicit one-run override or the snapshot."""
+    return args.config_db or str(_require_config().app.database.path)
 
 
 def _find_sync_bin() -> str | None:
     """Find the bilibili-podcast binary."""
+    if _CONFIG is not None:
+        return str(_CONFIG.app.executables.sync)
     # Look in venv bin first
     python_bin = Path(sys.executable).parent
     candidate = python_bin / "bilibili-podcast"
@@ -1873,41 +1891,35 @@ def _find_crontab_bin() -> str | None:
 # ── Paid / manual media commands ────────────────────────────────────
 
 def _get_allowed_media_dirs() -> list[Path]:
-    """Return allowed directories for manual media attach, configured via
-    ``BILIPOD_MANUAL_MEDIA_DIRS`` (colon-separated).
-
-    Falls back to safe defaults when the env var is not set.
-    Rejects broad root directories like ``/`` or ``/data``.
-    """
-    raw = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS", "")
-    if raw.strip():
-        dirs: list[Path] = []
-        for p_str in raw.split(":"):
-            p_str = p_str.strip()
-            if not p_str:
-                continue
-            p = Path(p_str)
-            if not p.is_absolute():
-                continue
-            parts = p.resolve().parts
-            # parts[0] is "/", parts[1] is top-level dir
-            # Allow at least 2 levels deep (e.g. /opt/bilipod/...)
-            if len(parts) < 3:
-                continue
-            dirs.append(p)
-        return dirs
-    return [
-        Path("/opt/bilipod/manual-media"),
-        Path("/data/manual-media"),
-    ]
+    """Return the validated manual-media allowlist from the snapshot."""
+    config = _require_config()
+    if not config.manual_media.enabled:
+        return []
+    allowed: list[Path] = []
+    for path in config.manual_media.allowed_dirs:
+        resolved = path.resolve(strict=False)
+        if path.is_absolute() and len(resolved.parts) >= 3:
+            allowed.append(path)
+    return allowed
 
 
 def is_allowed_manual_media_path(path: Path) -> bool:
     """Check if a resolved file path is inside an allowed manual media directory.
 
-    Reads allowed dirs from ``_get_allowed_media_dirs()`` each call,
-    ensuring env changes are picked up and the check is not bypassed.
+    Reads the immutable process snapshot on each call.
     """
+    config = _require_config()
+    if not config.manual_media.enabled:
+        return False
+    if not path.is_absolute():
+        return False
+    follow_symlinks = config.manual_media.follow_symlinks
+    if not follow_symlinks:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                return False
     resolved = path.resolve()
     for d in _get_allowed_media_dirs():
         try:
@@ -2058,7 +2070,7 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
         source=src, sync=sp, filters={}, paid_preview={}, keep_last=sp.get("keep_last", 0),
     )
     credential = None
-    cookie_file = args.cookie_file or os.environ.get("BILIPOD_COOKIE_FILE", "")
+    cookie_file = args.cookie_file or str(_require_config().sync.paths.cookie_file)
     if cookie_file:
         credential = load_cookie_file(cookie_file)
 
@@ -2102,7 +2114,7 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
         print(f"❌ API 获取失败: {e}")
         sys.exit(EXIT_SYNC_FAIL)
 
-    json_root = Path(args.json_root) if hasattr(args, "json_root") and args.json_root else Path("/var/lib/bilipod/json")
+    json_root = Path(args.json_root) if hasattr(args, "json_root") and args.json_root else _require_config().app.paths.json_root
     ep_dir = json_root / args.series
     ep_dir.mkdir(parents=True, exist_ok=True)
     written = 0
@@ -2124,8 +2136,9 @@ def cmd_paid_list_missing(args: argparse.Namespace) -> None:
     db_path = _get_db(args)
     _require_series(db_path, args.series)
 
-    json_dir = Path(args.json_root) / args.series
-    media_dir = Path(args.media_root) / args.series
+    config = _require_config()
+    json_dir = Path(args.json_root) / args.series if args.json_root else config.app.paths.json_root / args.series
+    media_dir = Path(args.media_root) / args.series if args.media_root else config.app.paths.media_root / args.series
 
     if not json_dir.exists():
         print(f"  无 metadata 目录: {json_dir}")
@@ -2168,7 +2181,7 @@ def cmd_paid_attach_media(args: argparse.Namespace) -> None:
     # Path safety checks
     if not is_allowed_manual_media_path(src):
         print(f"❌ 路径不在白名单内: {src}")
-        print(f"   设置 BILIPOD_MANUAL_MEDIA_DIRS 环境变量配置允许目录")
+        print("   请在 manual-media.toml 中配置允许目录")
         sys.exit(EXIT_VALIDATION)
     resolved = src.resolve()
     if not resolved.exists():
@@ -2181,7 +2194,7 @@ def cmd_paid_attach_media(args: argparse.Namespace) -> None:
 
     quality = _get_series_quality(db_path, args.series)
     dst_name = f"{args.bvid}_{quality}.mp3"
-    media_root = Path(args.media_root) if args.media_root else Path("/var/lib/bilipod/media")
+    media_root = Path(args.media_root) if args.media_root else _require_config().app.paths.media_root
     dst = media_root / args.series / dst_name
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2253,7 +2266,7 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
     src = Path(args.media_path)
     if not is_allowed_manual_media_path(src):
         print(f"❌ 路径不在白名单内: {src}")
-        print("   设置 BILIPOD_MANUAL_MEDIA_DIRS 环境变量配置允许目录")
+        print("   请在 manual-media.toml 中配置允许目录")
         sys.exit(EXIT_VALIDATION)
     src = src.resolve()
     if not src.exists() or not src.is_file():
@@ -2266,9 +2279,10 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         sys.exit(EXIT_VALIDATION)
 
     quality = _get_series_quality(db_path, args.series)
-    media_root = Path(args.media_root) if args.media_root else Path("/var/lib/bilipod/media")
-    json_root = Path(args.json_root) if args.json_root else Path("/var/lib/bilipod/json")
-    rss_root = Path(args.rss_root) if args.rss_root else Path("/var/lib/bilipod/rss")
+    config = _require_config()
+    media_root = Path(args.media_root) if args.media_root else config.app.paths.media_root
+    json_root = Path(args.json_root) if args.json_root else config.app.paths.json_root
+    rss_root = Path(args.rss_root) if args.rss_root else config.app.paths.rss_root
     media_dst = media_root / args.series / f"{bvid}_{quality}.mp3"
     json_dst = json_root / args.series / f"{bvid}_{quality}.info.json"
     rss_dst = rss_root / f"{args.series}.xml"
@@ -2281,11 +2295,13 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
     json_backup = _file_backup(json_dst)
     rss_backup = _file_backup(rss_dst)
     try:
-        metadata = _fetch_single_video_metadata(args.url, args.cookie_file or os.environ.get("BILIPOD_COOKIE_FILE"))
+        metadata = _fetch_single_video_metadata(
+            args.url, args.cookie_file or str(config.sync.paths.cookie_file)
+        )
         meta_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id") or bvid
         if meta_bvid != bvid:
             raise ValueError(f"metadata BVID 与 URL 不一致: {meta_bvid} != {bvid}")
-        converted, is_temp = _convert_media_to_mp3(src, media_dst.parent, bvid, quality, args.ffmpeg_bin)
+        converted, is_temp = _convert_media_to_mp3(src, media_dst.parent, bvid, quality, args.ffmpeg_bin or "ffmpeg")
         try:
             _copy_attached_media(converted, media_dst, args.replace)
         finally:
@@ -2425,9 +2441,10 @@ def rebuild_paid_rss(
 def cmd_paid_rebuild_rss(args: argparse.Namespace) -> None:
     """Rebuild RSS for a manual media series from existing metadata + media."""
     db_path = _get_db(args)
-    media_root = Path(args.media_root) if args.media_root else Path("/var/lib/bilipod/media")
-    json_root = Path(args.json_root) if args.json_root else Path("/var/lib/bilipod/json")
-    rss_root = Path(args.rss_root) if args.rss_root else Path("/var/lib/bilipod/rss")
+    config = _require_config()
+    media_root = Path(args.media_root) if args.media_root else config.app.paths.media_root
+    json_root = Path(args.json_root) if args.json_root else config.app.paths.json_root
+    rss_root = Path(args.rss_root) if args.rss_root else config.app.paths.rss_root
 
     try:
         rss_path, item_count = rebuild_paid_rss(
@@ -2458,7 +2475,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bilipod-admin",
         description="Bilipod 系列管理 CLI",
     )
-    parser.add_argument("--config-db", help=f"SQLite 数据库路径（默认: {DEFAULT_CONFIG_DB}）")
+    parser.add_argument("--config-db", help="SQLite 数据库路径（默认读取 app.database.path）")
     parser.add_argument("--yes", action="store_true", help="跳过低风险确认")
     parser.add_argument("--dry-run", action="store_true", help="只预览，不写 DB、不执行同步")
     parser.add_argument("--json", action="store_true", help="JSON 格式输出")
@@ -2479,20 +2496,14 @@ def build_parser() -> argparse.ArgumentParser:
     def add_removal_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--apply", action="store_true", help="真正执行移除（默认只预览）")
         p.add_argument("--yes", dest="remove_yes", action="store_true", help="跳过 remove 确认")
-        p.add_argument("--media-root", default=os.environ.get("BILIPOD_MEDIA_ROOT", "/var/lib/bilipod/media"))
-        p.add_argument("--json-root", default=os.environ.get("BILIPOD_JSON_ROOT", "/var/lib/bilipod/json"))
-        p.add_argument("--rss-root", default=os.environ.get("BILIPOD_RSS_ROOT", "/var/lib/bilipod/rss"))
-        p.add_argument("--published-rss-root", default=os.environ.get("BILIPOD_PUBLISHED_RSS_ROOT", "/var/lib/bilipod/published-rss"))
-        p.add_argument("--cron-script-dir", default=os.environ.get("BILIPOD_CRON_SCRIPT_DIR", "/opt/bilipod/auto"))
-        p.add_argument("--browser-user-data-root", default=os.environ.get(
-            "BILIPOD_BROWSER_USER_DATA_ROOT", "/opt/bilipod/browser-profiles",
-        ))
-        p.add_argument("--lock-file", default=os.environ.get(
-            "BILIPOD_LOCK_FILE", "/var/lib/bilipod/state/bilibili-podcast.lock",
-        ))
-        p.add_argument("--users-conf", default=os.environ.get(
-            "RSS_USERS_CONF", "/opt/bilipod/rss-publish-users.conf",
-        ))
+        p.add_argument("--media-root")
+        p.add_argument("--json-root")
+        p.add_argument("--rss-root")
+        p.add_argument("--published-rss-root")
+        p.add_argument("--cron-script-dir")
+        p.add_argument("--browser-user-data-root")
+        p.add_argument("--lock-file")
+        p.add_argument("--users-conf")
 
     # remove-series
     p_remove = sub.add_parser("remove-series", help="预览或永久移除系列及其本地产物")
@@ -2628,7 +2639,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_sp_set.add_argument("--request-jitter", dest="request_jitter_seconds", type=float)
     p_sp_set.add_argument("--rate-limit-cooldown", dest="rate_limit_cooldown_seconds", type=int)
     p_sp_set.add_argument("--update-period")
+    p_sp_set.add_argument("--update-period-grace-seconds", type=int)
     p_sp_set.add_argument("--format", choices=["audio", "video"])
+    p_sp_set.add_argument("--media-mode", choices=["auto", "manual"])
     p_sp_set.add_argument("--quality", choices=["64K", "132K", "192K"])
     p_sp_set.add_argument("--fetch-strategy", choices=["api_first", "browser_first"])
     p_sp_set.add_argument("--keep-last", type=int)
@@ -2650,7 +2663,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_cron_plan.set_defaults(handler=cmd_cron_plan)
 
     p_cron_apply = cron_sub.add_parser("apply", help="安装 crontab（需二次确认）")
-    p_cron_apply.add_argument("--cron-script-dir", help="wrapper 脚本输出目录（默认自动/auto，生产环境请指定绝对路径如 /opt/bilipod/auto）")
+    p_cron_apply.add_argument("--cron-script-dir", help="wrapper 脚本输出目录（默认读取 scheduler.toml，可用 <server_path>/auto 单次覆盖）")
     p_cron_apply.add_argument("--yes", dest="cron_yes", action="store_true", help="跳过确认（与全局 --yes 效果相同，支持放在子命令后）")
     p_cron_apply.set_defaults(handler=cmd_cron_apply)
 
@@ -2704,7 +2717,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched_disable.add_argument("--backend", dest="scheduler_backend", default="systemd",
                                  choices=["systemd"], help="调度后端（disable 仅支持 systemd）")
     p_sched_disable.add_argument("--series", required=True, help="系列标识")
-    p_sched_disable.add_argument("--cron-script-dir", help="wrapper 输出目录（生产环境必填如 /opt/bilipod/auto）")
+    p_sched_disable.add_argument("--cron-script-dir", help="wrapper 输出目录（默认读取 scheduler.toml，可用 <server_path>/auto 单次覆盖）")
     p_sched_disable.add_argument("--delete-units", action="store_true", help="同时删除 unit 文件")
     p_sched_disable.add_argument("--yes", dest="scheduler_disable_yes", action="store_true",
                                  help="跳过确认")
@@ -2716,7 +2729,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_refresh = paid_sub.add_parser("refresh-metadata", help="刷新 metadata（不下载 media）")
     p_refresh.add_argument("series")
-    p_refresh.add_argument("--json-root", default="/var/lib/bilipod/json", help="JSON metadata 目录")
+    p_refresh.add_argument("--json-root", help="JSON metadata 目录")
     p_refresh.add_argument("--cookie-file", help="Netscape cookie 文件路径")
     refresh_target = p_refresh.add_mutually_exclusive_group()
     refresh_target.add_argument("--bvid", help="仅刷新指定 BVID")
@@ -2725,15 +2738,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = paid_sub.add_parser("list-missing", help="列出缺失 media 的条目")
     p_list.add_argument("series")
-    p_list.add_argument("--json-root", default="/var/lib/bilipod/json", help="JSON metadata 目录")
-    p_list.add_argument("--media-root", default="/var/lib/bilipod/media")
+    p_list.add_argument("--json-root", help="JSON metadata 目录")
+    p_list.add_argument("--media-root")
     p_list.set_defaults(handler=cmd_paid_list_missing)
 
     p_attach = paid_sub.add_parser("attach-media", help="关联用户上传的 media 文件")
     p_attach.add_argument("series")
     p_attach.add_argument("--bvid", required=True)
     p_attach.add_argument("--server-path", required=True)
-    p_attach.add_argument("--media-root", default="/var/lib/bilipod/media")
+    p_attach.add_argument("--media-root")
     p_attach.add_argument("--replace", action="store_true", help="覆盖已有 media")
     p_attach.set_defaults(handler=cmd_paid_attach_media)
 
@@ -2741,30 +2754,66 @@ def build_parser() -> argparse.ArgumentParser:
     p_add_item.add_argument("series")
     p_add_item.add_argument("--url", required=True, help="B 站视频页面 URL")
     p_add_item.add_argument("--media-path", required=True, help="服务器上的用户 media 文件路径")
-    p_add_item.add_argument("--media-root", default="/var/lib/bilipod/media")
-    p_add_item.add_argument("--json-root", default="/var/lib/bilipod/json")
-    p_add_item.add_argument("--rss-root", default="/var/lib/bilipod/rss")
-    p_add_item.add_argument("--media-base-url", default="http://localhost:58743")
+    p_add_item.add_argument("--media-root")
+    p_add_item.add_argument("--json-root")
+    p_add_item.add_argument("--rss-root")
+    p_add_item.add_argument("--media-base-url")
     p_add_item.add_argument("--cookie-file", help="Netscape cookie 文件路径")
-    p_add_item.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg 可执行文件路径")
+    p_add_item.add_argument("--ffmpeg-bin", help="ffmpeg 可执行文件路径")
     p_add_item.add_argument("--replace", action="store_true", help="覆盖已有 media")
     p_add_item.add_argument("--publish-script", help="重建 RSS 后执行的发布脚本")
     p_add_item.set_defaults(handler=cmd_paid_add_item)
 
     p_rebuild = paid_sub.add_parser("rebuild-rss", help="从已有 metadata + media 重建 RSS")
     p_rebuild.add_argument("series")
-    p_rebuild.add_argument("--media-root", default="/var/lib/bilipod/media")
-    p_rebuild.add_argument("--json-root", default="/var/lib/bilipod/json")
-    p_rebuild.add_argument("--rss-root", default="/var/lib/bilipod/rss")
-    p_rebuild.add_argument("--media-base-url", default="http://localhost:58743")
+    p_rebuild.add_argument("--media-root")
+    p_rebuild.add_argument("--json-root")
+    p_rebuild.add_argument("--rss-root")
+    p_rebuild.add_argument("--media-base-url")
     p_rebuild.set_defaults(handler=cmd_paid_rebuild_rss)
 
     return parser
 
 
+def apply_admin_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapshot) -> argparse.Namespace:
+    defaults = {
+        "config_db": str(snapshot.app.database.path),
+        "media_root": str(snapshot.app.paths.media_root),
+        "json_root": str(snapshot.app.paths.json_root),
+        "rss_root": str(snapshot.app.paths.rss_root),
+        "published_rss_root": str(snapshot.app.paths.published_rss_root),
+        "cron_script_dir": str(snapshot.scheduler.paths.wrapper_dir),
+        "browser_user_data_root": str(snapshot.sync.browser.user_data_root),
+        "lock_file": str(snapshot.sync.paths.lock_file),
+        "users_conf": str(snapshot.root / "rss-users.toml"),
+        "cookie_file": str(snapshot.sync.paths.cookie_file),
+        "media_base_url": snapshot.publish.publish.media_base_url,
+        "ffmpeg_bin": snapshot.app.executables.ffmpeg,
+        "publish_script": (
+            str(snapshot.publish.publish.script)
+            if snapshot.publish.publish.enabled and snapshot.publish.publish.script
+            else None
+        ),
+    }
+    for name, value in defaults.items():
+        if hasattr(args, name) and getattr(args, name) is None:
+            setattr(args, name, value)
+    return args
+
+
 def main() -> int:
+    global _CONFIG
     parser = build_parser()
     args = parser.parse_args()
+
+    try:
+        _CONFIG = ConfigManager().load()
+        apply_admin_config_defaults(args, _CONFIG)
+        from .services import systemd_scheduler
+        systemd_scheduler.configure(_CONFIG)
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return exc.exit_code
 
     try:
         args.handler(args)

@@ -171,6 +171,19 @@ auto/
 # See configs/series.d/_template.yaml for the reference format.
 configs/series.d/
 
+# Unified runtime configuration. Track only redacted examples and the YAML
+# rollback template; actual TOML/YAML files may contain credentials and IDs.
+config/*.toml
+config/series.d/*.yaml
+!config/*.toml.example
+!config/series.d/_template.yaml
+config/.temp/
+config/**/*.tmp
+config/.backups/
+config/.bilipod-migrate-*/
+config/**/*.bak*
+.temp/
+
 # RSS user config (contains real tokens)
 rss-publish-users.conf
 

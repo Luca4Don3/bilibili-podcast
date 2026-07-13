@@ -14,10 +14,12 @@ from .db import write_state_file as _db_write_state
 from .utils.series_config import SeriesConfig, load_series_configs as _yaml_load
 
 
-def from_args(config_dir: str, state_root: str, config_db: str | None = None) -> ConfigStore:
+def from_args(config_dir: str | None, state_root: str, config_db: str | None = None) -> ConfigStore:
     """Select the appropriate store based on CLI args."""
     if config_db:
         return DbStore(Path(config_db))
+    if not config_dir:
+        raise ValueError("config database is required unless --config-dir is explicit")
     return YamlStore(Path(config_dir), Path(state_root))
 
 

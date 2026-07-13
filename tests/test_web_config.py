@@ -6,16 +6,36 @@ import importlib
 import inspect
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
 def _load_web_server(monkeypatch, db_path: Path):
-    monkeypatch.setenv("BILIPOD_CONFIG_DB", str(db_path))
-    monkeypatch.setenv("BILIPOD_WEB_PASSWORD", "test-password")
     name = "bilibili_podcast.web.server"
     if name in sys.modules:
-        return importlib.reload(sys.modules[name])
-    return importlib.import_module(name)
+        server = importlib.reload(sys.modules[name])
+    else:
+        server = importlib.import_module(name)
+    server.DB_PATH = str(db_path)
+    server.PASSWORD = "test-password"
+    server._SECRET_KEY = server.hashlib.sha256(server.PASSWORD.encode()).hexdigest()
+    server._serializer = server.URLSafeTimedSerializer(server._SECRET_KEY)
+    root = db_path.parent
+    server._CONFIG_SNAPSHOT = SimpleNamespace(
+        root=root / "config",
+        app=SimpleNamespace(paths=SimpleNamespace(
+            media_root=root / "media", json_root=root / "json", rss_root=root / "rss",
+            log_dir=root / "logs",
+        )),
+        sync=SimpleNamespace(
+            paths=SimpleNamespace(cookie_file=root / "cookie.txt", lock_file=root / "sync.lock"),
+            browser=SimpleNamespace(user_data_root=root / "browser"),
+        ),
+        publish=SimpleNamespace(publish=SimpleNamespace(
+            enabled=False, media_base_url="https://media.example.invalid", script=None,
+        )),
+    )
+    return server
 
 
 def test_filters_form_can_disable_exclude_paid(monkeypatch, tmp_path: Path) -> None:
@@ -139,7 +159,7 @@ def test_series_new_create_rejects_duplicate_without_overwrite(monkeypatch, tmp_
     assert row["author"] == "A"
 
 
-def test_manual_media_attach_rebuilds_and_publishes_rss(monkeypatch, tmp_path: Path) -> None:
+def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tmp_path: Path) -> None:
     import asyncio
     import json
     from unittest.mock import patch
@@ -155,11 +175,17 @@ def test_manual_media_attach_rebuilds_and_publishes_rss(monkeypatch, tmp_path: P
     src.write_text("audio")
     publish_script = tmp_path / "publish.sh"
 
-    monkeypatch.setenv("BILIPOD_MEDIA_ROOT", str(media_root))
-    monkeypatch.setenv("BILIPOD_JSON_ROOT", str(json_root))
-    monkeypatch.setenv("BILIPOD_RSS_ROOT", str(rss_root))
-    monkeypatch.setenv("BILIPOD_MEDIA_BASE_URL", "http://media.test")
-    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(allow_dir))
+    config = SimpleNamespace(
+        app=SimpleNamespace(paths=SimpleNamespace(
+            media_root=media_root, json_root=json_root, rss_root=rss_root,
+        )),
+        publish=SimpleNamespace(publish=SimpleNamespace(
+            enabled=False, media_base_url="http://media.test", script=None,
+        )),
+        manual_media=SimpleNamespace(
+            enabled=True, allowed_dirs=(allow_dir,), follow_symlinks=False,
+        ),
+    )
     monkeypatch.setenv("BILIPOD_RSS_PUBLISH", str(publish_script))
 
     db.migrate(str(db_path))
@@ -182,6 +208,8 @@ def test_manual_media_attach_rebuilds_and_publishes_rss(monkeypatch, tmp_path: P
     }))
 
     server = _load_web_server(monkeypatch, db_path)
+    server._CONFIG_SNAPSHOT = config
+    server._cli_admin._CONFIG = config
     with patch.object(server, "_csrf_guard", return_value=None), \
             patch.object(server.subprocess, "run") as run:
         response = asyncio.run(
@@ -201,7 +229,7 @@ def test_manual_media_attach_rebuilds_and_publishes_rss(monkeypatch, tmp_path: P
     rss = (rss_root / "paidweb.xml").read_text()
     assert "Manual paid item" in rss
     assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in rss
-    run.assert_called_once_with([str(publish_script)], check=True)
+    run.assert_not_called()
 
 
 def test_manual_media_attach_rejects_unknown_series(monkeypatch, tmp_path: Path) -> None:

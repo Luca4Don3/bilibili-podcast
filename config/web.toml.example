@@ -1,0 +1,10 @@
+[server]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+
+[security]
+password = ""
+https = false
+cookie_name = "bilipod_session"
+session_max_age_seconds = 86400

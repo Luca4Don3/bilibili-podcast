@@ -1,0 +1,23 @@
+[downloads]
+max_per_run = 20
+scheduled_max_per_run = 1
+min_free_gb = 5.0
+
+[paths]
+cookie_file = "<server_path>/secrets/www.bilibili.com_cookies.txt"
+lock_file = "<server_path>/state/bilibili-podcast.lock"
+
+[browser]
+user_data_root = "<server_path>/browser-profiles"
+playwright_browsers_path = "<server_path>/playwright-browsers"
+login_wait_seconds = 5.0
+
+[timeouts]
+preview_seconds = 120
+publish_seconds = 60
+
+[logging]
+level = "INFO"
+retention_days = 30
+max_bytes = 20971520
+backup_count = 10

@@ -11,67 +11,39 @@ from pathlib import Path
 from typing import Optional
 
 from .scheduler_service import SchedulerCommandResult
+from ..config import ConfigError, ConfigSnapshot
 
-# ── well-known paths (overridable via env for testing) ───────────────────
+# ── injected process configuration ───────────────────────────────────────
 
-SYSTEMD_DIR = Path(os.environ.get("BILIPOD_SYSTEMD_DIR", "/etc/systemd/system"))
-APP_DIR = Path(os.environ.get("BILIPOD_APP_DIR", "/opt/bilipod/app"))
-ENV_FILE = Path(os.environ.get("BILIPOD_ENV_FILE", "/opt/bilipod/bilipod-env.sh"))
-VENV_BIN = Path(os.environ.get("BILIPOD_VENV_BIN", "/opt/bilipod/venv/bin"))
-STATE_DIR = Path(os.environ.get("BILIPOD_STATE_DIR", "/var/lib/bilipod/state"))
-SECRETS_DIR = Path(os.environ.get("BILIPOD_SECRETS_DIR", "/opt/bilipod/secrets"))
-MEDIA_ROOT = Path(os.environ.get("BILIPOD_MEDIA_ROOT", "/var/lib/bilipod/media"))
-JSON_ROOT = Path(os.environ.get("BILIPOD_JSON_ROOT", "/var/lib/bilipod/json"))
-RSS_ROOT = Path(os.environ.get("BILIPOD_RSS_ROOT", "/var/lib/bilipod/rss"))
-LOG_DIR = Path(os.environ.get("BILIPOD_LOG_DIR", "/var/log/bilipod"))
-BROWSER_DATA_ROOT = Path(os.environ.get("BILIPOD_BROWSER_USER_DATA_ROOT",
-                                         "/opt/bilipod/browser-profiles"))
-PLAYWRIGHT_BWS = os.environ.get("PLAYWRIGHT_BROWSERS_PATH",
-                                "/opt/bilipod/playwright-browsers")
-DB_PATH = STATE_DIR / "bilipod.db"
-COOKIE_FILE = SECRETS_DIR / "www.bilibili.com_cookies.txt"
+_CONFIG: ConfigSnapshot | None = None
+SYSTEMD_DIR: Path | None = None
+APP_DIR: Path | None = None
+COMMAND_TIMEOUT = 30
 
 
-def _env_file_value(path: Path, key: str) -> str | None:
-    if not path.exists():
-        return None
-    prefix = f"{key}="
-    export_prefix = f"export {key}="
-    for raw_line in path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith(export_prefix):
-            value = line[len(export_prefix):]
-        elif line.startswith(prefix):
-            value = line[len(prefix):]
-        else:
-            continue
-        return value.strip().strip('"').strip("'")
-    return None
+def configure(config: ConfigSnapshot) -> None:
+    """Inject the process snapshot before scheduler operations."""
+    global _CONFIG, SYSTEMD_DIR, APP_DIR, COMMAND_TIMEOUT
+    _CONFIG = config
+    SYSTEMD_DIR = config.scheduler.paths.systemd_dir
+    APP_DIR = config.app.install.app_dir
+    COMMAND_TIMEOUT = config.scheduler.command_timeout_seconds
 
-
-MEDIA_BASE_URL = (
-    os.environ.get("BILIPOD_MEDIA_BASE_URL")
-    or _env_file_value(ENV_FILE, "BILIPOD_MEDIA_BASE_URL")
-    or "http://localhost:58743"
-)
-SYNC_LOG_LEVEL = os.environ.get("BILIPOD_SYNC_LOG_LEVEL", "INFO")
 
 # ── service unit template ──────────────────────────────────────────────
 
-SERVICE_TEMPLATE = """\
+UNIFIED_SERVICE_TEMPLATE = """\
 [Unit]
 Description=Bilipod Sync — {series}
 After=network.target
 
 [Service]
 Type=oneshot
-User=bilipod
-Group=bilipod
+User={user}
+Group={group}
 WorkingDirectory={app_dir}
-Environment=PLAYWRIGHT_BROWSERS_PATH={pw_browsers}
-ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply --publish-script {rss_publish}{retry_args}{log_level_args}
+Environment=BILIPOD_CONFIG_ROOT={config_root}
+ExecStart={sync_bin} --series {series} --max-downloads-per-run {max_downloads} --token __MEDIA_PLACEHOLDER__ --apply{retry_args}
 Restart=no
 TimeoutStartSec=1800
 """
@@ -129,45 +101,19 @@ def cron_to_oncalendar(expr: str) -> Optional[str]:
 
 # ── unit content generators ──────────────────────────────────────────
 
-_ENV_FILE = ENV_FILE
-_LOCK_FILE = STATE_DIR / "bilibili-podcast.lock"
-_SYNC_BIN = VENV_BIN / "bilibili-podcast"
-_RSS_PUBLISH = Path(os.environ.get("BILIPOD_RSS_PUBLISH",
-                                     "/opt/bilipod/rss-publish-and-sync.sh"))
-
-
-def _log_level_args() -> str:
-    """Return the log-level CLI args for the sync ExecStart line."""
-    level = (os.environ.get("BILIPOD_SYNC_LOG_LEVEL", SYNC_LOG_LEVEL) or "INFO").upper()
-    if level == "DEBUG":
-        # Keep the historical --debug flag so existing tooling continues to work.
-        return " --debug"
-    if level in ("INFO", "WARNING", "ERROR", "CRITICAL"):
-        return f" --log-level {level}"
-    # Unknown level: fall back to INFO to avoid breaking the unit.
-    return " --log-level INFO"
-
-
 def generate_service(series: str, *, scheduled_retry: bool = False) -> str:
     """Return the service unit content for *series*."""
-    return SERVICE_TEMPLATE.format(
+    if _CONFIG is None:
+        raise ConfigError("systemd scheduler configuration was not injected")
+    return UNIFIED_SERVICE_TEMPLATE.format(
         series=series,
-        app_dir=APP_DIR,
-        pw_browsers=PLAYWRIGHT_BWS,
-        sync_bin=_SYNC_BIN,
-        db_path=DB_PATH,
-        cookie_file=COOKIE_FILE,
-        media_root=MEDIA_ROOT,
-        json_root=JSON_ROOT,
-        rss_root=RSS_ROOT,
-        state_dir=STATE_DIR,
-        lock_file=_LOCK_FILE,
-        log_dir=LOG_DIR,
-        media_base_url=MEDIA_BASE_URL,
-        browser_data_root=BROWSER_DATA_ROOT,
-        rss_publish=_RSS_PUBLISH,
+        user=_CONFIG.scheduler.runtime.user,
+        group=_CONFIG.scheduler.runtime.group,
+        app_dir=_CONFIG.app.install.app_dir,
+        config_root=_CONFIG.root,
+        sync_bin=_CONFIG.app.executables.sync,
+        max_downloads=_CONFIG.sync.downloads.scheduled_max_per_run,
         retry_args=" --scheduled-retry" if scheduled_retry else "",
-        log_level_args=_log_level_args(),
     )
 
 
@@ -195,13 +141,13 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess:
     try:
         r = subprocess.run(
             ["systemctl", *args],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
         )
         # Retry with sudo if permission denied
         if r.returncode != 0 and ("denied" in r.stderr.lower() or "not authorized" in r.stderr.lower()):
             r = subprocess.run(
                 ["sudo", "systemctl", *args],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
             )
         return r
     except FileNotFoundError:
@@ -294,6 +240,8 @@ def disable_timer(series: str, *, scheduled_retry: bool = False) -> SchedulerCom
 
 def write_unit(series: str, suffix: str, content: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Write a unit file, using an atomic local replace and sudo fallback."""
+    if SYSTEMD_DIR is None:
+        raise ConfigError("systemd scheduler configuration was not injected")
     path = SYSTEMD_DIR / unit_name(series, suffix, scheduled_retry=scheduled_retry)
     tmp_path: Path | None = None
     sudo_tmp_path: Path | None = None
@@ -363,6 +311,8 @@ def write_unit(series: str, suffix: str, content: str, *, scheduled_retry: bool 
 
 def remove_unit(series: str, suffix: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Remove a generated unit file, using sudo when direct unlink is denied."""
+    if SYSTEMD_DIR is None:
+        raise ConfigError("systemd scheduler configuration was not injected")
     path = SYSTEMD_DIR / unit_name(series, suffix, scheduled_retry=scheduled_retry)
     if not path.exists():
         return SchedulerCommandResult(

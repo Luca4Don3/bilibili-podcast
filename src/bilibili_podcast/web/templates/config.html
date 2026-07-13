@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}有效配置 — Bilipod{% endblock %}
+{% block content %}
+<h1>有效配置</h1>
+<p class="text-muted">只读视图；敏感字段始终脱敏。</p>
+<table>
+  <thead><tr><th>字段</th><th>来源</th><th>有效值</th></tr></thead>
+  <tbody>
+  {% for row in rows %}
+    <tr><td><code>{{ row.field }}</code></td><td>{{ row.source }}</td><td><code>{{ row.value }}</code></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

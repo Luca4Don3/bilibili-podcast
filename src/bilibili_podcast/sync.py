@@ -22,6 +22,7 @@ from typing import Optional
 from .utils.series_config import SeriesConfig
 from .config_store import from_args as make_store
 from .utils.paid_content import has_paid_state, is_paid_content
+from .config import ConfigError, ConfigManager, ConfigSnapshot
 
 
 QUALITY_TO_AUDIO = {
@@ -42,8 +43,6 @@ DEFAULT_BROWSER_WAIT_SECONDS = 5.0
 DEFAULT_BROWSER_FALLBACK_COOLDOWN_SECONDS = 3600
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 21600
 DEFAULT_UPDATE_PERIOD_GRACE_SECONDS = 120
-DEFAULT_BROWSER_USER_DATA_ROOT = "/tmp/bilibili-podcast-browser-profiles"
-DEFAULT_LOG_DIR = "/var/log/bilipod"
 LOG_LEVELS = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -108,7 +107,15 @@ def cleanup_old_log_backups(
     return removed
 
 
-def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) -> Path:
+def setup_logging(
+    log_dir: str,
+    log_level: str = "INFO",
+    debug: bool = False,
+    *,
+    retention_days: int = LOG_RETENTION_DAYS,
+    max_bytes: int = 20 * 1024 * 1024,
+    backup_count: int = 10,
+) -> Path:
     if isinstance(log_level, bool):
         debug = log_level
         log_level = "INFO"
@@ -130,8 +137,8 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
             logger.handlers.clear()
             handler = RotatingFileHandler(
                 log_root / filename,
-                maxBytes=20 * 1024 * 1024,
-                backupCount=10,
+                maxBytes=max_bytes,
+                backupCount=backup_count,
                 encoding="utf-8",
             )
             handler.setFormatter(formatter)
@@ -140,8 +147,8 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
         # Separate error-only log for quick monitoring
         error_handler = RotatingFileHandler(
             log_root / "sync.error.log",
-            maxBytes=20 * 1024 * 1024,
-            backupCount=10,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
             encoding="utf-8",
         )
         error_handler.setLevel(logging.ERROR)
@@ -152,7 +159,7 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
     try:
         log_root.mkdir(parents=True, exist_ok=True)
         configure_handlers(log_root)
-        cleanup_old_log_backups(log_root)
+        cleanup_old_log_backups(log_root, retention_days)
     except OSError as exc:
         fallback = Path("/tmp/bilibili-podcast-logs")
         fallback.mkdir(parents=True, exist_ok=True)
@@ -162,7 +169,7 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
         )
         log_root = fallback
         configure_handlers(log_root)
-        cleanup_old_log_backups(log_root)
+        cleanup_old_log_backups(log_root, retention_days)
 
     LOGGER.info(
         "logging initialized log_dir=%s pid=%s log_level=%s debug=%s",
@@ -1960,7 +1967,8 @@ async def run(args: argparse.Namespace) -> int:
         LOGGER.info("running publish script: %s", args.publish_script)
         try:
             result = subprocess.run(
-                [args.publish_script], capture_output=True, text=True, timeout=60,
+                [args.publish_script], capture_output=True, text=True,
+                timeout=getattr(args, "publish_timeout_seconds", 60),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             LOGGER.error("publish script failed: %s", exc)
@@ -1987,25 +1995,26 @@ async def run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sync bilibili-podcast series configs.")
-    parser.add_argument("--config-db", help="SQLite database path (replaces --config-dir and --state-root).")
-    parser.add_argument("--config-dir", default="configs/series.d")
+    config_source = parser.add_mutually_exclusive_group()
+    config_source.add_argument("--config-db", help="One-run SQLite database path override.")
+    config_source.add_argument("--config-dir", help="Explicit legacy YAML rollback directory.")
     parser.add_argument("--series", help="Comma-separated series ids to sync.")
     parser.add_argument("--cookie-file", help="Netscape cookie file for Bilibili.")
     parser.add_argument("--token", help="Media token to append to RSS enclosure URLs.")
-    parser.add_argument("--media-root", default="/var/lib/bilipod/media")
-    parser.add_argument("--json-root", default="/var/lib/bilipod/json")
-    parser.add_argument("--rss-root", default="/var/lib/bilipod/rss")
-    parser.add_argument("--media-base-url", default="http://localhost:8080")
-    parser.add_argument("--lock-file", default="/tmp/bilibili-podcast.lock")
-    parser.add_argument("--state-root", default="/tmp/bilibili-podcast-state")
-    parser.add_argument("--max-downloads-per-run", type=int, default=20)
-    parser.add_argument("--min-free-gb", type=float, default=5.0)
+    parser.add_argument("--media-root")
+    parser.add_argument("--json-root")
+    parser.add_argument("--rss-root")
+    parser.add_argument("--media-base-url")
+    parser.add_argument("--lock-file")
+    parser.add_argument("--state-root")
+    parser.add_argument("--max-downloads-per-run", type=int)
+    parser.add_argument("--min-free-gb", type=float)
     parser.add_argument("--browser-fallback", action="store_true", help="Use one low-rate Playwright page visit if API fetching fails.")
-    parser.add_argument("--browser-user-data-root", default=DEFAULT_BROWSER_USER_DATA_ROOT)
+    parser.add_argument("--browser-user-data-root")
     parser.add_argument("--browser-login-check", action="store_true", help="Open Bilibili once with Playwright and loaded cookies to verify browser login.")
-    parser.add_argument("--browser-login-wait-seconds", type=float, default=5.0)
-    parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Directory for bilibili-podcast and Playwright logs.")
-    parser.add_argument("--log-level", type=parse_log_level, default="INFO", help="Log level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
+    parser.add_argument("--browser-login-wait-seconds", type=float)
+    parser.add_argument("--log-dir", help="Directory for bilibili-podcast and Playwright logs.")
+    parser.add_argument("--log-level", type=parse_log_level, help="Log level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
     parser.add_argument("--debug", action="store_true", help="Shortcut for --log-level DEBUG (per-item details).")
     parser.add_argument("--force", action="store_true", help="Ignore per-series update and rate-limit cooldown gates.")
     parser.add_argument("--scheduled-retry", action="store_true", help="Run only after a primary failure; bypass update-period gate only.")
@@ -2014,9 +2023,54 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapshot) -> argparse.Namespace:
+    """Apply ``explicit CLI > TOML > schema default`` without hiding CLI intent."""
+    yaml_rollback = args.config_dir is not None
+    defaults = {
+        "config_db": None if yaml_rollback else str(snapshot.app.database.path),
+        "state_root": str(snapshot.app.paths.state_root),
+        "media_root": str(snapshot.app.paths.media_root),
+        "json_root": str(snapshot.app.paths.json_root),
+        "rss_root": str(snapshot.app.paths.rss_root),
+        "media_base_url": snapshot.publish.publish.media_base_url,
+        "cookie_file": str(snapshot.sync.paths.cookie_file),
+        "lock_file": str(snapshot.sync.paths.lock_file),
+        "max_downloads_per_run": snapshot.sync.downloads.max_per_run,
+        "min_free_gb": snapshot.sync.downloads.min_free_gb,
+        "browser_user_data_root": str(snapshot.sync.browser.user_data_root),
+        "browser_login_wait_seconds": snapshot.sync.browser.login_wait_seconds,
+        "log_dir": str(snapshot.app.paths.log_dir),
+        "log_level": snapshot.sync.logging.level,
+        "publish_script": (
+            str(snapshot.publish.publish.script)
+            if snapshot.publish.publish.enabled and snapshot.publish.publish.script
+            else None
+        ),
+        "publish_timeout_seconds": snapshot.sync.timeouts.publish_seconds,
+    }
+    for name, value in defaults.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
+    return args
+
+
 def main() -> int:
     args = build_parser().parse_args()
-    setup_logging(args.log_dir, args.log_level, args.debug)
+    try:
+        snapshot = ConfigManager().load()
+        apply_config_defaults(args, snapshot)
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(snapshot.sync.browser.playwright_browsers_path)
+    except ConfigError as exc:
+        print(f"configuration error: {exc}", file=sys.stderr)
+        return exc.exit_code
+    setup_logging(
+        args.log_dir,
+        args.log_level,
+        args.debug,
+        retention_days=snapshot.sync.logging.retention_days,
+        max_bytes=snapshot.sync.logging.max_bytes,
+        backup_count=snapshot.sync.logging.backup_count,
+    )
     with process_lock(args.lock_file):
         return asyncio.run(run(args))
 

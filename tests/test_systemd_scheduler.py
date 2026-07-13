@@ -2,12 +2,37 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from bilibili_podcast.services import systemd_scheduler as sysd
 from bilibili_podcast.services.scheduler_service import ScheduleEntry, validate_schedules
+
+
+def _snapshot(root: Path):
+    return SimpleNamespace(
+        root=root / "config",
+        scheduler=SimpleNamespace(
+            paths=SimpleNamespace(systemd_dir=root),
+            runtime=SimpleNamespace(user="bilipod", group="bilipod"),
+            command_timeout_seconds=30,
+        ),
+        app=SimpleNamespace(
+            install=SimpleNamespace(app_dir=root / "app"),
+            executables=SimpleNamespace(sync=root / "venv/bin/bilibili-podcast"),
+        ),
+        sync=SimpleNamespace(downloads=SimpleNamespace(scheduled_max_per_run=1)),
+    )
+
+
+@pytest.fixture(autouse=True)
+def reset_injected_systemd_config(tmp_path: Path):
+    previous = sysd._CONFIG
+    sysd.configure(_snapshot(tmp_path))
+    yield
+    sysd._CONFIG = previous
 
 
 def _entry(schedule: str, kind: str = "primary") -> ScheduleEntry:
@@ -232,25 +257,19 @@ class TestUnitGeneration:
     def test_service_does_not_use_shell_env_file(self):
         content = sysd.generate_service("testseries")
         assert "EnvironmentFile=" not in content
-        assert "Environment=PLAYWRIGHT_BROWSERS_PATH=" in content
+        assert "Environment=BILIPOD_CONFIG_ROOT=" in content
         assert "ExecStartPost=" not in content
-        assert "--publish-script" in content
-
-    def test_env_file_value_reads_export_syntax(self, tmp_path: Path):
-        env_file = tmp_path / "bilipod-env.sh"
-        env_file.write_text('export BILIPOD_MEDIA_BASE_URL="http://media.example"\n')
-        assert sysd._env_file_value(env_file, "BILIPOD_MEDIA_BASE_URL") == "http://media.example"
+        assert "--publish-script" not in content
 
     def test_generate_service_no_debug_by_default(self, monkeypatch):
-        # 清除可能干扰的环境变量，默认 level=INFO 不应产生 --debug
         monkeypatch.delenv("BILIPOD_SYNC_LOG_LEVEL", raising=False)
         content = sysd.generate_service("testseries")
         assert "--debug" not in content
 
-    def test_generate_service_log_level_warning(self, monkeypatch):
+    def test_generate_service_ignores_legacy_log_environment(self, monkeypatch):
         monkeypatch.setenv("BILIPOD_SYNC_LOG_LEVEL", "WARNING")
         content = sysd.generate_service("testseries")
-        assert "--log-level WARNING" in content
+        assert "--log-level WARNING" not in content
 
     def test_timer_contains_oncalendar(self):
         content = sysd.generate_timer("testseries", ["*-*-* 03:15:00"])
@@ -540,12 +559,11 @@ class TestApplyRollback:
     def test_restart_timer_failure_rollbacks_and_restores_active_state(self, tmp_path: Path):
         """If restart_timer fails, rollback must restore the previous timer state."""
         import os
-        os.environ["BILIPOD_SYSTEMD_DIR"] = str(tmp_path)
-        # Re-import to pick up the new env var
         from unittest.mock import patch
         import importlib
         import bilibili_podcast.services.systemd_scheduler as sysd_mod
         importlib.reload(sysd_mod)
+        sysd_mod.configure(_snapshot(tmp_path))
         from bilibili_podcast.services.scheduler_service import SchedulerService
         from bilibili_podcast import db
 
@@ -577,10 +595,10 @@ class TestApplyRollback:
         """If timer_is_active returns False, disable_timer must be called and
         the error must mention 'active verification' not just 'enabled'."""
         import os
-        os.environ["BILIPOD_SYSTEMD_DIR"] = str(tmp_path)
         import importlib
         import bilibili_podcast.services.systemd_scheduler as sysd_mod
         importlib.reload(sysd_mod)
+        sysd_mod.configure(_snapshot(tmp_path))
         from unittest.mock import patch
         from bilibili_podcast.services.scheduler_service import SchedulerService
         from bilibili_podcast import db

@@ -5,11 +5,54 @@ import os
 import sys
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
 
 from bilibili_podcast import cli_admin
+
+
+@pytest.fixture(autouse=True)
+def reset_admin_config_snapshot(tmp_path: Path):
+    """Inject one explicit test snapshot for low-level handler tests."""
+    class ManualMedia:
+        enabled = True
+        follow_symlinks = False
+
+        @property
+        def allowed_dirs(self):
+            raw = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS", "")
+            return tuple(Path(item) for item in raw.split(":") if item)
+
+    cli_admin._CONFIG = SimpleNamespace(
+        root=tmp_path / "config",
+        app=SimpleNamespace(
+            database=SimpleNamespace(path=tmp_path / "bilipod.db"),
+            paths=SimpleNamespace(
+                media_root=tmp_path / "media",
+                json_root=tmp_path / "json",
+                rss_root=tmp_path / "rss",
+                published_rss_root=tmp_path / "published-rss",
+                state_root=tmp_path / "state",
+                log_dir=tmp_path / "logs",
+                secrets_dir=tmp_path / "secrets",
+            ),
+            executables=SimpleNamespace(sync=tmp_path / "bin/bilibili-podcast"),
+        ),
+        sync=SimpleNamespace(
+            paths=SimpleNamespace(cookie_file="", lock_file=tmp_path / "sync.lock"),
+            browser=SimpleNamespace(user_data_root=tmp_path / "browser"),
+            downloads=SimpleNamespace(scheduled_max_per_run=1, min_free_gb=5.0),
+            timeouts=SimpleNamespace(preview_seconds=120, publish_seconds=60),
+        ),
+        publish=SimpleNamespace(publish=SimpleNamespace(
+            enabled=False, media_base_url="https://media.example.invalid", script=None,
+        )),
+        manual_media=ManualMedia(),
+    )
+    yield
+    cli_admin._CONFIG = None
 
 
 @pytest.fixture
@@ -606,8 +649,8 @@ def test_sync_dry_run_has_production_params(tmp_path: Path) -> None:
     assert "--min-free-gb" in cmd
 
 
-def test_sync_apply_runs_publish(tmp_path: Path) -> None:
-    """apply success must run publish script."""
+def test_sync_apply_ignores_legacy_publish_environment(tmp_path: Path) -> None:
+    """Legacy publish environment must not activate the post-sync hook."""
     import os
     import subprocess
 
@@ -627,12 +670,10 @@ def test_sync_apply_runs_publish(tmp_path: Path) -> None:
             os.environ["BILIPOD_RSS_PUBLISH"] = "/tmp/test-publish.sh"
             cli_admin.cmd_sync(ns)
 
-    assert len(calls) == 2, f"expected 2 subprocess calls (sync + publish), got {len(calls)}"
+    assert len(calls) == 1
     sync_cmd = calls[0]
-    pub_cmd = calls[1]
     assert "--apply" in sync_cmd
     assert "--token __MEDIA_PLACEHOLDER__" in " ".join(sync_cmd)
-    assert pub_cmd == ["/tmp/test-publish.sh"], f"expected publish, got {pub_cmd}"
 
 
 def test_sync_failure_does_not_publish(tmp_path: Path) -> None:
@@ -660,8 +701,7 @@ def test_sync_failure_does_not_publish(tmp_path: Path) -> None:
     assert len(calls) == 1, f"expected 1 subprocess call, got {len(calls)}"
 
 
-def test_publish_failure_exits_nonzero(tmp_path: Path) -> None:
-    """publish failure must exit non-zero even if sync succeeded."""
+def test_legacy_publish_environment_cannot_inject_failing_hook(tmp_path: Path) -> None:
     import os
     import subprocess
 
@@ -681,10 +721,8 @@ def test_publish_failure_exits_nonzero(tmp_path: Path) -> None:
             p = cli_admin.build_parser()
             ns = p.parse_args(["--config-db", db_path, "--yes", "sync", "synctest", "--apply"])
             os.environ["BILIPOD_RSS_PUBLISH"] = "/tmp/test-publish.sh"
-            import pytest
-            with pytest.raises(SystemExit) as exc:
-                cli_admin.cmd_sync(ns)
-            assert exc.value.code == cli_admin.EXIT_SYNC_FAIL
+            cli_admin.cmd_sync(ns)
+    assert side_effects["first"] is False
 
 
 def _create_minimal_series(db_path: str) -> None:
@@ -712,20 +750,10 @@ def test_crontab_excludes_disabled_schedule(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
 
-    # bilipod-crontab checks for placeholder values in env; provide dummy ones
-    secret_file = tmp_path / "rsync_secret"
-    secret_file.write_text("dummy")
     crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
-        env={
-            "BILIPOD_MEDIA_BASE_URL": "http://test:8080",
-            "BILIPOD_RSYNC_HOST": "test-rsync",
-            "BILIPOD_RSYNC_PORT": "22",
-            "BILIPOD_RSYNC_USER": "test",
-            "BILIPOD_RSYNC_SECRET": str(secret_file),
-        },
     )
     assert result.returncode == 0, f"bilipod-crontab failed:\nstdout:{result.stdout}\nstderr:{result.stderr}"
     assert "15 3" in result.stdout, \
@@ -755,6 +783,27 @@ def test_crontab_rejects_retry_schedule(tmp_path: Path) -> None:
     assert "does not support retry schedules: retrycron" in result.stderr
 
 
+def test_crontab_database_failure_does_not_write_scheduler_files(tmp_path: Path) -> None:
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    wrapper_dir = tmp_path / "auto"
+    result = subprocess.run(
+        [
+            sys.executable, crontab_script,
+            "--config-db", str(tmp_path / "missing" / "bilipod.db"),
+            "--script-dir", str(wrapper_dir),
+            "--apply",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={"BILIPOD_CONFIG_ROOT": str(tmp_path / "config")},
+    )
+
+    assert result.returncode == 2
+    assert "cannot load scheduling configuration" in result.stderr
+    assert not wrapper_dir.exists()
+
+
 def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:
     """bilipod-crontab must not let a title break the auto block marker."""
     import sqlite3
@@ -764,19 +813,10 @@ def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:
         conn.execute("INSERT INTO series(series,title,author) VALUES('marker','Line One\nLine Two','T')")
         conn.execute("INSERT INTO cron_schedule(series,schedule) VALUES('marker','15 3 * * *')")
 
-    secret_file = tmp_path / "rsync_secret"
-    secret_file.write_text("dummy")
     crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
-        env={
-            "BILIPOD_MEDIA_BASE_URL": "http://test:8080",
-            "BILIPOD_RSYNC_HOST": "test-rsync",
-            "BILIPOD_RSYNC_PORT": "22",
-            "BILIPOD_RSYNC_USER": "test",
-            "BILIPOD_RSYNC_SECRET": str(secret_file),
-        },
     )
 
     assert result.returncode == 0
@@ -795,19 +835,10 @@ def test_crontab_excludes_systemd_backend_without_disabling_schedule(tmp_path: P
         conn.execute("INSERT INTO cron_schedule(series,schedule) VALUES('systemdonly','15 3 * * *')")
         db.set_scheduler_backend(conn, "systemdonly", "systemd")
 
-    secret_file = tmp_path / "rsync_secret"
-    secret_file.write_text("dummy")
     crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
-        env={
-            "BILIPOD_MEDIA_BASE_URL": "http://test:8080",
-            "BILIPOD_RSYNC_HOST": "test-rsync",
-            "BILIPOD_RSYNC_PORT": "22",
-            "BILIPOD_RSYNC_USER": "test",
-            "BILIPOD_RSYNC_SECRET": str(secret_file),
-        },
     )
 
     assert result.returncode == 0

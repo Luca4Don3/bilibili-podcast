@@ -1,0 +1,20 @@
+[database]
+path = "<server_path>/state/bilipod.db"
+
+[paths]
+media_root = "<server_path>/media"
+json_root = "<server_path>/json"
+rss_root = "<server_path>/rss"
+published_rss_root = "<server_path>/published-rss"
+state_root = "<server_path>/state"
+log_dir = "<server_path>/logs"
+secrets_dir = "<server_path>/secrets"
+
+[install]
+app_dir = "<server_path>/app"
+venv_bin = "<server_path>/venv/bin"
+
+[executables]
+sync = "<server_path>/venv/bin/bilibili-podcast"
+ffmpeg = "ffmpeg"
+bilipod_config = "bilipod-config"
