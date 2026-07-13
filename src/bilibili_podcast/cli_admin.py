@@ -1494,7 +1494,9 @@ def cmd_scheduler_set(args: argparse.Namespace) -> None:
             print("已取消")
             return
 
-    count = SchedulerService(db_path).replace_schedules(args.series, args.schedule)
+    count = SchedulerService(db_path).replace_schedules(
+        args.series, args.schedule, args.retry_schedule,
+    )
     print(f"✅ 已更新 {args.series} 的 {count} 条调度")
     print(f"   注意: 修改仅保存到数据库，执行 'scheduler apply' 才安装调度")
     print()
@@ -2639,6 +2641,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched_set = sched_sub.add_parser("set", help="设置系列调度（仅写 DB，不安装）")
     p_sched_set.add_argument("series")
     p_sched_set.add_argument("--schedule", action="append", default=[], help="Cron 表达式（可多次）")
+    p_sched_set.add_argument("--retry-schedule", action="append", default=[], help="仅在主调度失败后执行的兜底时间（可多次）")
     p_sched_set.add_argument("--yes", dest="scheduler_set_yes", action="store_true",
                              help="跳过确认（与全局 --yes 效果相同，支持放在子命令后）")
     p_sched_set.add_argument("--backend", dest="scheduler_backend", default="cron",
