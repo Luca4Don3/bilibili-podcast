@@ -957,6 +957,7 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
     exclude_keywords = filters.get("exclude_keywords", [])
     include_keywords = filters.get("include_keywords", [])
     advertisement_keywords = filters.get("advertisement_keywords", [])
+    exclude_season_ids = {int(value) for value in filters.get("exclude_season_ids", [])}
     exclude_paid = filters.get("exclude_paid", True)
 
     # Duration filter config
@@ -976,6 +977,7 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
         "paid_confirmed": 0,
         "paid_unconfirmed": 0,
         "exclude_bvid": 0,
+        "exclude_season": 0,
         "exclude_keyword": 0,
         "advertisement_keyword": 0,
         "not_in_include": 0,
@@ -986,6 +988,7 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
         "paid_confirmed": set(),
         "paid_unconfirmed": set(),
         "bvid": set(),
+        "season": set(),
         "keyword": set(),
         "ad_keyword": set(),
         "not_in_include": set(),
@@ -1011,6 +1014,15 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
             counts["exclude_bvid"] += 1
             excluded["bvid"].add(bvid)
             continue
+        raw_season_id = episode.get("raw", {}).get("season_id", 0)
+        try:
+            season_id = int(raw_season_id or 0)
+        except (TypeError, ValueError):
+            season_id = 0
+        if season_id in exclude_season_ids:
+            counts["exclude_season"] += 1
+            excluded["season"].add(bvid)
+            continue
         if exclude_keywords and text_matches(exclude_keywords, episode):
             counts["exclude_keyword"] += 1
             excluded["keyword"].add(bvid)
@@ -1026,7 +1038,7 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
         filtered.append(episode)
     counts["kept"] = len(filtered)
     LOGGER.info(
-        "filters series=%s total=%s kept=%s duration_skip=%s paid_confirmed=%s paid_unconfirmed=%s by_bvid=%s by_keyword=%s ad_keyword=%s not_in_include=%s",
+        "filters series=%s total=%s kept=%s duration_skip=%s paid_confirmed=%s paid_unconfirmed=%s by_bvid=%s by_season=%s by_keyword=%s ad_keyword=%s not_in_include=%s",
         config.series,
         counts["total"],
         counts["kept"],
@@ -1034,6 +1046,7 @@ def apply_filters(config: SeriesConfig, episodes: list[dict]) -> tuple[list[dict
         counts["paid_confirmed"],
         counts["paid_unconfirmed"],
         counts["exclude_bvid"],
+        counts["exclude_season"],
         counts["exclude_keyword"],
         counts["advertisement_keyword"],
         counts["not_in_include"],
@@ -1736,6 +1749,7 @@ async def sync_series(
         other_excluded = (
             excluded.get("paid_unconfirmed", set())
             | excluded.get("bvid", set())
+            | excluded.get("season", set())
             | excluded.get("keyword", set())
             | excluded.get("ad_keyword", set())
             | excluded.get("not_in_include", set())

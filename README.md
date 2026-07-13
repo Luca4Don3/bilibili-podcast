@@ -183,11 +183,12 @@ bilibili-podcast-admin add \
 | `bilibili-podcast-admin filters-add <series> --ad-keyword "恰饭"` | 追加广告关键词 |
 | `bilibili-podcast-admin filters-add <series> --exclude-bvid BVxxxx` | 追加排除 BVID |
 | `bilibili-podcast-admin filters-add <series> --ad-bvid BVxxxx` | 追加广告 BVID |
+| `bilibili-podcast-admin filters-add <series> --exclude-season-id 123456` | 追加排除合集 ID |
 | `bilibili-podcast-admin filters-add <series> --exclude-paid` | 启用付费内容排除 |
 | `bilibili-podcast-admin filters-remove <series> --exclude-keyword "访谈" [--delete]` | 禁用/删除匹配规则（默认禁用，加 `--delete` 物理删除；别名: `fdel`） |
 | `bilibili-podcast-admin filters-disable <series> --rule-id 123` | 按 ID 禁用规则（别名: `fd`） |
 | `bilibili-podcast-admin filters-enable <series> --rule-id 123` | 按 ID 启用规则（别名: `fe`） |
-| `bilibili-podcast-admin filters-import <series> --type exclude_keyword --file keywords.txt` | 从文件批量导入。`--type` 可选: `exclude_keyword`, `include_keyword`, `ad_keyword`, `exclude_bvid`, `ad_bvid`（别名: `fi`） |
+| `bilibili-podcast-admin filters-import <series> --type exclude_keyword --file keywords.txt` | 从文件批量导入。`--type` 可选: `exclude_keyword`, `include_keyword`, `ad_keyword`, `exclude_bvid`, `ad_bvid`, `exclude_season_id`（别名: `fi`） |
 
 `filters-add` 额外支持子命令级 `--yes`；`filters-remove` 支持 `--delete` 物理删除，否则默认只禁用匹配规则。
 
@@ -239,6 +240,8 @@ bilibili-podcast-admin add \
 |------|------|
 | `bilibili-podcast-admin paid refresh-metadata <series> --json-root /path/to/json` | 刷新 metadata JSON，不下载媒体 |
 | `bilibili-podcast-admin paid refresh-metadata <series> --cookie-file /path/to/cookies.txt` | 使用指定 cookie 刷新 metadata |
+| `bilibili-podcast-admin paid refresh-metadata <series> --bvid BVxxxxxxxxxx` | 仅刷新指定 BVID 的 metadata |
+| `bilibili-podcast-admin paid refresh-metadata <series> --url <bilibili-video-url>` | 仅刷新指定视频 URL 的 metadata |
 | `bilibili-podcast-admin paid list-missing <series> --json-root /path/to/json --media-root /path/to/media` | 列出已有 metadata 但缺少媒体的条目，只读 |
 | `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --media-root /path/to/media` | 关联人工上传的 MP3 文件 |
 | `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --replace` | 覆盖已有媒体文件 |
@@ -463,6 +466,7 @@ BILIBILI_PODCAST_WEB_PASSWORD=<web_password>
 |------|------|--------|------|
 | `exclude_paid` | bool | `true` | 是否排除付费/充电内容 |
 | `exclude_bvids` | list | `[]` | 黑名单 BV 号 |
+| `exclude_season_ids` | list[int] | `[]` | 黑名单合集 ID（season_id） |
 | `exclude_keywords` | list | `[]` | 标题或简介包含任一关键词则排除 |
 | `advertisement_bvids` | list | `[]` | 广告 BV 号黑名单 |
 | `advertisement_keywords` | list | `[]` | 广告关键词，命中则排除 |
@@ -487,9 +491,10 @@ BILIBILI_PODCAST_WEB_PASSWORD=<web_password>
 2. **付费确认** (`exclude_paid`) — 自动检测充电专属、付费合集等付费标记。
 3. **付费未确认** (`require_paid_state_confirmation`) — 缺少付费状态信息的视频暂不保留。
 4. **BV 黑名单** (`exclude_bvids` + `advertisement_bvids`) — 精确 BV 号匹配。
-5. **关键词黑名单** (`exclude_keywords`) — 标题或简介包含任一关键词则排除。
-6. **广告关键词** (`advertisement_keywords`) — 标题或简介包含任一关键词则排除。
-7. **白名单** (`include_keywords`) — 非空时，仅标题或简介匹配至少一个关键词的视频保留。
+5. **合集黑名单** (`exclude_season_ids`) — 精确匹配空间列表 API 返回的 season_id。
+6. **关键词黑名单** (`exclude_keywords`) — 标题或简介包含任一关键词则排除。
+7. **广告关键词** (`advertisement_keywords`) — 标题或简介包含任一关键词则排除。
+8. **白名单** (`include_keywords`) — 非空时，仅标题或简介匹配至少一个关键词的视频保留。
 
 ### 清理机制
 

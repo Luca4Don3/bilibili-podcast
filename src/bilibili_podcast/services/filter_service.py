@@ -12,6 +12,8 @@ def list_filter_entries(filters: dict) -> list[tuple[str, str]]:
         entries.append(("exclude_bvid", bvid))
     for bvid in filters.get("advertisement_bvids", []):
         entries.append(("advertisement_bvid", bvid))
+    for season_id in filters.get("exclude_season_ids", []):
+        entries.append(("exclude_season_id", str(season_id)))
     for kw in filters.get("exclude_keywords", []):
         entries.append(("exclude_keyword", kw))
     for kw in filters.get("advertisement_keywords", []):
@@ -31,6 +33,7 @@ def build_filters_from_rows(rows) -> dict[str, Any]:
         "exclude_paid": True,
         "exclude_bvids": [],
         "advertisement_bvids": [],
+        "exclude_season_ids": [],
         "exclude_keywords": [],
         "advertisement_keywords": [],
         "include_keywords": [],
@@ -44,6 +47,8 @@ def build_filters_from_rows(rows) -> dict[str, Any]:
             filters["exclude_bvids"].append(val)
         elif rt == "advertisement_bvid":
             filters["advertisement_bvids"].append(val)
+        elif rt == "exclude_season_id":
+            filters["exclude_season_ids"].append(int(val))
         elif rt == "exclude_keyword":
             filters["exclude_keywords"].append(val)
         elif rt == "advertisement_keyword":

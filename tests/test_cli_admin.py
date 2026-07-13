@@ -231,6 +231,7 @@ def test_add_noninteractive_writes_all_tables(tmp_path: Path) -> None:
             "--keep-last", "7",
             "--exclude-keyword", "访谈",
             "--include-keyword", "科技",
+            "--exclude-season-id", "5492168",
             "--cron", "0 */6 * * *",
             "--yes",
         ])
@@ -541,6 +542,7 @@ def test_filters_add_yes_writes_to_db(tmp_path: Path) -> None:
             "filters-add", "filtertest",
             "--exclude-keyword", "广告",
             "--include-keyword", "科技",
+            "--exclude-season-id", "5492168",
             "--yes",
         ])
         ns.yes = False
@@ -557,6 +559,7 @@ def test_filters_add_yes_writes_to_db(tmp_path: Path) -> None:
     assert rule_map["exclude_keyword"] == "广告"
     assert "include_keyword" in rule_map
     assert rule_map["include_keyword"] == "科技"
+    assert rule_map["exclude_season_id"] == "5492168"
 
 
 # ── cmd_sync tests ────────────────────────────────────────────────────
@@ -1498,6 +1501,51 @@ def test_paid_refresh_metadata_writes_192K_json(tmp_path: Path, monkeypatch) -> 
         json_file = tmp_path / "json" / "ref192" / f"{bvid}_192K.info.json"
         assert json_file.exists(), f"expected {json_file}"
         assert not (tmp_path / "json" / "ref192" / f"{bvid}_64K.info.json").exists()
+
+
+@pytest.mark.parametrize("target_flag", ["--bvid", "--url"])
+def test_paid_refresh_metadata_single_item(tmp_path: Path, monkeypatch, target_flag: str) -> None:
+    from bilibili_podcast import cli_admin as ca
+    from bilibili_podcast import db as _db
+
+    monkeypatch.delenv("BILIBILI_PODCAST_COOKIE_FILE", raising=False)
+    db_path = _migrate(tmp_path)
+    with _db.transaction(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('singlemeta','Single','T')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('singlemeta','space',1)")
+        conn.execute("INSERT INTO sync_policy(series,quality) VALUES('singlemeta','192K')")
+
+    bvid = "BV1234567890"
+    target = bvid if target_flag == "--bvid" else f"https://www.bilibili.com/video/{bvid}/"
+    metadata = {
+        "id": bvid,
+        "title": "Single metadata",
+        "duration": 120.6,
+        "webpage_url": f"https://www.bilibili.com/video/{bvid}/",
+    }
+    with patch.object(ca, "_fetch_single_video_metadata", return_value=metadata) as fetch:
+        ns = ca.build_parser().parse_args([
+            "--config-db", db_path, "paid", "refresh-metadata", "singlemeta",
+            target_flag, target, "--json-root", str(tmp_path / "json"),
+        ])
+        ca.cmd_paid_refresh_metadata(ns)
+
+    output = tmp_path / "json" / "singlemeta" / f"{bvid}_192K.info.json"
+    saved = json.loads(output.read_text())
+    assert saved["bvid"] == bvid
+    assert saved["duration"] == 121
+    fetch.assert_called_once()
+
+
+def test_paid_refresh_metadata_rejects_bvid_and_url_together() -> None:
+    parser = cli_admin.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "paid", "refresh-metadata", "singlemeta",
+            "--bvid", "BV1234567890",
+            "--url", "https://www.bilibili.com/video/BV1234567890/",
+        ])
 
 
 # ── 6.6: manual media path whitelist config tests ────────────────────
