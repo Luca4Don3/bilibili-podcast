@@ -1,4 +1,5 @@
 import logging
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,7 @@ from bilibili_podcast.sync import (
     EXIT_SYNC_ERROR,
     LOGGER,
     build_parser,
+    cleanup_old_log_backups,
     sanitize_external_output,
     setup_logging,
 )
@@ -37,6 +39,31 @@ def test_setup_logging_keeps_legacy_debug_positional(tmp_path) -> None:
     setup_logging(str(tmp_path), True)
 
     assert LOGGER.level == logging.DEBUG
+
+
+def test_cleanup_old_log_backups_only_removes_expired_recognized_files(tmp_path) -> None:
+    now = 2_000_000_000.0
+    expired = tmp_path / "sync.log.1"
+    recent = tmp_path / "sync.error.log.1"
+    active = tmp_path / "playwright.log"
+    unrelated = tmp_path / "other.log.1"
+    for path in (expired, recent, active, unrelated):
+        path.write_text("log")
+    os.utime(expired, (now - 31 * 86400, now - 31 * 86400))
+    os.utime(recent, (now - 29 * 86400, now - 29 * 86400))
+    os.utime(active, (now - 31 * 86400, now - 31 * 86400))
+    os.utime(unrelated, (now - 31 * 86400, now - 31 * 86400))
+    link = tmp_path / "playwright.log.1"
+    link.symlink_to(expired)
+
+    removed = cleanup_old_log_backups(tmp_path, now=now)
+
+    assert removed == 1
+    assert not expired.exists()
+    assert recent.exists()
+    assert active.exists()
+    assert unrelated.exists()
+    assert link.is_symlink()
 
 
 def test_publish_script_argument_accepted() -> None:
