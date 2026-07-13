@@ -1,6 +1,6 @@
 """bilibili-podcast web management UI — FastAPI + Jinja2 + SQLite."""
 
-from .server import app
+from .server import create_app
 
 
 class _ResolverProxy:
@@ -19,4 +19,4 @@ class _ResolverProxy:
 
 resolver = _ResolverProxy()
 
-__all__ = ["app", "resolver"]
+__all__ = ["create_app", "resolver"]

@@ -1,0 +1,5 @@
+[publish]
+enabled = false
+media_base_url = "https://media.example.invalid"
+script = ""
+master_placeholder = "__MEDIA_PLACEHOLDER__"

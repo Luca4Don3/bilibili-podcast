@@ -5,7 +5,7 @@ bilibili-podcast-crontab — Read series configs and generate/manage cron.
 Usage:
   bilibili-podcast-crontab [--config-dir DIR | --config-db DB] [--apply] [--print]
 
-  --config-dir    Config directory (default: configs/series.d)
+  --config-dir    Explicit legacy YAML rollback directory
   --config-db     SQLite database path (replaces --config-dir)
   --apply         Write generated crontab and wrapper scripts
   --print         Print generated crontab entries to stdout (default)
@@ -57,68 +57,35 @@ def systemd_timer_is_enabled(series: str) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "enabled"
 
 
-# Wrapper script template.
-# Shell variables use {{...}} to survive Python .format().
-WRAPPER_TEMPLATE = """#!/bin/sh
+UNIFIED_WRAPPER_TEMPLATE = """#!/bin/sh
 set -eu
-PATH=<server_path>:/usr/local/python3.14/bin:/usr/local/python3.13/bin:/usr/local/bin:/usr/bin:/bin
-PLAYWRIGHT_BROWSERS_PATH=<server_path>
-export PATH PLAYWRIGHT_BROWSERS_PATH
+export BILIBILI_PODCAST_CONFIG_ROOT={CONFIG_ROOT}
 
-MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-1}}
+MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-{MAX_DOWNLOADS}}}
 FORCE=${{FORCE:-0}}
 DEBUG=${{DEBUG:-0}}
-LOG_LEVEL=${{LOG_LEVEL:-INFO}}
-CONFIG_DB="{CONFIG_DB}"
-# Allow override via BILIBILI_PODCAST_CONFIG_DB env var at runtime
-if [ -z "$CONFIG_DB" ]; then
-  CONFIG_DB="${{BILIBILI_PODCAST_CONFIG_DB:-}}"
-fi
-FORCE_ARGS=""
-CONFIG_SRC_ARGS=""
+LOG_LEVEL=${{LOG_LEVEL:-}}
+
+EXTRA_ARGS=""
 if [ "$FORCE" = "1" ]; then
-  FORCE_ARGS="--force"
+  EXTRA_ARGS="$EXTRA_ARGS --force"
 fi
-if [ -n "$CONFIG_DB" ]; then
-  CONFIG_SRC_ARGS="--config-db $CONFIG_DB"
-else
-  CONFIG_SRC_ARGS="--config-dir {CONFIG_DIR}"
-fi
-
-LOG_LEVEL_VAL=$LOG_LEVEL
 if [ "$DEBUG" = "1" ]; then
-  LOG_LEVEL_VAL="DEBUG"
+  EXTRA_ARGS="$EXTRA_ARGS --debug"
+elif [ -n "$LOG_LEVEL" ]; then
+  echo "warning: LOG_LEVEL is deprecated; use sync.toml, or a CLI override" >&2
+  EXTRA_ARGS="$EXTRA_ARGS --log-level $LOG_LEVEL"
 fi
-LOG_LEVEL_ARGS="--log-level $LOG_LEVEL_VAL"
+if [ "$MAX_DOWNLOADS_PER_RUN" != "{MAX_DOWNLOADS}" ]; then
+  echo "warning: MAX_DOWNLOADS_PER_RUN is deprecated; applying it as a one-run CLI override" >&2
+fi
 
-{BILIBILI_PODCAST_SYNC_PATH} \\
-  $CONFIG_SRC_ARGS \\
-  --series {SERIES} \\
-  --cookie-file {COOKIE_FILE} \\
-  --token "__MEDIA_PLACEHOLDER__" \\
-  --media-root {MEDIA_ROOT} \\
-  --json-root {JSON_ROOT} \\
-  --rss-root {RSS_ROOT} \\
-  --state-root {STATE_ROOT} \\
-  --lock-file {LOCK_FILE} \\
-  --log-dir {LOG_DIR} \\
-  --media-base-url {MEDIA_BASE_URL} \\
-  --browser-user-data-root {BROWSER_USER_DATA_ROOT} \\
-  --max-downloads-per-run "$MAX_DOWNLOADS_PER_RUN" \\
-  --min-free-gb {MIN_FREE_GB} \\
-  --apply \\
-  $LOG_LEVEL_ARGS \\
-  $FORCE_ARGS
-
-# 分发各用户 RSS 到 /var/lib/bilibili-podcast/published-rss/{{token}}/
-{RSS_PUBLISH_SCRIPT}
-
-# Optional legacy RSS sync target for dual-server compatibility.
-RSYNC_PASSWORD=$(cat {RSYNC_SECRET})
-export RSYNC_PASSWORD
-rsync -qt --port={RSYNC_PORT} --contimeout=10 \\
-  {RSYNC_RSS_SRC} \\
-  {RSYNC_USER}@{RSYNC_HOST}::rss/
+exec {BILIBILI_PODCAST_SYNC_PATH} \
+  --series {SERIES} \
+  --token "__MEDIA_PLACEHOLDER__" \
+  --max-downloads-per-run "$MAX_DOWNLOADS_PER_RUN" \
+  --apply \
+  $EXTRA_ARGS
 """
 
 
@@ -151,11 +118,7 @@ def _load_configs_from_db(db_path: str) -> list[dict]:
     import sqlite3 as _sqlite3
 
     configs = []
-    try:
-        cfgs = _db.load_series_configs(db_path)
-    except Exception as exc:
-        print(f"  error loading from DB: {exc}", file=sys.stderr)
-        return configs
+    cfgs = _db.load_series_configs(db_path)
 
     conn = _sqlite3.connect(db_path)
     conn.row_factory = _sqlite3.Row
@@ -278,23 +241,6 @@ def derive_cron_from_period(hours: int, series_name: str) -> list[str]:
     return schedules
 
 
-# ── Auto-load bilibili-podcast-env.sh if it exists next to this script ──────────
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_ENV_FILE = _SCRIPT_DIR / "bilibili-podcast-env.sh"
-if _ENV_FILE.exists():
-    _RE_EXPORT = re.compile(r'^export\s+(\w+)=(.*)$')
-    for _line in _ENV_FILE.read_text(encoding="utf-8").splitlines():
-        _m = _RE_EXPORT.match(_line.strip())
-        if _m:
-            _key, _val = _m.group(1), _m.group(2).strip()
-            # Strip surrounding quotes
-            if len(_val) >= 2 and _val[0] == _val[-1] and _val[0] in ('"', "'"):
-                _val = _val[1:-1]
-            if _key not in os.environ:  # existing env vars take precedence
-                os.environ[_key] = _val
-# ────────────────────────────────────────────────────────────────────────
-
-
 def generate_wrapper_script(series_name: str, config_dir: str | None, config_db: str | None, script_dir: str, force: bool) -> Path | None:
     """Generate a wrapper script for a series if it doesn't exist."""
     script_path = Path(script_dir) / f"run_{series_name}_sync.sh"
@@ -305,93 +251,23 @@ def generate_wrapper_script(series_name: str, config_dir: str | None, config_db:
     script_dir_path = Path(script_dir)
     script_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Use absolute paths from the environment or sensible defaults
-    bilibili_podcast_sync_path = os.environ.get(
-        "BILIBILI_PODCAST_SYNC_PATH",
-        "<server_path>",
-    )
-    config_dir_abs = str(Path(config_dir).resolve()) if config_dir else ""
-    cookie_file = os.environ.get(
-        "BILIBILI_PODCAST_COOKIE_FILE",
-        "<server_path>",
-    )
-    media_root = os.environ.get("BILIBILI_PODCAST_MEDIA_ROOT", "/var/lib/bilibili-podcast/media")
-    json_root = os.environ.get("BILIBILI_PODCAST_JSON_ROOT", "/var/lib/bilibili-podcast/json")
-    rss_root = os.environ.get("BILIBILI_PODCAST_RSS_ROOT", "/var/lib/bilibili-podcast/rss")
-    state_root = os.environ.get("BILIBILI_PODCAST_STATE_ROOT", "/var/lib/bilibili-podcast/state")
-    lock_file = os.environ.get("BILIBILI_PODCAST_LOCK_FILE", "/var/lib/bilibili-podcast/state/bilibili-podcast.lock")
-    log_dir = os.environ.get("BILIBILI_PODCAST_LOG_DIR", "/var/log/bilibili-podcast")
-    browser_user_data_root = os.environ.get(
-        "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT",
-        "<server_path>",
-    )
-    media_base_url = os.environ.get(
-        "BILIBILI_PODCAST_MEDIA_BASE_URL",
-        "<media_base_url>",
-    )
-    min_free_gb = os.environ.get("BILIBILI_PODCAST_MIN_FREE_GB", "5")
-    rsync_secret = os.environ.get(
-        "BILIBILI_PODCAST_RSYNC_SECRET",
-        "<rsync_secret_file>",
-    )
-    rsync_port = os.environ.get("BILIBILI_PODCAST_RSYNC_PORT", "<rsync_port>")
-    rsync_user = os.environ.get("BILIBILI_PODCAST_RSYNC_USER", "publish")
-    rsync_host = os.environ.get("BILIBILI_PODCAST_RSYNC_HOST", "<rsync_host>")
-    rsync_rss_src = os.environ.get(
-        "BILIBILI_PODCAST_RSYNC_RSS_SRC",
-        "/var/lib/bilibili-podcast/published-rss/<user_token>/*.xml",
-    )
-    rss_publish_script = os.environ.get(
-        "BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT",
-        "<server_path>",
-    )
+    config_root = os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT")
+    if config_root:
+        from bilibili_podcast.config import ConfigManager
 
-    # Guard: reject placeholder values in --config-db mode only.
-    # YAML mode wraps inherit placeholders; server bilibili-podcast-env.sh provides runtime values.
-    if config_db:
-        _placeholder_vars = {
-            "media_base_url": media_base_url,
-            "rsync_secret": rsync_secret,
-            "rsync_port": rsync_port,
-            "rsync_host": rsync_host,
-        }
-        for _name, _val in _placeholder_vars.items():
-            if "<" in str(_val) or ">" in str(_val):
-                print(
-                    f"  ERROR: {_name} contains placeholder {_val!r}. "
-                    f"Set BILIBILI_PODCAST_{_name.upper()} env var or create bilibili-podcast-env.sh.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
+        snapshot = ConfigManager(config_root).load()
+        content = UNIFIED_WRAPPER_TEMPLATE.format(
+            CONFIG_ROOT=shlex.quote(str(snapshot.root)),
+            MAX_DOWNLOADS=shlex.quote(str(snapshot.sync.downloads.scheduled_max_per_run)),
+            BILIBILI_PODCAST_SYNC_PATH=shlex.quote(str(snapshot.app.executables.sync)),
+            SERIES=shlex.quote(series_name),
+        )
+        script_path.write_text(content, encoding="utf-8")
+        script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        print(f"  generated: {script_path}", file=sys.stderr)
+        return script_path
 
-    content = WRAPPER_TEMPLATE.format(
-        BILIBILI_PODCAST_SYNC_PATH=shlex.quote(bilibili_podcast_sync_path),
-        CONFIG_DB=shlex.quote(config_db or ""),
-        CONFIG_DIR=shlex.quote(config_dir_abs),
-        SERIES=shlex.quote(series_name),
-        COOKIE_FILE=shlex.quote(cookie_file),
-        MEDIA_ROOT=shlex.quote(media_root),
-        JSON_ROOT=shlex.quote(json_root),
-        RSS_ROOT=shlex.quote(rss_root),
-        STATE_ROOT=shlex.quote(state_root),
-        LOCK_FILE=shlex.quote(lock_file),
-        LOG_DIR=shlex.quote(log_dir),
-        BROWSER_USER_DATA_ROOT=shlex.quote(browser_user_data_root),
-        MEDIA_BASE_URL=shlex.quote(media_base_url),
-        MIN_FREE_GB=shlex.quote(min_free_gb),
-        RSYNC_SECRET=shlex.quote(rsync_secret),
-        RSYNC_PORT=shlex.quote(rsync_port),
-        RSYNC_USER=shlex.quote(rsync_user),
-        RSYNC_HOST=shlex.quote(rsync_host),
-        RSYNC_RSS_SRC=rsync_rss_src,  # no shlex.quote — wildcard needs shell expansion
-        RSS_PUBLISH_SCRIPT=shlex.quote(rss_publish_script),
-    )
-
-    script_path.write_text(content, encoding="utf-8")
-    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-    print(f"  generated: {script_path}", file=sys.stderr)
-    return script_path
+    raise RuntimeError("BILIBILI_PODCAST_CONFIG_ROOT is required to generate wrapper scripts")
 
 
 def generate_crontab(configs: list[dict], config_dir: str | None, config_db: str | None, script_dir: str) -> str:
@@ -489,7 +365,7 @@ def write_crontab(content: str, user: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Generate bilibili-podcast crontab from series configs")
-    parser.add_argument("--config-dir", default="configs/series.d", help="Config directory (YAML mode)")
+    parser.add_argument("--config-dir", help="Explicit legacy YAML rollback directory")
     parser.add_argument("--config-db", default=None, help="SQLite database path (replaces --config-dir)")
     parser.add_argument("--apply", action="store_true", help="Write crontab and wrapper scripts")
     parser.add_argument("--print", action="store_true", help="Print generated crontab (default)")
@@ -498,6 +374,16 @@ def main():
     parser.add_argument("--force", action="store_true", help="Overwrite existing wrapper scripts")
     args = parser.parse_args()
 
+    if os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT") and not args.config_db and not args.config_dir:
+        from bilibili_podcast.config import ConfigManager
+
+        snapshot = ConfigManager().load()
+        args.config_db = str(snapshot.app.database.path)
+        args.script_dir = str(snapshot.scheduler.paths.wrapper_dir)
+        args.cron_user = snapshot.scheduler.runtime.user
+    elif not args.config_db and not args.config_dir:
+        parser.error("--config-db or explicit --config-dir is required")
+
     # Default: print if neither --apply nor --print
     do_print = args.print or not args.apply
     do_apply = args.apply
@@ -505,26 +391,34 @@ def main():
     config_dir = Path(args.config_dir) if args.config_dir else None
 
     source_label = args.config_db or str(config_dir)
-    configs = load_configs(args.config_dir, args.config_db)
+    try:
+        configs = load_configs(args.config_dir, args.config_db)
+    except Exception as exc:
+        print(f"ERROR: cannot load scheduling configuration: {type(exc).__name__}", file=sys.stderr)
+        raise SystemExit(2) from None
     print(f"loaded {len(configs)} configs from {source_label}", file=sys.stderr)
 
     script_dir = Path(args.script_dir)
-    script_dir.mkdir(parents=True, exist_ok=True)
+    if do_apply:
+        script_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate wrapper scripts
+    # Generate wrappers only for apply; read-only plans never write files.
     generated_scripts = 0
-    for config in configs:
-        if not config.get("enabled", True):
-            continue
-        series = config.get("series", "")
-        if not series or not SERIES_SLUG_RE.match(series):
-            continue
-        schedules = parse_cron_schedules(config)
-        if not schedules:
-            continue
-        script_path = generate_wrapper_script(series, args.config_dir, args.config_db, str(script_dir), args.force)
-        if script_path:
-            generated_scripts += 1
+    if do_apply:
+        if not os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT"):
+            parser.error("BILIBILI_PODCAST_CONFIG_ROOT is required with --apply")
+        for config in configs:
+            if not config.get("enabled", True):
+                continue
+            series = config.get("series", "")
+            if not series or not SERIES_SLUG_RE.match(series):
+                continue
+            schedules = parse_cron_schedules(config)
+            if not schedules:
+                continue
+            script_path = generate_wrapper_script(series, args.config_dir, args.config_db, str(script_dir), args.force)
+            if script_path:
+                generated_scripts += 1
 
     print(f"  {generated_scripts} wrapper scripts ready in {script_dir}", file=sys.stderr)
 

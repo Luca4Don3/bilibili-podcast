@@ -52,6 +52,10 @@
         <input type="text" name="update_period" value="{{ data.update_period or '12h' }}" placeholder="例: 12h, 1h, 30m">
         <div class="subtitle">两次同步的最小间隔</div>
       </div>
+      <div>
+        <label>调度容差（秒）</label>
+        <input type="number" name="update_period_grace_seconds" value="{{ data.update_period_grace_seconds if data.update_period_grace_seconds is not none else 120 }}" min="0">
+      </div>
     </div>
 
     <h2>下载</h2>
@@ -69,6 +73,13 @@
           <option value="64K" {% if data.quality == '64K' %}selected{% endif %}>64K</option>
           <option value="132K" {% if data.quality == '132K' %}selected{% endif %}>132K</option>
           <option value="192K" {% if data.quality == '192K' %}selected{% endif %}>192K</option>
+        </select>
+      </div>
+      <div>
+        <label>媒体模式</label>
+        <select name="media_mode">
+          <option value="auto" {% if data.media_mode == 'auto' or not data.media_mode %}selected{% endif %}>自动下载</option>
+          <option value="manual" {% if data.media_mode == 'manual' %}selected{% endif %}>手动媒体</option>
         </select>
       </div>
       <div>

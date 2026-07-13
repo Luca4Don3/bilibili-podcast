@@ -1,0 +1,15 @@
+[runtime]
+user = "bilibili-podcast"
+group = "bilibili-podcast"
+
+[paths]
+systemd_dir = "<server_path>/systemd"
+cron_script_dir = "<server_path>/cron"
+wrapper_dir = "<server_path>/wrappers"
+
+[units]
+web = "bilibili-podcast-web.service"
+sync_glob = "bilibili-podcast-sync@*.service"
+
+[timeouts]
+command_seconds = 30

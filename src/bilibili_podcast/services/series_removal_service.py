@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import shutil
+import tomllib
+import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -135,6 +139,10 @@ class SeriesRemovalService:
     def _users_conf_reference_count(self, series: str) -> int:
         if not self.users_conf.exists():
             return 0
+        if self.users_conf.suffix == ".toml":
+            with self.users_conf.open("rb") as handle:
+                users = (tomllib.load(handle).get("users") or {}).values()
+            return sum(1 for user in users if series in user.get("series", []))
         count = 0
         for raw in self.users_conf.read_text(encoding="utf-8").splitlines():
             content = raw.split("#", 1)[0].strip()
@@ -148,6 +156,41 @@ class SeriesRemovalService:
 
     def _remove_users_conf_reference(self, series: str) -> None:
         if not self.users_conf.exists():
+            return
+        if self.users_conf.suffix == ".toml":
+            with self.users_conf.open("rb") as handle:
+                users = tomllib.load(handle).get("users") or {}
+            output: list[str] = []
+            changed = False
+            for name, user in users.items():
+                if not isinstance(name, str) or not isinstance(user, dict):
+                    raise ValueError("invalid rss-users.toml user entry")
+                names = [item for item in user.get("series", []) if item != series]
+                changed = changed or len(names) != len(user.get("series", []))
+                if not names:
+                    continue
+                token = user.get("token")
+                if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
+                    raise ValueError("invalid rss-users.toml token")
+                if not all(isinstance(item, str) for item in names):
+                    raise ValueError("invalid rss-users.toml series list")
+                encoded_series = ", ".join(json.dumps(item, ensure_ascii=False) for item in names)
+                output.extend((
+                    f"[users.{json.dumps(name, ensure_ascii=False)}]",
+                    f"token = {json.dumps(token, ensure_ascii=False)}",
+                    f"series = [{encoded_series}]", "",
+                ))
+            if changed:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=self.users_conf.parent,
+                    prefix=f".{self.users_conf.name}.", suffix=".tmp", delete=False,
+                ) as handle:
+                    handle.write("\n".join(output))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    temporary = Path(handle.name)
+                temporary.chmod(self.users_conf.stat().st_mode & 0o777)
+                temporary.replace(self.users_conf)
             return
         output: list[str] = []
         changed = False

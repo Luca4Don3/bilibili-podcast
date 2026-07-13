@@ -3,28 +3,10 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from ..config.schema import SERIES_SYNC_DEFAULTS
 
-SYNC_POLICY_DEFAULTS: dict[str, Any] = {
-    "page_size": 20,
-    "incremental_page_size": 5,
-    "max_pages": 10,
-    "max_requests_per_series": 8,
-    "request_interval_seconds": 2.0,
-    "request_jitter_seconds": 0.5,
-    "rate_limit_cooldown_seconds": 21600,
-    "update_period": "12h",
-    "format": "audio",
-    "quality": "64K",
-    "fetch_strategy": "api_first",
-    "keep_last": 100,
-    "browser_fallback": False,
-    "browser_wait_min_seconds": 4.0,
-    "browser_wait_max_seconds": 8.0,
-    "browser_fallback_cooldown_seconds": 3600,
-    "require_paid_state_confirmation": False,
-    "min_duration_seconds": 0,
-    "max_duration_seconds": 0,
-}
+
+SYNC_POLICY_DEFAULTS: dict[str, Any] = dict(SERIES_SYNC_DEFAULTS)
 
 # Column names (and order) that map to the INSERT/UPDATE for sync_policy.
 SYNC_POLICY_COLUMNS = tuple(SYNC_POLICY_DEFAULTS.keys())

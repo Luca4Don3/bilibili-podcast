@@ -2,11 +2,12 @@
 
 将 B 站 UP 主视频或合集/系列转换为播客 RSS 订阅源，支持音频下载、内容过滤、多用户分发。
 
-配置文件支持 **YAML 文件**和 **SQLite 数据库**两种方式，任选其一。
+应用配置统一存放在 `config/*.toml`，系列配置与同步状态以 SQLite 为唯一写源；YAML 仅用于显式迁移或回滚读取。
 
 ## 目录
 
 - [快速开始](#快速开始)
+- [统一配置](#统一配置)
 - [CLI 参数](#cli-参数)
   - [bilibili-podcast](#bilibili-podcast)
   - [bilibili-podcast-crontab](#bilibili-podcast-crontab)
@@ -42,34 +43,43 @@ pip install -e .
 ### 单次运行
 
 ```bash
-bilibili-podcast \
-  --config-dir configs/series.d \
-  --series demo-series \
-  --cookie-file /path/to/cookies.txt \
-  --token "__MEDIA_PLACEHOLDER__" \
-  --media-root /var/lib/bilibili-podcast/media \
-  --json-root /var/lib/bilibili-podcast/json \
-  --rss-root /var/lib/bilibili-podcast/rss \
-  --state-root /var/lib/bilibili-podcast/state \
-  --media-base-url http://your-server:58743 \
-  --apply
+export BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config
+bilibili-podcast-config validate
+bilibili-podcast --series demo-series --token "__MEDIA_PLACEHOLDER__" --apply
 ```
 
-不带 `--apply` 时为干跑模式，仅获取和过滤数据，不写入任何文件。手动全量同步需要同步成功后分发用户 RSS 时，追加 `--publish-script /path/to/rss-publish.sh`。
+不带 `--apply` 时为干跑模式。路径、凭据和行为默认值来自统一配置；显式 CLI 参数仅覆盖当前一次运行。
 
-### 配置来源选择
+## 统一配置
 
-项目支持两种配置方式：
+仓库只跟踪脱敏模板。复制 `config/*.toml.example` 为同名 `.toml` 后填写实际值，并将敏感文件权限设为 `600` 或服务组只读的 `640`。README 仍位于仓库根目录，配置目录不再放第二份 README。
+
+| 文件 | 职责 |
+|------|------|
+| `app.toml` | SQLite、共享数据目录、安装目录和公共可执行文件 |
+| `sync.toml` | 下载限制、Cookie、浏览器、日志和超时 |
+| `web.toml` | Web 登录、HTTPS、Cookie、session 和监听配置 |
+| `scheduler.toml` | cron/systemd 用户、目录、wrapper、unit 和超时 |
+| `publish.toml` | master/published RSS、media URL 和本机发布脚本 |
+| `manual-media.toml` | 手动媒体白名单和 symlink 策略 |
+| `rss-users.toml` | 用户 token 与系列授权关系 |
+| SQLite | 系列、来源、过滤、同步策略、调度和 `sync_state` |
+
+配置根定位顺序是显式 `ConfigManager(root)`、`BILIBILI_PODCAST_CONFIG_ROOT`、可确认的仓库根 `config/`；找不到时明确失败。除 `BILIBILI_PODCAST_CONFIG_ROOT` 外，旧持久配置环境变量不再生效，检测到时会给出目标字段和迁移命令。
 
 ```bash
-# YAML 模式（默认）
-bilibili-podcast --config-dir configs/series.d ...
-
-# SQLite 模式（单一文件，推荐生产使用）
-bilibili-podcast --config-db /path/to/bilibili-podcast.db ...
+bilibili-podcast-config validate
+bilibili-podcast-config validate --templates
+bilibili-podcast-config show --scope web --format json  # 永远脱敏
+bilibili-podcast-config migrate \
+  --legacy-env <server_path>/legacy.env \
+  --legacy-web-env <server_path>/legacy-web.env \
+  --legacy-series-dir <server_path>/series.d \
+  --legacy-rss-users <server_path>/rss-users.conf \
+  --output-root <server_path>/config             # 默认 dry-run
 ```
 
-SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下方](#sqlite-迁移)。
+`migrate` 只有加 `--apply` 才写入；写入前会 staged 校验，并把被替换的配置和 SQLite 备份到 `config/.backups/`。真实生产值必须由旧配置迁移和人工核对产生，不要把模板占位符当作实际配置。
 
 ---
 
@@ -80,24 +90,24 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--config-db` | (none) | SQLite 数据库路径，替代 `--config-dir` 和 `--state-root` |
-| `--config-dir` | `configs/series.d` | 系列 YAML 配置目录 |
+| `--config-dir` | (none) | 显式启用 legacy YAML 回滚读取；不会自动回退 |
 | `--series` | (all enabled) | 逗号分隔的系列 ID，不指定则处理所有 `enabled: true` 的系列 |
 | `--cookie-file` | (none) | Netscape 格式 cookie 文件，用于 B 站 API 鉴权 |
 | `--token` | (none) | RSS enclosure URL 中的 token 占位符，分发时替换为真实用户 token |
-| `--media-root` | `/var/lib/bilibili-podcast/media` | MP3 媒体文件存储根目录 |
-| `--json-root` | `/var/lib/bilibili-podcast/json` | 剧集元数据 JSON 存储根目录 |
-| `--rss-root` | `/var/lib/bilibili-podcast/rss` | RSS XML 输出目录 |
-| `--media-base-url` | `http://localhost:8080` | RSS enclosure URL 的基础 URL |
-| `--lock-file` | `/tmp/bilibili-podcast.lock` | 进程锁文件路径 |
-| `--state-root` | `/tmp/bilibili-podcast-state` | 系列状态 JSON 目录（YAML 模式使用） |
-| `--max-downloads-per-run` | `20` | 每次运行最大下载数，`-1` 无限制 |
-| `--min-free-gb` | `5.0` | 磁盘最小剩余空间 (GB)，不足时中止下载 |
+| `--media-root` | `app.toml` | MP3 媒体文件存储根目录 |
+| `--json-root` | `app.toml` | 剧集元数据 JSON 存储根目录 |
+| `--rss-root` | `app.toml` | RSS XML 输出目录 |
+| `--media-base-url` | `publish.toml` | RSS enclosure URL 的基础 URL |
+| `--lock-file` | `sync.toml` | 进程锁文件路径 |
+| `--state-root` | `app.toml` | YAML 回滚模式状态目录 |
+| `--max-downloads-per-run` | `sync.toml`（20） | 每次运行最大下载数，`-1` 无限制 |
+| `--min-free-gb` | `sync.toml`（5.0） | 磁盘最小剩余空间 (GB)，不足时中止下载 |
 | `--browser-fallback` | off | 启用 Playwright 浏览器回退（API 失败时用） |
-| `--browser-user-data-root` | `/tmp/bilibili-podcast-browser-profiles` | Playwright 浏览器 profile 目录 |
+| `--browser-user-data-root` | `sync.toml` | Playwright 浏览器 profile 目录 |
 | `--browser-login-check` | off | 启动时用 Playwright 验证 cookie 登录状态 |
-| `--browser-login-wait-seconds` | `5.0` | 登录检查页面等待时间 |
-| `--log-dir` | `/var/log/bilibili-podcast` | 日志输出目录 |
-| `--log-level` | `INFO` | 日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`（大小写不敏感） |
+| `--browser-login-wait-seconds` | `sync.toml`（5.0） | 登录检查页面等待时间 |
+| `--log-dir` | `app.toml` | 日志输出目录 |
+| `--log-level` | `sync.toml`（`INFO`） | 日志级别：`DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`（大小写不敏感） |
 | `--debug` | off | `--log-level DEBUG` 的兼容快捷方式，优先级高于 `--log-level` |
 | `--force` | off | 跳过更新周期和 rate-limit cooldown 门控 |
 | `--apply` | off | 实际写入文件和下载媒体，不带则为干跑 |
@@ -107,7 +117,7 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--config-dir` | `configs/series.d` | 系列 YAML 配置目录 |
+| `--config-dir` | (none) | 显式 legacy YAML 回滚目录 |
 | `--config-db` | (none) | SQLite 数据库路径，替代 `--config-dir` |
 | `--apply` | off | 写入 crontab 和生成 wrapper 脚本 |
 | `--print` | on | 打印生成的 cron 条目（无 `--apply` 时默认） |
@@ -123,7 +133,7 @@ SQLite 模式合并了配置和同步状态，简化管理。迁移工具见[下
 
 | 参数 | 说明 |
 |------|------|
-| `--config-db PATH` | SQLite 数据库路径（也支持 `BILIBILI_PODCAST_CONFIG_DB` 环境变量；生产默认路径见运维手册） |
+| `--config-db PATH` | SQLite 数据库路径，仅覆盖当前命令；默认读取 `app.database.path` |
 | `--yes` | 跳过低风险确认 |
 | `--dry-run` | 只预览，不写 DB、不执行同步 |
 | `--json` | JSON 格式输出，方便脚本消费 |
@@ -167,11 +177,11 @@ bilibili-podcast-admin add \
 
 `add` 支持的非交互参数包括：`--url`、`--series`、`--title`、`--author`、`--description`、`--cover-art`、`--category`、`--lang`、`--exclude-keyword`、`--include-keyword`、`--ad-keyword`、`--exclude-bvid`、`--ad-bvid`、`--keep-last`、`--update-period`、`--quality`、`--fetch-strategy`、`--format`、`--page-size`、`--incremental-page-size`、`--max-pages`、`--max-requests-per-series`、`--request-interval-seconds`、`--request-jitter-seconds`、`--rate-limit-cooldown-seconds`、`--cron`、`--exclude-paid`、`--update-existing`、`--dry-run`、`--yes`。
 
-移除命令默认只预览，必须显式传入 `--apply` 才会执行。执行时会获取与同步进程相同的锁，再逐个系列移除 cron/systemd 调度；调度清理失败时不会继续删除该系列数据。成功后会删除 SQLite 中的系列及关联记录、本地 media/JSON 目录、master RSS、已发布的本地用户 RSS、cron wrapper、浏览器 profile，并从 `rss-publish-users.conf` 的显式系列列表中移除该系列。
+移除命令默认只预览，必须显式传入 `--apply` 才会执行。执行时会获取与同步进程相同的锁，再逐个系列移除 cron/systemd 调度；调度清理失败时不会继续删除该系列数据。成功后会删除 SQLite 中的系列及关联记录、本地 media/JSON 目录、master RSS、已发布的本地用户 RSS、cron wrapper、浏览器 profile，并从 `rss-users.toml` 的显式系列授权中移除该系列。
 
 远端 RSS 节点不在该命令的控制范围内，远端 XML 不会自动删除。
 
-`remove-series` 和 `remove-up` 还支持：`--apply`、`--yes`、`--media-root`、`--json-root`、`--rss-root`、`--published-rss-root`、`--cron-script-dir`、`--browser-user-data-root`、`--lock-file`、`--users-conf`。这些路径参数默认读取对应 `BILIBILI_PODCAST_*` / `RSS_USERS_CONF` 环境变量，未设置时使用生产默认路径。
+`remove-series` 和 `remove-up` 还支持：`--apply`、`--yes`、`--media-root`、`--json-root`、`--rss-root`、`--published-rss-root`、`--cron-script-dir`、`--browser-user-data-root`、`--lock-file`、`--users-conf`。这些参数默认读取统一快照，并可作为单次 CLI 覆盖。
 
 **过滤规则管理：**
 
@@ -284,19 +294,19 @@ bilibili-podcast-admin paid add-item <series> \
 
 ## 配置来源
 
-项目使用 `ConfigStore` 抽象层，统一读写配置和同步状态。
+`ConfigManager(...).load()` 为每个进程生成一次不可变快照。TOML repository 负责应用配置，SQLite repository 负责系列与同步状态；旧 `ConfigStore` 和 `utils.series_config.SeriesConfig` 仅保留兼容 shim。
 
-### YAML 模式（默认）
+### SQLite 模式（默认）
 
-- 配置：`configs/series.d/*.yaml`
-- 状态：`{state_root}/{series}.json`
-- 无需额外设置，开箱即用
+- 系列配置与状态：`app.database.path` 指向的 SQLite
+- Web、Admin、Sync、cron 和 systemd 共用同一路径
+- `--config-db` 仍可作为单次覆盖，不再是持久配置入口
 
-### SQLite 模式
+### YAML 回滚模式
 
-- 配置 + 状态：单一 SQLite 文件（`bilibili-podcast.db`）
-- 8 表 schema，WAL 模式，外键约束
-- 使用 `--config-db` 启用，不指定时自动退回到 YAML 模式
+- 只有显式传 `--config-dir <legacy-series-dir>` 时读取 YAML
+- 不传时绝不扫描旧目录或当前工作目录
+- `config/series.d/_template.yaml` 仅是脱敏格式模板
 
 ### SQLite 迁移
 
@@ -307,8 +317,8 @@ python3 scripts/migrate_yaml_to_sqlite \
   --state-root /path/to/state \
   --db-path /path/to/bilibili-podcast.db
 
-# 2. 切换运行
-bilibili-podcast --config-db /path/to/bilibili-podcast.db ... --apply
+# 2. 显式回滚读取（不会写回 YAML）
+bilibili-podcast --config-dir <server_path>/legacy-series.d ...
 
 # 3. 切换 cron wrapper
 python3 scripts/bilibili-podcast-crontab \
@@ -316,7 +326,7 @@ python3 scripts/bilibili-podcast-crontab \
   --script-dir auto --force --apply
 ```
 
-**回滚**：迁移脚本自动备份 `bilibili-podcast.db.bak.<timestamp>`；wrapper 用 `--config-dir` 重新生成。
+**回滚**：恢复迁移前的 TOML、SQLite、unit 和 wrapper 备份，再显式用 `--config-dir` 读取旧 YAML；不要让生产命令静默回退。
 
 ### 生产部署
 
@@ -329,7 +339,7 @@ python3 scripts/bilibili-podcast-crontab \
 | 拉取最新代码 | `git pull --ff-only` |
 | 依赖安装 | `pip install -c requirements.lock -e .`；GitHub 不可达时自动回退 PyPI 安装 |
 | 模块验证 | 验证 sqlite3/yaml/aiohttp/curl_cffi/feedgen/lxml/bilibili-api/yt-dlp 已就绪 |
-| 运行配置标准化 | 清理旧 systemd unit 中无效的 shell env 引用；Web 密码迁入受限 secrets env 文件 |
+| 运行配置标准化 | 将旧 env/RSS 用户配置迁为 TOML；unit 只保留 config root |
 | DB 迁移 | YAML 配置 + JSON 状态 → SQLite（自动备份） |
 | wrapper/调度准备 | 生成 auto/run_*.sh；可用于 cron 兼容路径，也可供 scheduler/systemd 使用 |
 | 验证 | DB 配置计数 + `exclude_paid` 语义检查 + Web 健康检查；默认不访问 B 站 API |
@@ -342,65 +352,41 @@ python3 scripts/bilibili-podcast-crontab \
 | Git 仓库 | 代码需已 clone 到服务器，remote origin 已配置 |
 | 系统用户 | `bilibili-podcast` 服务用户（`useradd -r -s /sbin/nologin bilibili-podcast`） |
 | Cookie | `www.bilibili.com_cookies.txt`（Netscape 格式，可选，无则降级浏览器模式） |
-| Web 密码 | 预先创建受限 env 文件，内容为 `BILIBILI_PODCAST_WEB_PASSWORD=<web_password>`；真实值不写入 Git |
+| Web 密码 | 写入权限受限的实际 `web.toml`；真实值不写入 Git |
 | 磁盘空间 | media/json/rss/state 所在分区至少 5GB 可用 |
 
 ```bash
 # 干跑预览（不修改任何文件）
-ssh <deploy-host> 'sudo bash -s' < scripts/deploy.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config bash -s' < scripts/deploy.sh
 
 # 实际执行
-ssh <deploy-host> 'sudo bash -s -- --apply' < scripts/deploy.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config bash -s -- --apply' < scripts/deploy.sh
 ```
 
 首次部署先干跑确认步骤，再用 `--apply`。
 
-默认部署验证不会执行真实同步请求。确实需要做 API smoke test 时，显式设置：
-
-```bash
-ssh <deploy-host> 'sudo SMOKE_SYNC=1 bash -s -- --apply' < scripts/deploy.sh
-```
-
-生产部署后的进一步验证应以只读检查为主：确认部署版本、timer 状态、日志 warning/error、RSS 中媒体/图片/JSON URL 均包含 token 或占位符。服务器别名、真实路径、访问控制和日志清理等运维动作请放在不提交 git 的运维手册中维护。
+部署脚本不会执行真实同步请求。生产部署后的进一步验证应以只读检查为主：确认部署版本、timer 状态、日志 warning/error、RSS 中媒体/图片/JSON URL 均包含 token 或占位符。服务器别名、真实路径、访问控制和日志清理等运维动作请放在不提交 git 的运维手册中维护。
 
 #### 运行配置标准化
 
-部署配置遵循以下边界：
-
-- `bilibili-podcast-env.sh` 是 shell 脚本环境文件，可以使用 `export KEY=value`，由 wrapper 和 RSS 发布脚本 `source`。
-- systemd unit 不应把 `bilibili-podcast-env.sh` 当作 `EnvironmentFile`，否则 systemd 会忽略 `export ...` 行并产生 warning。
-- Web 密码不写入 `.service` 文件；应放在受限 env 文件中，例如 `<app_dir>/secrets/bilibili-podcast-web.env`，内容格式为 `BILIBILI_PODCAST_WEB_PASSWORD=<web_password>`。
-- RSS/rsync 目标仍属于后续待清理的 legacy 兼容路径；相关主机、端口、token 必须只放在服务器私有配置里，不提交 Git。
+标准化脚本把旧 env、Web env、系列 YAML 和 RSS 用户文件视为只读迁移输入。它先执行 dry-run/校验；`--apply` 时生成实际 TOML、备份旧配置和 unit，并把 unit 改为只含 `BILIBILI_PODCAST_CONFIG_ROOT`。脚本不会显示密文。
 
 可单独运行标准化脚本：
 
 ```bash
 # 干跑
-ssh <deploy-host> 'sudo bash -s' < scripts/standardize-runtime-config.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s' < scripts/standardize-runtime-config.sh
 
 # 实际修复
-ssh <deploy-host> 'sudo bash -s -- --apply' < scripts/standardize-runtime-config.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --apply' < scripts/standardize-runtime-config.sh
 ```
 
-首次执行前，先在服务器私有 secrets 目录创建 `<app_dir>/secrets/bilibili-podcast-web.env`：
-
-```bash
-sudo install -m 640 -o root -g bilibili-podcast /dev/null <app_dir>/secrets/bilibili-podcast-web.env
-sudoedit <app_dir>/secrets/bilibili-podcast-web.env
-```
-
-文件内容为：
-
-```text
-BILIBILI_PODCAST_WEB_PASSWORD=<web_password>
-```
-
-如果是迁移旧 unit，标准化脚本会从现有 `.service` 中提取旧值并迁入 secrets env 文件。不要把真实密码放进命令行、README、handoff 或 Git。
+生产切换前必须先取得服务器上未跟踪的 `scripts/rss-publish.sh` 做只读审计，并确认其改为读取 `rss-users.toml`。该文件未审计前，不得宣称发布链已经全局覆盖，也不得执行生产切换。
 
 ---
 ## 系列配置文件
 
-每个系列一个 YAML 文件（YAML 模式）或一条数据库记录（SQLite 模式）。以下以 YAML 格式说明所有字段。
+每个系列在 SQLite 中保存一组关联记录。以下 YAML 仅描述迁移/回滚格式；实际写入由 Admin/Web 进入 SQLite。
 
 ### 顶层字段
 
@@ -632,7 +618,7 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 
 ## 日志系统
 
-所有日志输出到 `--log-dir`（默认 `/var/log/bilibili-podcast`）。
+所有日志输出到 `--log-dir`；未显式覆盖时读取 `app.paths.log_dir`。
 
 | 文件 | Logger | 级别 | 内容 |
 |------|--------|------|------|
@@ -663,7 +649,7 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 
 `sync.error.log` 始终只接收 `ERROR` 及以上级别，方便监控；`sync.log` 和 `playwright.log` 按 `--log-level` 控制最低记录级别。
 
-systemd 用户可通过环境变量 `BILIBILI_PODCAST_SYNC_LOG_LEVEL` 控制生成 service 时的日志级别（默认 `INFO`）。当设为 `DEBUG` 时，生成的 unit 使用 `--debug`（兼容旧行为）；其它值使用 `--log-level <LEVEL>`。
+systemd 使用 `sync.logging.level`。生成的 unit 不再嵌入日志、Cookie、路径或发布配置。
 
 cron wrapper 用户可通过环境变量 `LOG_LEVEL`（默认 `INFO`）和 `DEBUG=1` 控制日志级别，`DEBUG=1` 优先级更高。
 
@@ -677,8 +663,8 @@ cron wrapper 用户可通过环境变量 `LOG_LEVEL`（默认 `INFO`）和 `DEBU
 # YAML 模式
 bilibili-podcast-crontab --config-dir configs/series.d --apply
 
-# SQLite 模式（wrapper 自动嵌入 DB 路径）
-bilibili-podcast-crontab --config-db /path/to/bilibili-podcast.db --force --apply
+# SQLite 模式（默认读取 app.database.path）
+bilibili-podcast-crontab --force --apply
 
 # 仅预览
 bilibili-podcast-crontab --config-dir configs/series.d --print
@@ -686,8 +672,8 @@ bilibili-podcast-crontab --config-dir configs/series.d --print
 
 `bilibili-podcast-crontab` 为每个启用了 cron 的系列生成独立的 wrapper 脚本：
 
-- wrapper 脚本嵌入 `--config-db` 路径（DB 模式）或 `--config-dir` 路径（YAML 模式）
-- 运行时支持 `BILIBILI_PODCAST_CONFIG_DB` 环境变量覆盖
+- wrapper 脚本仅嵌入 `BILIBILI_PODCAST_CONFIG_ROOT`、series 和一次性控制参数
+- `--config-dir` 只用于显式 YAML 回滚
 - 支持 `MAX_DOWNLOADS_PER_RUN` / `FORCE` / `DEBUG` 环境变量覆盖
 - 自动合并到 `--cron-user` 用户的 crontab（默认 `bilibili-podcast`）
 - 已有 crontab 中由 `BEGIN BILIBILI_PODCAST AUTO` / `END BILIBILI_PODCAST AUTO` 标记的自动区域会被替换
@@ -731,8 +717,8 @@ systemd 调度的安全约束：
 - cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
-- 如果使用 RSS 多用户分发，service 的同步成功后应触发发布脚本。
-- 生成的 `.service` 不应包含 `EnvironmentFile=<app_dir>/bilibili-podcast-env.sh`；该文件是 shell env 文件，不是 systemd env 文件。
+- 如果使用 RSS 多用户分发，service 的同步成功后按 `publish.toml` 触发发布脚本。
+- 生成的 `.service` 只保留 `Environment=BILIBILI_PODCAST_CONFIG_ROOT=...`，不包含旧 env 文件或敏感值。
 - 验证 timer 时只启动/刷新 `.timer`，不要手动启动 `.service`。
 - 不要把启用和立即运行合并成一步；启用和启动 timer 应分开执行，并确认 timer active 后再移除旧调度。
 
@@ -751,25 +737,22 @@ systemd 调度的安全约束：
 /path/to/published-rss/{token1}/{series}.xml
 /path/to/published-rss/{token2}/{series}.xml
          │
-         ▼  rsync
-RSS 服务节点
          │
-         ▼  RSS 服务
-http://rss-host:58743/rss/<user_token>/{series}.xml
+         ▼  本机 RSS 服务
+https://podcast.example.invalid/rss/<user_token>/{series}.xml
 ```
 
 ### 用户配置文件
 
-`rss-publish-users.conf` 每行格式：
+`config/rss-users.toml` 使用具名用户表：
 
+```toml
+[users.example]
+token = "<user_token>"
+series = ["series1", "series2"]
 ```
-<user_token>:series1,series2,series3
-<user_token>:all
-```
 
-以 `#` 开头的行为注释。用户 token 和系列列表不允许有空格；真实 token 只放在服务器私有配置里，不提交 Git。
-
-如果 RSS 服务 Nginx 还使用 `$rss_perm` 白名单 map，`<user_token>:all` 应对应通配规则（例如匹配该 token 下任意 series），避免每新增系列都手动追加白名单。
+真实 token 只放在权限受限且被 Git 忽略的实际 TOML。`show`、Web `/config`、日志和错误不会回显 token。
 
 ### 路径规范
 
@@ -784,20 +767,17 @@ http://rss-host:58743/rss/<user_token>/{series}.xml
 
 ## 部署架构
 
-典型部署为双服务器结构：
+项目按单服务器部署：同步进程、Web 管理、SQLite、媒体文件、master RSS、用户 RSS 和对外 HTTP 服务位于同一台服务器。`scripts/rss-publish-and-sync.sh` 仅作为历史命令名保留，当前只执行本机 `rss-publish.sh`，不包含跨服务器同步。
 
-| 服务器 | 角色 | 职责 |
-|--------|------|------|
-| 媒体节点 | 下载节点 | yt-dlp 下载 B 站视频，存储 MP3/JSON，Nginx 提供媒体文件 |
-| RSS 节点 | 订阅节点 | 维护 RSS XML 文件，Nginx 提供 RSS 订阅（带 token 访问控制） |
+未来如需向其他服务器分发，应单独设计带身份认证、完整性校验、失败重试和可观测性的发布接口；本项目不保留 rsync 执行链或配置。
 
 ### 数据流
 
 ```
 播客客户端
-  → RSS 节点 (http://rss-host:58743/rss/{token}/{series}.xml)
+  → 本机 RSS 服务 (https://podcast.example.invalid/rss/{token}/{series}.xml)
     → 解析 enclosure URL
-      → 媒体节点 (http://media-host:58743/media/{series}/{bvid}_{quality}.mp3?token=xxx)
+      → 本机媒体服务 (https://media.example.invalid/media/{series}/{bvid}_{quality}.mp3?token=xxx)
 ```
 
 ### 文件所有权
@@ -805,36 +785,15 @@ http://rss-host:58743/rss/<user_token>/{series}.xml
 - media / json / rss / state 目录属主：`bilibili-podcast:bilibili-podcast`
 - 目录权限：`755`
 - 文件权限：`644`
-- Cookie、token 和 Web 密码 env 文件：`600` 或 `640`，属主限制为部署用户/服务用户可读
+- Cookie、token 和 Web 密码所在 TOML：`600` 或服务组只读的 `640`
 
 ---
 
 ## 环境变量
 
-以下环境变量可覆盖 wrapper 脚本中的默认路径：
+唯一的持久配置 bootstrap 是 `BILIBILI_PODCAST_CONFIG_ROOT`。`FORCE`、`DEBUG`、`SMOKE_SYNC` 仍是一次性运行/部署控制；`PATH` 只参与系统命令发现。cron 的 `MAX_DOWNLOADS_PER_RUN`、`LOG_LEVEL` 会转换成显式 CLI 覆盖并输出弃用提示。
 
-| 变量 | 说明 |
-|------|------|
-| `BILIBILI_PODCAST_CONFIG_DB` | SQLite 数据库路径，wrapper 脚本据此选择 `--config-db` 或 `--config-dir` |
-| `BILIBILI_PODCAST_SYNC_PATH` | `bilibili-podcast` 可执行文件路径 |
-| `BILIBILI_PODCAST_COOKIE_FILE` | Netscape cookie 文件路径 |
-| `BILIBILI_PODCAST_MEDIA_ROOT` | 媒体文件存储根目录 |
-| `BILIBILI_PODCAST_JSON_ROOT` | 元数据 JSON 根目录 |
-| `BILIBILI_PODCAST_RSS_ROOT` | RSS XML 输出根目录 |
-| `BILIBILI_PODCAST_STATE_ROOT` | 状态 JSON 根目录 |
-| `BILIBILI_PODCAST_LOCK_FILE` | 进程锁文件路径 |
-| `BILIBILI_PODCAST_LOG_DIR` | 日志输出目录 |
-| `BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT` | Playwright 浏览器 profile 目录 |
-| `BILIBILI_PODCAST_MEDIA_BASE_URL` | RSS enclosure 的 base URL |
-| `BILIBILI_PODCAST_MIN_FREE_GB` | 最小剩余磁盘空间 |
-| `BILIBILI_PODCAST_RSYNC_SECRET` | Rsync 密码文件路径 |
-| `BILIBILI_PODCAST_RSYNC_PORT` | Rsync 端口 |
-| `BILIBILI_PODCAST_RSYNC_USER` | Rsync 用户名 |
-| `BILIBILI_PODCAST_RSYNC_HOST` | Rsync 目标主机 |
-| `BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT` | 多用户 RSS 分发脚本路径 |
-| `BILIBILI_PODCAST_MANUAL_MEDIA_DIRS` | 手动 media attach 允许目录（冒号分隔，如 `/path/a:/path/b`） |
-
-`bilibili-podcast-env.sh` 文件（与脚本同目录）可自动加载上述变量，运行时环境变量优先级更高。
+检测到 `BILIBILI_PODCAST_CONFIG_DB`、`BILIBILI_PODCAST_WEB_PASSWORD`、`BILIBILI_PODCAST_MEDIA_ROOT` 等旧持久变量时，配置加载会以退出码 `2` 失败，并指出新字段和 `bilibili-podcast-config migrate`。已移除的 `BILIBILI_PODCAST_RSYNC_*`/`RSYNC_PASSWORD` 同样会被明确拒绝，迁移器只报告其未迁移，不生成替代配置。不允许通过旧环境静默覆盖 TOML。
 
 ---
 
@@ -854,7 +813,6 @@ pip install -c requirements.lock -e ".[browser]"  # 含 Playwright 浏览器回�
 | 工具 | 用途 | 安装方式 |
 |------|------|----------|
 | `ffmpeg` | 手动媒体转码 | 系统包或显式传 `--ffmpeg-bin` |
-| `rsync` | legacy RSS 同步 | 系统包 |
 | Playwright (Chromium) | 浏览器回退抓取 | `pip install -c requirements.lock -e ".[browser]" && playwright install chromium` |
 
 `yt-dlp` 必须是项目专用的 yt-dlp 版本（与 bilibili-podcast 使用同一 Python 环境的 pip 包），不要依赖系统级 `yt-dlp` 命令。

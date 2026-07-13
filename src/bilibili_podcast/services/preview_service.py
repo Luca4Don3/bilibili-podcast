@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from ..config.models import ConfigSnapshot
 
 
 @dataclass
@@ -32,8 +33,9 @@ def _find_sync_bin() -> str | None:
 class PreviewService:
     """Run dry-run/preview of bilibili-podcast sync."""
 
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str, config: ConfigSnapshot | None = None) -> None:
         self.db_path = db_path
+        self.config = config
 
     def run_dry_run(
         self,
@@ -42,12 +44,12 @@ class PreviewService:
         timeout: int = 120,
         env_overrides: dict[str, str] | None = None,
     ) -> DryRunResult:
-        sync_bin = _find_sync_bin()
+        sync_bin = str(self.config.app.executables.sync) if self.config else _find_sync_bin()
         if not sync_bin:
             return DryRunResult(
                 stdout="", stderr="",
                 returncode=-1, timed_out=False,
-                error="未配置 BILIBILI_PODCAST_SYNC_PATH，无法执行干跑。",
+                error="未配置 app.executables.sync，无法执行干跑。",
             )
 
         cmd = [sync_bin, "--config-db", self.db_path, "--series", series, "--log-level", "DEBUG"]
@@ -85,12 +87,22 @@ class PreviewService:
     def run_preview(self, series: str, **overrides) -> DryRunResult:
         """Convenience for CLI-style preview."""
         args = []
-        cookie_file = overrides.get("cookie_file") or os.environ.get("BILIBILI_PODCAST_COOKIE_FILE", "")
+        cookie_file = overrides.get("cookie_file")
         if cookie_file:
             args.extend(["--cookie-file", cookie_file])
         for key in ("media_root", "json_root", "rss_root", "lock_file",
                      "media_base_url", "browser_user_data_root", "log_dir"):
-            val = overrides.get(key) or os.environ.get(f"BILIBILI_PODCAST_{key.upper()}", "")
+            val = overrides.get(key)
             if val:
                 args.extend([f"--{key.replace('_', '-')}", val])
-        return self.run_dry_run(series, extra_args=args)
+        timeout = self.config.sync.timeouts.preview_seconds if self.config else 120
+        env_overrides = (
+            {
+                "BILIBILI_PODCAST_CONFIG_ROOT": str(self.config.root),
+                "PLAYWRIGHT_BROWSERS_PATH": str(self.config.sync.browser.playwright_browsers_path),
+            }
+            if self.config else None
+        )
+        return self.run_dry_run(
+            series, extra_args=args, timeout=timeout, env_overrides=env_overrides,
+        )

@@ -118,6 +118,33 @@ def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> N
         )
 
 
+def replace_schedules_in_connection(
+    conn: sqlite3.Connection,
+    series: str,
+    schedules: list[str],
+    retry_schedules: list[str] | None = None,
+) -> int:
+    """Validate and replace primary/retry schedules in the caller's transaction."""
+    entries = [(schedule, "primary") for schedule in schedules]
+    entries.extend((schedule, "retry") for schedule in (retry_schedules or []))
+    period_row = conn.execute(
+        "SELECT update_period FROM sync_policy WHERE series=?", (series,),
+    ).fetchone()
+    update_period = period_row[0] if period_row else "12h"
+    validate_schedules([
+        ScheduleEntry(None, series, schedule, True, pos, kind)
+        for pos, (schedule, kind) in enumerate(entries)
+    ], update_period)
+    conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
+    for pos, (schedule, kind) in enumerate(entries):
+        conn.execute(
+            "INSERT INTO cron_schedule (series, enabled, schedule, position, kind) "
+            "VALUES (?, 1, ?, ?, ?)",
+            (series, schedule, pos, kind),
+        )
+    return len(entries)
+
+
 def _find_crontab_script() -> Optional[str]:
     """Locate scripts/bilibili-podcast-crontab relative to this file or via PATH."""
     here = Path(__file__).resolve().parent.parent.parent
@@ -760,28 +787,9 @@ class SchedulerService:
     ) -> int:
         retry_schedules = retry_schedules or []
         with sqlite3.connect(self.db_path) as conn:
-            entries = [(schedule, "primary") for schedule in schedules]
-            entries.extend((schedule, "retry") for schedule in retry_schedules)
-            period_row = conn.execute(
-                "SELECT update_period FROM sync_policy WHERE series=?", (series,),
-            ).fetchone()
-            update_period = period_row[0] if period_row else "12h"
-            validate_schedules(
-                [
-                    ScheduleEntry(None, series, schedule, True, pos, kind)
-                    for pos, (schedule, kind) in enumerate(entries)
-                ],
-                update_period,
-            )
-            conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
-            for pos, (sched, kind) in enumerate(entries):
-                conn.execute(
-                    "INSERT INTO cron_schedule (series, enabled, schedule, position, kind) "
-                    "VALUES (?, 1, ?, ?, ?)",
-                    (series, sched, pos, kind),
-                )
+            count = replace_schedules_in_connection(conn, series, schedules, retry_schedules)
             conn.commit()
-        return len(entries)
+        return count
 
     # ── status ─────────────────────────────────────────────────────────
 

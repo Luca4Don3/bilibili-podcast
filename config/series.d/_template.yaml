@@ -1,0 +1,21 @@
+series: example-series
+enabled: true
+title: Example Series
+description: ""
+author: Example Author
+cover_art: ""
+category: ""
+subcategories: []
+explicit: false
+lang: zh-CN
+source:
+  uid: 123456
+  type: space
+sync:
+  quality: 64K
+  keep_last: 100
+  update_period: 12h
+filters:
+  exclude_paid: true
+paid_preview:
+  enabled: false

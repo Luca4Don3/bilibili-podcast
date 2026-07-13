@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, Request, Form, HTTPException
+from fastapi import APIRouter, FastAPI, Request, Form, HTTPException
 from fastapi.responses import RedirectResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -32,25 +32,25 @@ from ..cli_admin import (
     is_allowed_manual_media_path,
     rebuild_paid_rss,
 )
+from ..config import ConfigManager, ConfigSnapshot
+from .. import cli_admin as _cli_admin
 
 # ── Config ──────────────────────────────────────────────────────────────
-DB_PATH = os.environ.get("BILIBILI_PODCAST_CONFIG_DB")
-PASSWORD = os.environ.get("BILIBILI_PODCAST_WEB_PASSWORD")
-
-if not DB_PATH:
-    raise RuntimeError("BILIBILI_PODCAST_CONFIG_DB environment variable is required")
-if not PASSWORD:
-    raise RuntimeError("BILIBILI_PODCAST_WEB_PASSWORD environment variable is required")
-
-_SECRET_KEY = hashlib.sha256(PASSWORD.encode()).hexdigest()
+DB_PATH = ""
+PASSWORD = ""
+_CONFIG_MANAGER: ConfigManager | None = None
+_CONFIG_SNAPSHOT: ConfigSnapshot | None = None
 _COOKIE_NAME = "bilibili_podcast_session"
 _SESSION_MAX_AGE = 86400  # 24 hours
-_HTTPS = os.environ.get("BILIBILI_PODCAST_HTTPS", "") == "1"
+_HTTPS = False
+_cli_admin._CONFIG = None
+
+_SECRET_KEY = hashlib.sha256(PASSWORD.encode()).hexdigest()
 
 # ── App ─────────────────────────────────────────────────────────────────
 _HERE = Path(__file__).resolve().parent
 _TEMPLATE_DIR = str(_HERE / "templates")
-app = FastAPI(title="bilibili-podcast Manager")
+router = APIRouter()
 templates = Jinja2Templates(directory=_TEMPLATE_DIR)
 
 
@@ -85,6 +85,12 @@ templates.env.filters["url_enc_draft"] = _url_enc_draft
 
 # ── Auth helpers ────────────────────────────────────────────────────────
 _serializer = URLSafeTimedSerializer(_SECRET_KEY)
+
+
+def _runtime_config() -> ConfigSnapshot:
+    if _CONFIG_SNAPSHOT is None:
+        raise RuntimeError("web configuration was not injected")
+    return _CONFIG_SNAPSHOT
 
 
 def csrf_token() -> str:
@@ -153,14 +159,14 @@ async def _fetch_up_face_url(uid: int) -> str | None:
 
 # ── Routes ──────────────────────────────────────────────────────────────
 
-@app.get("/login")
+@router.get("/login")
 async def login_page(request: Request):
     if _get_session(request) is not None:
         return RedirectResponse(url="/series", status_code=302)
     return templates.TemplateResponse(request, "login.html", {})
 
 
-@app.post("/login")
+@router.post("/login")
 async def login_post(request: Request, password: str = Form(...)):
     if password == PASSWORD:
         resp = RedirectResponse(url="/series", status_code=302)
@@ -173,20 +179,41 @@ async def login_post(request: Request, password: str = Form(...)):
     }, status_code=401)
 
 
-@app.get("/logout")
+@router.get("/logout")
 async def logout():
     resp = RedirectResponse(url="/login", status_code=302)
     resp.delete_cookie(_COOKIE_NAME)
     return resp
 
 
-@app.get("/")
+@router.get("/")
 async def root():
     return RedirectResponse(url="/series", status_code=302)
 
 
+@router.get("/config")
+async def config_view(request: Request):
+    redirect = _login_required(request)
+    if redirect:
+        return redirect
+    if _CONFIG_MANAGER is None or _CONFIG_SNAPSHOT is None:
+        raise HTTPException(status_code=503, detail="unified configuration is not loaded")
+    redacted = _CONFIG_MANAGER.redacted(_CONFIG_SNAPSHOT)
+    rows = []
+    for scope, values in redacted.items():
+        stack = [(scope, values)]
+        while stack:
+            prefix, value = stack.pop()
+            if isinstance(value, dict):
+                stack.extend((f"{prefix}.{key}", item) for key, item in reversed(value.items()))
+            else:
+                source = _CONFIG_SNAPSHOT.sources.get(prefix.replace("manual_media", "manual-media").replace("rss_users", "rss-users"))
+                rows.append({"field": prefix, "source": source.name if source else "derived", "value": value})
+    return templates.TemplateResponse(request, "config.html", {"rows": rows})
+
+
 # ── /series — list ─────────────────────────────────────────────────────
-@app.get("/series")
+@router.get("/series")
 async def series_list(request: Request):
     redirect = _login_required(request)
     if redirect:
@@ -211,7 +238,7 @@ async def series_list(request: Request):
 
 
 # ── /series/{series}/toggle ────────────────────────────────────────────
-@app.post("/series/{series}/toggle")
+@router.post("/series/{series}/toggle")
 async def series_toggle(request: Request, series: str,
                         csrf_token: str = Form("")):
     guard = _csrf_guard(request, csrf_token)
@@ -241,7 +268,7 @@ async def series_toggle(request: Request, series: str,
 
 
 # ── /series/new — form ─────────────────────────────────────────────────
-@app.get("/series/new")
+@router.get("/series/new")
 async def series_new_form(request: Request, draft: str = ""):
     redirect = _login_required(request)
     if redirect:
@@ -283,7 +310,7 @@ async def series_new_form(request: Request, draft: str = ""):
     })
 
 
-@app.post("/series/new")
+@router.post("/series/new")
 async def series_new_create(
     request: Request,
     series: str = Form(""),
@@ -389,7 +416,7 @@ async def series_new_create(
 
 
 # ── /resolve — URL parsing ─────────────────────────────────────────────
-@app.get("/resolve")
+@router.get("/resolve")
 async def resolve_page(request: Request):
     redirect = _login_required(request)
     if redirect:
@@ -400,7 +427,7 @@ async def resolve_page(request: Request):
     })
 
 
-@app.post("/resolve")
+@router.post("/resolve")
 async def resolve_url(request: Request, url: str = Form(""),
                       csrf_value: str = Form("", alias="csrf_token")):
     guard = _csrf_guard(request, csrf_value)
@@ -428,7 +455,7 @@ async def resolve_url(request: Request, url: str = Form(""),
 
 
 # ── /series/{series} — detail/edit ─────────────────────────────────────
-@app.get("/series/{series}")
+@router.get("/series/{series}")
 async def series_detail(request: Request, series: str):
     redirect = _login_required(request)
     if redirect:
@@ -456,7 +483,7 @@ async def series_detail(request: Request, series: str):
     })
 
 
-@app.post("/series/{series}")
+@router.post("/series/{series}")
 async def series_update(
     request: Request,
     series: str,
@@ -530,7 +557,7 @@ async def series_update(
 
 
 # ── /series/{series}/sync — sync policy ────────────────────────────────
-@app.get("/series/{series}/sync")
+@router.get("/series/{series}/sync")
 async def sync_policy_page(request: Request, series: str):
     redirect = _login_required(request)
     if redirect:
@@ -554,7 +581,7 @@ async def sync_policy_page(request: Request, series: str):
     })
 
 
-@app.post("/series/{series}/sync")
+@router.post("/series/{series}/sync")
 async def sync_policy_update(
     request: Request,
     series: str,
@@ -567,7 +594,9 @@ async def sync_policy_update(
     request_jitter_seconds: float = Form(0.5),
     rate_limit_cooldown_seconds: int = Form(21600),
     update_period: str = Form("12h"),
+    update_period_grace_seconds: int = Form(120),
     format: str = Form("audio"),
+    media_mode: str = Form("auto"),
     quality: str = Form("64K"),
     keep_last: int = Form(100),
     fetch_strategy: str = Form("api_first"),
@@ -592,7 +621,9 @@ async def sync_policy_update(
                 "request_jitter_seconds": request_jitter_seconds,
                 "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
                 "update_period": update_period,
+                "update_period_grace_seconds": update_period_grace_seconds,
                 "format": format,
+                "media_mode": media_mode,
                 "quality": quality,
                 "keep_last": keep_last,
                 "fetch_strategy": fetch_strategy,
@@ -609,7 +640,7 @@ async def sync_policy_update(
 
 
 # ── /series/{series}/filters ───────────────────────────────────────────
-@app.get("/series/{series}/filters")
+@router.get("/series/{series}/filters")
 async def filters_page(request: Request, series: str):
     redirect = _login_required(request)
     if redirect:
@@ -643,7 +674,7 @@ async def filters_page(request: Request, series: str):
     })
 
 
-@app.post("/series/{series}/filters")
+@router.post("/series/{series}/filters")
 async def filters_update(
     request: Request,
     series: str,
@@ -704,7 +735,7 @@ async def filters_update(
 
 
 # ── Filter rule single operations ────────────────────────────────────
-@app.post("/series/{series}/filters/toggle")
+@router.post("/series/{series}/filters/toggle")
 async def filter_rule_toggle(
     request: Request,
     series: str,
@@ -730,7 +761,7 @@ async def filter_rule_toggle(
     return RedirectResponse(url=f"/series/{series}/filters", status_code=302)
 
 
-@app.post("/series/{series}/filters/delete")
+@router.post("/series/{series}/filters/delete")
 async def filter_rule_delete(
     request: Request,
     series: str,
@@ -749,7 +780,7 @@ async def filter_rule_delete(
 
 
 # ── /series/{series}/cron ──────────────────────────────────────────────
-@app.get("/series/{series}/cron")
+@router.get("/series/{series}/cron")
 async def cron_page(request: Request, series: str):
     redirect = _login_required(request)
     if redirect:
@@ -776,7 +807,7 @@ async def cron_page(request: Request, series: str):
     })
 
 
-@app.post("/series/{series}/cron")
+@router.post("/series/{series}/cron")
 async def cron_update(
     request: Request,
     series: str,
@@ -800,7 +831,7 @@ async def cron_update(
 
 
 # ── /series/{series}/preview — dry-run ─────────────────────────────────
-@app.get("/series/{series}/preview")
+@router.get("/series/{series}/preview")
 async def preview_page(request: Request, series: str):
     redirect = _login_required(request)
     if redirect:
@@ -819,22 +850,23 @@ async def preview_page(request: Request, series: str):
     })
 
 
-@app.post("/series/{series}/preview")
+@router.post("/series/{series}/preview")
 async def preview_run(request: Request, series: str,
                       csrf_value: str = Form("", alias="csrf_token")):
     guard = _csrf_guard(request, csrf_value)
     if guard:
         return guard
 
-    svc = PreviewService(DB_PATH)
-    cookie_file = os.environ.get("BILIBILI_PODCAST_COOKIE_FILE", "")
-    media_root = os.environ.get("BILIBILI_PODCAST_MEDIA_ROOT", "/tmp/bilibili-podcast-media")
-    json_root = os.environ.get("BILIBILI_PODCAST_JSON_ROOT", "/tmp/bilibili-podcast-json")
-    rss_root = os.environ.get("BILIBILI_PODCAST_RSS_ROOT", "/tmp/bilibili-podcast-rss")
-    lock_file = os.environ.get("BILIBILI_PODCAST_LOCK_FILE", "/tmp/bilibili-podcast-preview.lock")
-    media_base_url = os.environ.get("BILIBILI_PODCAST_MEDIA_BASE_URL", "http://localhost:8080")
-    browser_data_root = os.environ.get("BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT", "/tmp/bilibili-podcast-browser")
-    log_dir = os.environ.get("BILIBILI_PODCAST_LOG_DIR", "/tmp/bilibili-podcast-log")
+    config = _runtime_config()
+    svc = PreviewService(DB_PATH, config)
+    cookie_file = str(config.sync.paths.cookie_file)
+    media_root = str(config.app.paths.media_root)
+    json_root = str(config.app.paths.json_root)
+    rss_root = str(config.app.paths.rss_root)
+    lock_file = str(config.sync.paths.lock_file)
+    media_base_url = config.publish.publish.media_base_url
+    browser_data_root = str(config.sync.browser.user_data_root)
+    log_dir = str(config.app.paths.log_dir)
 
     result = svc.run_preview(series,
         cookie_file=cookie_file,
@@ -882,7 +914,7 @@ def _require_web_series(series: str) -> None:
 
 
 # ── /jobs — sync status ────────────────────────────────────────────────
-@app.get("/jobs")
+@router.get("/jobs")
 async def jobs_page(request: Request):
     redirect = _login_required(request)
     if redirect:
@@ -899,7 +931,7 @@ async def jobs_page(request: Request):
         """).fetchall()
 
     # Read last lines of error log
-    log_dir = os.environ.get("BILIBILI_PODCAST_LOG_DIR", "")
+    log_dir = str(_runtime_config().app.paths.log_dir)
     error_log = ""
     if log_dir:
         error_path = Path(log_dir) / "sync.error.log"
@@ -917,7 +949,7 @@ async def jobs_page(request: Request):
 
 
 # ── /series/{series}/manual-media — read-only manual media info ─────
-@app.get("/series/{series}/manual-media")
+@router.get("/series/{series}/manual-media")
 async def manual_media_page(request: Request, series: str,
                             error: str = "", success: str = ""):
     redirect = _login_required(request)
@@ -930,8 +962,9 @@ async def manual_media_page(request: Request, series: str,
         ).fetchone()
     quality = row["quality"] if row and row["quality"] else "64K"
 
-    json_dir = Path(os.environ.get("BILIBILI_PODCAST_JSON_ROOT", "/var/lib/bilibili-podcast/json")) / series
-    media_dir = Path(os.environ.get("BILIBILI_PODCAST_MEDIA_ROOT", "/var/lib/bilibili-podcast/media")) / series
+    config = _runtime_config()
+    json_dir = config.app.paths.json_root / series
+    media_dir = config.app.paths.media_root / series
 
     json_files = list(json_dir.glob("*.info.json")) if json_dir.exists() else []
     total_meta = len(json_files)
@@ -966,7 +999,7 @@ async def manual_media_page(request: Request, series: str,
 
 
 # ── /series/{series}/manual-media — attach form POST ──────────────────
-@app.post("/series/{series}/manual-media")
+@router.post("/series/{series}/manual-media")
 async def manual_media_attach(
     request: Request,
     series: str,
@@ -997,10 +1030,11 @@ async def manual_media_attach(
 
     quality = _get_series_quality(DB_PATH, series)
     dst_name = f"{bvid}_{quality}.mp3"
-    media_root = Path(os.environ.get("BILIBILI_PODCAST_MEDIA_ROOT", "/var/lib/bilibili-podcast/media"))
-    json_root = Path(os.environ.get("BILIBILI_PODCAST_JSON_ROOT", "/var/lib/bilibili-podcast/json"))
-    rss_root = Path(os.environ.get("BILIBILI_PODCAST_RSS_ROOT", "/var/lib/bilibili-podcast/rss"))
-    media_base_url = os.environ.get("BILIBILI_PODCAST_MEDIA_BASE_URL", "http://localhost:58743")
+    config = _runtime_config()
+    media_root = config.app.paths.media_root
+    json_root = config.app.paths.json_root
+    rss_root = config.app.paths.rss_root
+    media_base_url = config.publish.publish.media_base_url
     dst = media_root / series / dst_name
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1022,20 +1056,22 @@ async def manual_media_attach(
     except ValueError as exc:
         return _manual_media_redirect(series, error=f"rss rebuild failed: {exc}")
 
-    publish_script = Path(os.environ.get(
-        "BILIBILI_PODCAST_RSS_PUBLISH",
-        "<server_path>",
-    ))
-    try:
-        subprocess.run([str(publish_script)], check=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
+    publish_script = (
+        _CONFIG_SNAPSHOT.publish.publish.script
+        if _CONFIG_SNAPSHOT and _CONFIG_SNAPSHOT.publish.publish.enabled
+        else None
+    )
+    if publish_script is not None:
+        try:
+            subprocess.run([str(publish_script)], check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
 
     return _manual_media_redirect(series, success="media attached and RSS updated")
 
 
 # ── /scheduler — web scheduler status ───────────────────────────────
-@app.get("/scheduler")
+@router.get("/scheduler")
 async def scheduler_page(request: Request):
     redirect = _login_required(request)
     if redirect:
@@ -1056,3 +1092,40 @@ async def scheduler_page(request: Request):
         "sysd_status": sysd_status,
         "csrf_token": csrf_token(),
     })
+
+
+def create_app(
+    snapshot: ConfigSnapshot | None = None,
+    *,
+    manager: ConfigManager | None = None,
+) -> FastAPI:
+    """Configure and return the ASGI app from one immutable snapshot."""
+    global DB_PATH, PASSWORD, _COOKIE_NAME, _SESSION_MAX_AGE, _HTTPS
+    global _SECRET_KEY, _serializer, _CONFIG_MANAGER, _CONFIG_SNAPSHOT
+
+    if snapshot is not None:
+        selected_manager = manager or ConfigManager(snapshot.root, environ={})
+        selected = snapshot
+    else:
+        selected_manager = manager or ConfigManager()
+        selected = selected_manager.load()
+    if not selected.web.server.enabled:
+        raise RuntimeError("web.server.enabled is false")
+    if not selected.web.security.password:
+        raise RuntimeError("web.security.password is required")
+    DB_PATH = str(selected.app.database.path)
+    PASSWORD = selected.web.security.password
+    _COOKIE_NAME = selected.web.security.cookie_name
+    _SESSION_MAX_AGE = selected.web.security.session_max_age_seconds
+    _HTTPS = selected.web.security.https
+    _SECRET_KEY = hashlib.sha256(PASSWORD.encode()).hexdigest()
+    _serializer = URLSafeTimedSerializer(_SECRET_KEY)
+    _CONFIG_MANAGER = selected_manager
+    _CONFIG_SNAPSHOT = selected
+    _cli_admin._CONFIG = selected
+    from ..services import systemd_scheduler
+    systemd_scheduler.configure(selected)
+    configured_app = FastAPI(title="bilibili-podcast Manager")
+    configured_app.include_router(router)
+    configured_app.state.config = selected
+    return configured_app

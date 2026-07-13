@@ -1,7 +1,0 @@
-# rss-publish-users.conf — RSS 用户配置
-# 格式：TOKEN:SERIES1,SERIES2,...
-#       TOKEN:all 表示所有系列
-#
-# 示例：
-# <user_token>:all
-# <user_token>:demo-series,paid-sample
