@@ -288,6 +288,41 @@ class TestUpsertCron:
         assert len(rows) == 1
         assert rows[0]["schedule"] == "30 18 * * *"
 
+    def test_upsert_cron_preserves_retry_schedules(self, db_path: Path):
+        with db.transaction(str(db_path)) as conn:
+            conn.execute(
+                "INSERT INTO series (series, title, author) VALUES ('cron-retry', 'Cron', 'Author')"
+            )
+            conn.execute(
+                "INSERT INTO cron_schedule(series,schedule,kind) VALUES('cron-retry','0 11 * * *','retry')"
+            )
+            db.upsert_cron(conn, "cron-retry", ["0 9 * * *"])
+        with sqlite3.connect(str(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT schedule, kind FROM cron_schedule WHERE series='cron-retry' ORDER BY kind"
+            ).fetchall()
+        assert rows == [("0 9 * * *", "primary"), ("0 11 * * *", "retry")]
+
+
+def test_sync_policy_update_rejects_new_schedule_conflict(db_path: Path):
+    from bilibili_podcast.services.sync_policy_service import SyncPolicyService
+
+    with db.transaction(str(db_path)) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('policy','P','A')")
+        conn.execute("INSERT INTO sync_policy(series,update_period) VALUES('policy','12h')")
+        conn.execute("INSERT INTO cron_schedule(series,schedule,position) VALUES('policy','0 0 * * *',0)")
+        conn.execute("INSERT INTO cron_schedule(series,schedule,position) VALUES('policy','0 12 * * *',1)")
+
+    with pytest.raises(ValueError, match="less than update_period"):
+        with db.transaction(str(db_path)) as conn:
+            SyncPolicyService(conn).update_fields("policy", {"update_period": "24h"})
+
+    with sqlite3.connect(str(db_path)) as conn:
+        value = conn.execute(
+            "SELECT update_period FROM sync_policy WHERE series='policy'"
+        ).fetchone()[0]
+    assert value == "12h"
+
 
 # ── READ: load_series_configs ───────────────────────────────────────
 

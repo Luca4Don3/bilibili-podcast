@@ -27,6 +27,8 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p class="text-muted">每行一个标准 5 段 cron 表达式。空表时不生成 cron 任务。</p>
     <textarea name="schedules" rows="6" placeholder="15 11 * * *&#10;15 13 * * *">{% if schedules %}{{ schedules | join('\n') }}{% endif %}</textarea>
+    <p class="text-muted">兜底时间仅在最近一次主调度失败后执行；成功后不会请求。</p>
+    <textarea name="retry_schedules" rows="4" placeholder="15 13 * * *">{% if retry_schedules %}{{ retry_schedules | join('\n') }}{% endif %}</textarea>
     <div class="subtitle">保存仅写数据库，不安装到系统调度。</div>
 
     <div class="actions" style="margin-top:1rem;">

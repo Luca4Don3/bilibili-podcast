@@ -71,8 +71,7 @@ User=bilibili-podcast
 Group=bilibili-podcast
 WorkingDirectory={app_dir}
 Environment=PLAYWRIGHT_BROWSERS_PATH={pw_browsers}
-ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply{log_level_args}
-ExecStartPost={rss_publish}
+ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply --publish-script {rss_publish}{retry_args}{log_level_args}
 Restart=no
 TimeoutStartSec=1800
 """
@@ -149,7 +148,7 @@ def _log_level_args() -> str:
     return " --log-level INFO"
 
 
-def generate_service(series: str) -> str:
+def generate_service(series: str, *, scheduled_retry: bool = False) -> str:
     """Return the service unit content for *series*."""
     return SERVICE_TEMPLATE.format(
         series=series,
@@ -167,6 +166,7 @@ def generate_service(series: str) -> str:
         media_base_url=MEDIA_BASE_URL,
         browser_data_root=BROWSER_DATA_ROOT,
         rss_publish=_RSS_PUBLISH,
+        retry_args=" --scheduled-retry" if scheduled_retry else "",
         log_level_args=_log_level_args(),
     )
 
@@ -179,9 +179,10 @@ def generate_timer(series: str, oncalendars: list[str]) -> str:
     return TIMER_TEMPLATE.format(series=series, oncalendar_lines=lines)
 
 
-def unit_name(series: str, suffix: str = "service") -> str:
+def unit_name(series: str, suffix: str = "service", *, scheduled_retry: bool = False) -> str:
     """Return the systemd unit file name, e.g. ``bilibili-podcast-sync@myseries.service``."""
-    return f"bilibili-podcast-sync@{series}.{suffix}"
+    prefix = "bilibili-podcast-retry" if scheduled_retry else "bilibili-podcast-sync"
+    return f"{prefix}@{series}.{suffix}"
 
 
 # ── systemd interaction helpers ───────────────────────────────────────
@@ -223,14 +224,14 @@ def daemon_reload() -> SchedulerCommandResult:
     )
 
 
-def enable_timer(series: str) -> SchedulerCommandResult:
+def enable_timer(series: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Enable (but not start) the timer for *series*.
 
     Using ``enable --now`` with ``Persistent=true`` would cause an
     immediate catch-up sync, triggering real B站 API calls.  We
     deliberately only ``enable`` without ``--now``.
     """
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     result = _systemctl("enable", u)
     return SchedulerCommandResult(
         backend="systemd",
@@ -242,7 +243,7 @@ def enable_timer(series: str) -> SchedulerCommandResult:
     )
 
 
-def start_timer(series: str) -> SchedulerCommandResult:
+def start_timer(series: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Start the timer (arm it in the current boot cycle) without
     triggering the service.
 
@@ -251,7 +252,7 @@ def start_timer(series: str) -> SchedulerCommandResult:
     OnCalendar event fires.  With ``Persistent=false``, no catch-up
     sync occurs either.
     """
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     result = _systemctl("start", u)
     return SchedulerCommandResult(
         backend="systemd",
@@ -263,9 +264,9 @@ def start_timer(series: str) -> SchedulerCommandResult:
     )
 
 
-def restart_timer(series: str) -> SchedulerCommandResult:
+def restart_timer(series: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Restart the timer so updated unit contents take effect."""
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     result = _systemctl("restart", u)
     return SchedulerCommandResult(
         backend="systemd",
@@ -277,9 +278,9 @@ def restart_timer(series: str) -> SchedulerCommandResult:
     )
 
 
-def disable_timer(series: str) -> SchedulerCommandResult:
+def disable_timer(series: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Disable and stop the timer for *series*."""
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     result = _systemctl("disable", "--now", u)
     return SchedulerCommandResult(
         backend="systemd",
@@ -291,9 +292,9 @@ def disable_timer(series: str) -> SchedulerCommandResult:
     )
 
 
-def write_unit(series: str, suffix: str, content: str) -> SchedulerCommandResult:
+def write_unit(series: str, suffix: str, content: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Write a unit file, using an atomic local replace and sudo fallback."""
-    path = SYSTEMD_DIR / unit_name(series, suffix)
+    path = SYSTEMD_DIR / unit_name(series, suffix, scheduled_retry=scheduled_retry)
     tmp_path: Path | None = None
     sudo_tmp_path: Path | None = None
     try:
@@ -360,9 +361,9 @@ def write_unit(series: str, suffix: str, content: str) -> SchedulerCommandResult
                 pass
 
 
-def remove_unit(series: str, suffix: str) -> SchedulerCommandResult:
+def remove_unit(series: str, suffix: str, *, scheduled_retry: bool = False) -> SchedulerCommandResult:
     """Remove a generated unit file, using sudo when direct unlink is denied."""
-    path = SYSTEMD_DIR / unit_name(series, suffix)
+    path = SYSTEMD_DIR / unit_name(series, suffix, scheduled_retry=scheduled_retry)
     if not path.exists():
         return SchedulerCommandResult(
             backend="systemd",
@@ -411,16 +412,16 @@ def remove_unit(series: str, suffix: str) -> SchedulerCommandResult:
         )
 
 
-def timer_is_enabled(series: str) -> bool:
+def timer_is_enabled(series: str, *, scheduled_retry: bool = False) -> bool:
     """Check if the timer for *series* is enabled (not necessarily active)."""
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     r = _systemctl("is-enabled", u)
     return r.returncode == 0 and r.stdout.strip() == "enabled"
 
 
-def timer_is_active(series: str) -> bool:
+def timer_is_active(series: str, *, scheduled_retry: bool = False) -> bool:
     """Check if the timer for *series* is enabled and active."""
-    u = unit_name(series, "timer")
+    u = unit_name(series, "timer", scheduled_retry=scheduled_retry)
     r = _systemctl("is-enabled", u)
     enabled = r.returncode == 0 and r.stdout.strip() == "enabled"
     r2 = _systemctl("is-active", u)

@@ -32,7 +32,16 @@ def migrate(db_path: str | Path) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
+    _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
+    _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
     conn.close()
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 SCHEMA_SQL = """
@@ -104,7 +113,8 @@ CREATE TABLE IF NOT EXISTS cron_schedule (
     series TEXT NOT NULL REFERENCES series(series) ON DELETE CASCADE,
     enabled INTEGER NOT NULL DEFAULT 1,
     schedule TEXT NOT NULL,
-    position INTEGER NOT NULL DEFAULT 0
+    position INTEGER NOT NULL DEFAULT 0,
+    kind TEXT NOT NULL DEFAULT 'primary' CHECK(kind IN ('primary','retry'))
 );
 
 {scheduler_backend_sql};
@@ -120,7 +130,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_attempt_at INTEGER NOT NULL DEFAULT 0,
     last_success_at INTEGER NOT NULL DEFAULT 0,
     last_browser_fallback_at INTEGER NOT NULL DEFAULT 0,
-    rate_limited_until INTEGER NOT NULL DEFAULT 0
+    rate_limited_until INTEGER NOT NULL DEFAULT 0,
+    retry_pending INTEGER NOT NULL DEFAULT 0
 );
 """.format(scheduler_backend_sql=SCHEDULER_BACKEND_SQL.strip())
 
@@ -248,7 +259,7 @@ def upsert_paid_preview(conn, config: SeriesConfig) -> None:
 
 
 def upsert_cron(conn, series: str, schedules: list[str]) -> None:
-    conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
+    conn.execute("DELETE FROM cron_schedule WHERE series=? AND kind='primary'", (series,))
     for pos, sched in enumerate(schedules):
         conn.execute(
             "INSERT INTO cron_schedule (series, enabled, schedule, position) VALUES (?, 1, ?, ?)",
@@ -279,18 +290,21 @@ def set_scheduler_backend(conn, series: str, backend: str) -> None:
 def upsert_sync_state(conn, series: str, state: dict) -> None:
     conn.execute(
         """INSERT INTO sync_state (series, last_attempt_at, last_success_at,
-                                   last_browser_fallback_at, rate_limited_until)
-           VALUES (?, ?, ?, ?, ?)
+                                   last_browser_fallback_at, rate_limited_until,
+                                   retry_pending)
+           VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(series) DO UPDATE SET
                last_attempt_at=excluded.last_attempt_at,
                last_success_at=excluded.last_success_at,
                last_browser_fallback_at=excluded.last_browser_fallback_at,
-               rate_limited_until=excluded.rate_limited_until""",
+               rate_limited_until=excluded.rate_limited_until,
+               retry_pending=excluded.retry_pending""",
         (series,
          int(state.get("last_attempt_at", 0)),
          int(state.get("last_success_at", 0)),
          int(state.get("last_browser_fallback_at", 0)),
-         int(state.get("rate_limited_until", 0))),
+         int(state.get("rate_limited_until", 0)),
+         int(bool(state.get("retry_pending", False)))),
     )
 
 
@@ -434,6 +448,7 @@ def read_state_file(db_path: str | Path, series: str) -> dict:
         "last_success_at": _row_value(row, "last_success_at", 0),
         "last_browser_fallback_at": _row_value(row, "last_browser_fallback_at", 0),
         "rate_limited_until": _row_value(row, "rate_limited_until", 0),
+        "retry_pending": bool(_row_value(row, "retry_pending", 0)),
     }
 
 

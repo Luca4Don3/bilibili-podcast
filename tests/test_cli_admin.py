@@ -176,11 +176,16 @@ def test_config_service_cron_schedules_only_enabled(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO cron_schedule(series,enabled,schedule,position) VALUES('croncfg',1,'15 3 * * *',1)"
         )
+        conn.execute(
+            "INSERT INTO cron_schedule(series,enabled,schedule,position,kind) VALUES('croncfg',1,'15 5 * * *',2,'retry')"
+        )
 
     with db.transaction(db_path) as conn:
         svc = ConfigService(conn)
         assert svc.load_cron_schedules("croncfg") == ["15 3 * * *"]
-        assert svc.load_full_config("croncfg")["cron"] == ["15 3 * * *"]
+        full = svc.load_full_config("croncfg")
+        assert full["cron"] == ["15 3 * * *"]
+        assert full["retry_cron"] == ["15 5 * * *"]
 
 
 def test_sync_policy_update_fields_normalizes_boolean_values(tmp_path: Path) -> None:
@@ -232,7 +237,7 @@ def test_add_noninteractive_writes_all_tables(tmp_path: Path) -> None:
             "--exclude-keyword", "访谈",
             "--include-keyword", "科技",
             "--exclude-season-id", "5492168",
-            "--cron", "0 */6 * * *",
+            "--cron", "0 */12 * * *",
             "--yes",
         ])
         ns.yes = True
@@ -257,7 +262,7 @@ def test_add_noninteractive_writes_all_tables(tmp_path: Path) -> None:
         "SELECT schedule FROM cron_schedule WHERE series='inttest'"
     ).fetchall()
     assert len(cron) == 1
-    assert cron[0][0] == "0 */6 * * *"
+    assert cron[0][0] == "0 */12 * * *"
     conn.close()
 
 
@@ -502,7 +507,7 @@ def test_cron_set_yes_writes_to_db(tmp_path: Path) -> None:
         ns = p.parse_args([
             "--config-db", db_path,
             "cron", "set", "crontest",
-            "--schedule", "5 */6 * * *",
+            "--schedule", "5 */12 * * *",
             "--yes",
         ])
         ns.yes = False
@@ -515,7 +520,7 @@ def test_cron_set_yes_writes_to_db(tmp_path: Path) -> None:
     ).fetchall()
     conn.close()
     assert len(cron) == 1
-    assert cron[0][0] == "5 */6 * * *"
+    assert cron[0][0] == "5 */12 * * *"
 
 
 def test_filters_add_yes_writes_to_db(tmp_path: Path) -> None:
@@ -727,6 +732,27 @@ def test_crontab_excludes_disabled_schedule(tmp_path: Path) -> None:
         "enabled schedule should appear in crontab"
     assert "0 6" not in result.stdout, \
         "disabled schedule should NOT appear in crontab"
+
+
+def test_crontab_rejects_retry_schedule(tmp_path: Path) -> None:
+    import sqlite3
+
+    db_path = _migrate(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('retrycron','R','T')")
+        conn.execute("INSERT INTO series_source(series,type,uid) VALUES('retrycron','space',1)")
+        conn.execute("INSERT INTO sync_policy(series) VALUES('retrycron')")
+        conn.execute("INSERT INTO cron_schedule(series,schedule,kind) VALUES('retrycron','0 3 * * *','primary')")
+        conn.execute("INSERT INTO cron_schedule(series,schedule,kind) VALUES('retrycron','0 5 * * *','retry')")
+
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
+    result = subprocess.run(
+        [sys.executable, crontab_script, "--config-db", db_path,
+         "--script-dir", str(tmp_path / "auto"), "--print"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 2
+    assert "does not support retry schedules: retrycron" in result.stderr
 
 
 def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:

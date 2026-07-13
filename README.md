@@ -227,6 +227,7 @@ bilibili-podcast-admin add \
 | `bilibili-podcast-admin scheduler status <series>` | 显示指定系列调度状态 |
 | `bilibili-podcast-admin scheduler status --backend systemd` | 显示 systemd timer 状态（enabled/active） |
 | `bilibili-podcast-admin scheduler set <series> --schedule "15 3 * * *" --yes` | 设置系列调度（仅写 DB，不安装） |
+| `bilibili-podcast-admin scheduler set <series> --schedule "15 11 * * *" --retry-schedule "15 13 * * *" --yes` | 设置主调度和失败后的条件兜底调度 |
 | `bilibili-podcast-admin scheduler disable --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 禁用指定 series 的 systemd timer，并按需要恢复 cron 调度 |
 | `bilibili-podcast-admin scheduler disable --backend systemd --series <series> --delete-units --yes` | 禁用并删除对应 systemd unit 文件 |
 
@@ -724,6 +725,10 @@ bilibili-podcast-admin scheduler status --backend systemd
 
 systemd 调度的安全约束：
 
+- 主调度之间不得重复，且最短间隔不得小于该系列的 `update_period`；兜底调度必须通过 `--retry-schedule` 显式标记。
+- 主调度成功后，兜底 timer 当天触发时只记录 `retry_not_needed`，不会请求 B 站；主调度失败后，兜底可绕过 `update_period` 尝试一次。
+- `rate_limit_cooldown` 的优先级始终高于兜底调度，兜底不会绕过限流冷却。
+- cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
 - 如果使用 RSS 多用户分发，service 的同步成功后应触发发布脚本。
@@ -868,3 +873,18 @@ pip-audit
 ## License
 
 GNU General Public License v3.0
+
+---
+
+## 致谢
+
+本项目站在许多优秀开源项目的肩膀上，特别感谢：
+
+- bilibili-podcast：为 Bilibili 内容的播客化工作提供了重要参考与基础。
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)：可靠的媒体下载与格式处理能力。
+- [bilibili-api-python](https://github.com/Nemo2011/bilibili-api)：Bilibili API 的 Python 封装。
+- [FeedGenerator](https://github.com/lkiesow/python-feedgen)：RSS/Atom feed 生成能力。
+- [Playwright](https://github.com/microsoft/playwright-python)：浏览器回退抓取能力。
+- [FFmpeg](https://ffmpeg.org/)：音视频转码与处理能力。
+
+感谢这些项目的维护者与贡献者。
