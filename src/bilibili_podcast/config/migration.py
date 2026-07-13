@@ -231,7 +231,7 @@ def migrate_legacy(
             ("downloads", {"max_per_run": 20, "scheduled_max_per_run": 1, "min_free_gb": _number(merged.get("BILIBILI_PODCAST_MIN_FREE_GB", "5"), "BILIBILI_PODCAST_MIN_FREE_GB", float)}),
             ("paths", {"cookie_file": _require(merged, "BILIBILI_PODCAST_COOKIE_FILE"), "lock_file": _require(merged, "BILIBILI_PODCAST_LOCK_FILE")}),
             ("browser", {"user_data_root": _require(merged, "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT"), "playwright_browsers_path": _require(merged, "PLAYWRIGHT_BROWSERS_PATH"), "login_wait_seconds": 5.0}),
-            ("timeouts", {"preview_seconds": 120, "publish_seconds": 60}),
+            ("timeouts", {"sync_seconds": 300, "preview_seconds": 120, "publish_seconds": 60}),
             ("logging", {"level": merged.get("BILIBILI_PODCAST_SYNC_LOG_LEVEL", "INFO"), "retention_days": 30, "max_bytes": 20971520, "backup_count": 10}),
         ]),
         "web.toml": _toml([

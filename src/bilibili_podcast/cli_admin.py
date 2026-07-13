@@ -41,6 +41,14 @@ def _require_config() -> ConfigSnapshot:
     return _CONFIG
 
 
+def _scheduler_service(db_path: str, **kwargs) -> SchedulerService:
+    return SchedulerService(
+        db_path,
+        command_timeout_seconds=_require_config().scheduler.command_timeout_seconds,
+        **kwargs,
+    )
+
+
 def _sanitize(text: str) -> str:
     """Remove or mask sensitive patterns from output text."""
     # Mask common sensitive patterns
@@ -297,7 +305,7 @@ def _remove_series_list(args: argparse.Namespace, series_list: list[str]) -> Non
     from .sync import process_lock
 
     with process_lock(args.lock_file):
-        scheduler = SchedulerService(
+        scheduler = _scheduler_service(
             db_path,
             crontab_script=_find_crontab_bin(),
             cron_script_dir=args.cron_script_dir,
@@ -443,33 +451,7 @@ def cmd_add(args: argparse.Namespace) -> None:
             (data["series"], source.get("space_url", ""),
              source.get("uid"), source["type"], source.get("sid")),
         )
-        conn.execute(
-            """INSERT INTO sync_policy (
-                   series, page_size, incremental_page_size, max_pages,
-                   max_requests_per_series, request_interval_seconds,
-                   request_jitter_seconds, rate_limit_cooldown_seconds,
-                   update_period, format, quality, fetch_strategy, keep_last,
-                   browser_fallback, browser_wait_min_seconds,
-                   browser_wait_max_seconds, browser_fallback_cooldown_seconds,
-                   require_paid_state_confirmation,
-                   min_duration_seconds, max_duration_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (data["series"],
-             sync.get("page_size", 20), sync.get("incremental_page_size", 5),
-             sync.get("max_pages", 10), sync.get("max_requests_per_series", 8),
-             sync.get("request_interval_seconds", 2.0),
-             sync.get("request_jitter_seconds", 0.5),
-             sync.get("rate_limit_cooldown_seconds", 21600),
-             sync.get("update_period", "12h"), sync.get("format", "audio"),
-             sync.get("quality", "64K"), sync.get("fetch_strategy", "api_first"),
-             sync.get("keep_last", 100), int(sync.get("browser_fallback", False)),
-             sync.get("browser_wait_min_seconds", 4.0),
-             sync.get("browser_wait_max_seconds", 8.0),
-             sync.get("browser_fallback_cooldown_seconds", 3600),
-             int(sync.get("require_paid_state_confirmation", False)),
-             sync.get("min_duration_seconds", 0),
-             sync.get("max_duration_seconds", 0)),
-        )
+        SyncPolicyService(conn).upsert(data["series"], sync)
 
         # Filter rules
         pos = 0
@@ -618,7 +600,9 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
         "request_jitter_seconds": args.request_jitter_seconds if args.request_jitter_seconds is not None else _get_sv("request_jitter_seconds", 0.5),
         "rate_limit_cooldown_seconds": args.rate_limit_cooldown_seconds if args.rate_limit_cooldown_seconds is not None else _get_sv("rate_limit_cooldown_seconds", 21600),
         "update_period": args.update_period or _get_sv("update_period", "12h"),
+        "update_period_grace_seconds": _get_sv("update_period_grace_seconds", 120),
         "format": args.format or _get_sv("format", "audio"),
+        "media_mode": _get_sv("media_mode", "auto"),
         "quality": args.quality or _get_sv("quality", "64K"),
         "fetch_strategy": args.fetch_strategy or _get_sv("fetch_strategy", "api_first"),
         "keep_last": args.keep_last if args.keep_last is not None else _get_sv("keep_last", 100),
@@ -714,51 +698,7 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
             (series, source.get("space_url", ""),
              source.get("uid"), source["type"], source.get("sid")),
         )
-        conn.execute(
-            """INSERT INTO sync_policy (series, page_size, incremental_page_size,
-                   max_pages, max_requests_per_series, request_interval_seconds,
-                   request_jitter_seconds, rate_limit_cooldown_seconds,
-                   update_period, format, quality, fetch_strategy, keep_last,
-                   browser_fallback, browser_wait_min_seconds,
-                   browser_wait_max_seconds, browser_fallback_cooldown_seconds,
-                   require_paid_state_confirmation,
-                   min_duration_seconds, max_duration_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(series) DO UPDATE SET
-                   page_size=excluded.page_size,
-                   incremental_page_size=excluded.incremental_page_size,
-                   max_pages=excluded.max_pages,
-                   max_requests_per_series=excluded.max_requests_per_series,
-                   request_interval_seconds=excluded.request_interval_seconds,
-                   request_jitter_seconds=excluded.request_jitter_seconds,
-                   rate_limit_cooldown_seconds=excluded.rate_limit_cooldown_seconds,
-                   update_period=excluded.update_period,
-                   format=excluded.format, quality=excluded.quality,
-                   fetch_strategy=excluded.fetch_strategy,
-                   keep_last=excluded.keep_last,
-                   browser_fallback=excluded.browser_fallback,
-                   browser_wait_min_seconds=excluded.browser_wait_min_seconds,
-                   browser_wait_max_seconds=excluded.browser_wait_max_seconds,
-                   browser_fallback_cooldown_seconds=excluded.browser_fallback_cooldown_seconds,
-                   require_paid_state_confirmation=excluded.require_paid_state_confirmation,
-                   min_duration_seconds=excluded.min_duration_seconds,
-                   max_duration_seconds=excluded.max_duration_seconds""",
-            (series,
-             sync["page_size"], sync["incremental_page_size"],
-             sync["max_pages"], sync["max_requests_per_series"],
-             sync["request_interval_seconds"],
-             sync["request_jitter_seconds"],
-             sync["rate_limit_cooldown_seconds"],
-             sync["update_period"], sync["format"],
-             sync["quality"], sync["fetch_strategy"],
-             sync["keep_last"], int(sync["browser_fallback"]),
-             sync["browser_wait_min_seconds"],
-             sync["browser_wait_max_seconds"],
-             sync["browser_fallback_cooldown_seconds"],
-             int(sync["require_paid_state_confirmation"]),
-             sync["min_duration_seconds"],
-             sync["max_duration_seconds"]),
-        )
+        SyncPolicyService(conn).upsert(series, sync)
 
         # Filters
         pos = 0
@@ -883,51 +823,7 @@ def cmd_edit(args: argparse.Namespace) -> None:
             (args.series, new_source.get("space_url", ""),
              new_source.get("uid"), new_source["type"], new_source.get("sid")),
         )
-        conn.execute(
-            """INSERT INTO sync_policy (series, page_size, incremental_page_size,
-                   max_pages, max_requests_per_series, request_interval_seconds,
-                   request_jitter_seconds, rate_limit_cooldown_seconds,
-                   update_period, format, quality, fetch_strategy, keep_last,
-                   browser_fallback, browser_wait_min_seconds,
-                   browser_wait_max_seconds, browser_fallback_cooldown_seconds,
-                   require_paid_state_confirmation,
-                   min_duration_seconds, max_duration_seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(series) DO UPDATE SET
-                   page_size=excluded.page_size,
-                   incremental_page_size=excluded.incremental_page_size,
-                   max_pages=excluded.max_pages,
-                   max_requests_per_series=excluded.max_requests_per_series,
-                   request_interval_seconds=excluded.request_interval_seconds,
-                   request_jitter_seconds=excluded.request_jitter_seconds,
-                   rate_limit_cooldown_seconds=excluded.rate_limit_cooldown_seconds,
-                   update_period=excluded.update_period,
-                   format=excluded.format, quality=excluded.quality,
-                   fetch_strategy=excluded.fetch_strategy,
-                   keep_last=excluded.keep_last,
-                   browser_fallback=excluded.browser_fallback,
-                   browser_wait_min_seconds=excluded.browser_wait_min_seconds,
-                   browser_wait_max_seconds=excluded.browser_wait_max_seconds,
-                   browser_fallback_cooldown_seconds=excluded.browser_fallback_cooldown_seconds,
-                   require_paid_state_confirmation=excluded.require_paid_state_confirmation,
-                   min_duration_seconds=excluded.min_duration_seconds,
-                   max_duration_seconds=excluded.max_duration_seconds""",
-            (args.series, new_sync.get("page_size", 20),
-             new_sync.get("incremental_page_size", 5),
-             new_sync.get("max_pages", 10), new_sync.get("max_requests_per_series", 8),
-             new_sync.get("request_interval_seconds", 2.0),
-             new_sync.get("request_jitter_seconds", 0.5),
-             new_sync.get("rate_limit_cooldown_seconds", 21600),
-             new_sync.get("update_period", "12h"), new_sync.get("format", "audio"),
-             new_sync.get("quality", "64K"), new_sync.get("fetch_strategy", "api_first"),
-             new_sync.get("keep_last", 100), int(new_sync.get("browser_fallback", False)),
-             new_sync.get("browser_wait_min_seconds", 4.0),
-             new_sync.get("browser_wait_max_seconds", 8.0),
-             new_sync.get("browser_fallback_cooldown_seconds", 3600),
-             int(new_sync.get("require_paid_state_confirmation", False)),
-             new_sync.get("min_duration_seconds", 0),
-             new_sync.get("max_duration_seconds", 0)),
-        )
+        SyncPolicyService(conn).upsert(args.series, new_sync)
 
         # Paid preview
         conn.execute(
@@ -1175,7 +1071,8 @@ def cmd_preview(args: argparse.Namespace) -> None:
         if result.returncode != 0:
             print(f"\n⚠️ 干跑返回码 {result.returncode}")
     except subprocess.TimeoutExpired:
-        print("❌ 执行超时（120秒）")
+        timeout = _CONFIG.sync.timeouts.preview_seconds if _CONFIG else 120
+        print(f"❌ 执行超时（{timeout}秒）")
         sys.exit(EXIT_SYNC_FAIL)
     except FileNotFoundError:
         print(f"❌ 找不到可执行文件: {sync_bin}")
@@ -1218,7 +1115,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
         "--log-dir", log_dir,
         "--media-base-url", media_base_url,
         "--browser-user-data-root", browser_root,
-        "--max-downloads-per-run", str(config.sync.downloads.scheduled_max_per_run),
+        "--max-downloads-per-run", str(config.sync.downloads.max_per_run),
         "--min-free-gb", str(config.sync.downloads.min_free_gb),
         "--token", "__MEDIA_PLACEHOLDER__",
     ]
@@ -1238,7 +1135,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
         child_env.pop("BILIBILI_PODCAST_CONFIG_DB", None)
         if _CONFIG is not None:
             child_env["BILIBILI_PODCAST_CONFIG_ROOT"] = str(_CONFIG.root)
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=config.sync.timeouts.sync_seconds,
                                 env=child_env)
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         print(_sanitize(output))
@@ -1246,7 +1145,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"\n⚠️ 返回码 {result.returncode}")
             sys.exit(EXIT_SYNC_FAIL)
     except subprocess.TimeoutExpired:
-        print("❌ 执行超时（300秒）")
+        print(f"❌ 执行超时（{config.sync.timeouts.sync_seconds}秒）")
         sys.exit(EXIT_SYNC_FAIL)
     except Exception as e:
         print(f"❌ 执行错误: {e}")
@@ -1259,10 +1158,14 @@ def cmd_sync(args: argparse.Namespace) -> None:
         else None
     )
     if args.apply and publish:
-        pub_result = subprocess.run(
-            [publish], capture_output=True, text=True,
-            timeout=_CONFIG.sync.timeouts.publish_seconds if _CONFIG else 60,
-        )
+        try:
+            pub_result = subprocess.run(
+                [publish], capture_output=True, text=True,
+                timeout=_CONFIG.sync.timeouts.publish_seconds if _CONFIG else 60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"RSS 发布失败: {_sanitize(str(exc))}")
+            sys.exit(EXIT_SYNC_FAIL)
         pub_out = (pub_result.stdout or "") + "\n" + (pub_result.stderr or "")
         print(_sanitize(pub_out))
         if pub_result.returncode != 0:
@@ -1369,7 +1272,7 @@ def _run_crontab(args: argparse.Namespace, db_path: str, action: str) -> None:
     if not crontab_bin:
         print("❌ 找不到 bilibili-podcast-crontab 脚本")
         sys.exit(EXIT_SYNC_FAIL)
-    svc = SchedulerService(db_path, crontab_script=crontab_bin)
+    svc = _scheduler_service(db_path, crontab_script=crontab_bin)
     if action == "apply":
         yes = args.yes or getattr(args, "cron_yes", False)
         if not yes:
@@ -1412,7 +1315,7 @@ def cmd_cron_show(args: argparse.Namespace) -> None:
     """Show cron schedules for a series using SchedulerService."""
     db_path = _get_db(args)
     _require_series(db_path, args.series)
-    schedules = SchedulerService(db_path).list_schedules(args.series)
+    schedules = _scheduler_service(db_path).list_schedules(args.series)
 
     if _should_json(args):
         _run_json(args, {
@@ -1449,7 +1352,7 @@ def cmd_cron_set(args: argparse.Namespace) -> None:
             print("已取消")
             return
 
-    count = SchedulerService(db_path).replace_schedules(args.series, args.schedule)
+    count = _scheduler_service(db_path).replace_schedules(args.series, args.schedule)
     print(f"✅ 已更新 {args.series} 的 {count} 条 cron 配置")
     print(f"   注意: 修改仅保存到数据库，执行 'bilibili-podcast-admin cron apply' 才安装到系统 crontab")
     print()
@@ -1464,7 +1367,7 @@ def cmd_scheduler_plan(args: argparse.Namespace) -> None:
         print("❌ 找不到 bilibili-podcast-crontab 脚本")
         sys.exit(EXIT_SYNC_FAIL)
     try:
-        svc = SchedulerService(db_path, crontab_script=crontab_bin,
+        svc = _scheduler_service(db_path, crontab_script=crontab_bin,
                                 cron_script_dir=args.cron_script_dir)
         result = svc.plan(backend=args.scheduler_backend, cron_script_dir=args.cron_script_dir,
                           series=getattr(args, "series", None))
@@ -1498,7 +1401,7 @@ def cmd_scheduler_apply(args: argparse.Namespace) -> None:
             print("已取消")
             return
     try:
-        svc = SchedulerService(db_path, crontab_script=crontab_bin,
+        svc = _scheduler_service(db_path, crontab_script=crontab_bin,
                                 cron_script_dir=args.cron_script_dir)
         result = svc.apply(backend=args.scheduler_backend, cron_script_dir=args.cron_script_dir,
                            series=getattr(args, "series", None))
@@ -1519,7 +1422,7 @@ def cmd_scheduler_apply(args: argparse.Namespace) -> None:
 def cmd_scheduler_status(args: argparse.Namespace) -> None:
     db_path = _get_db(args)
     try:
-        svc = SchedulerService(db_path)
+        svc = _scheduler_service(db_path)
         status_list = svc.status(backend=args.scheduler_backend,
                                  series=getattr(args, "series", None))
     except NotImplementedError as e:
@@ -1566,7 +1469,7 @@ def cmd_scheduler_set(args: argparse.Namespace) -> None:
             print("已取消")
             return
 
-    count = SchedulerService(db_path).replace_schedules(
+    count = _scheduler_service(db_path).replace_schedules(
         args.series, args.schedule, args.retry_schedule,
     )
     print(f"✅ 已更新 {args.series} 的 {count} 条调度")
@@ -1584,7 +1487,7 @@ def cmd_scheduler_disable(args: argparse.Namespace) -> None:
             print("已取消")
             return
     crontab_bin = _find_crontab_bin()
-    svc = SchedulerService(db_path, crontab_script=crontab_bin,
+    svc = _scheduler_service(db_path, crontab_script=crontab_bin,
                             cron_script_dir=args.cron_script_dir)
     result = svc.disable_systemd(args.series, delete_units=args.delete_units)
     output = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -1734,6 +1637,10 @@ def _interactive_collect_sync(existing: dict) -> dict:
     if fmt not in ("audio", "video"):
         print("  无效值，使用 audio")
         fmt = "audio"
+    media_mode = _prompt_str("媒体模式(auto/manual)", existing.get("media_mode", "auto"))
+    if media_mode not in ("auto", "manual"):
+        print("  无效值，使用 auto")
+        media_mode = "auto"
     return {
         "page_size": _prompt_int("首页每页条数", existing.get("page_size", 20), 1, 50),
         "incremental_page_size": _prompt_int("增量页条数", existing.get("incremental_page_size", 5), 1),
@@ -1743,7 +1650,9 @@ def _interactive_collect_sync(existing: dict) -> dict:
         "request_jitter_seconds": _prompt_float("抖动(秒)", float(existing.get("request_jitter_seconds", 0.5)), 0.0),
         "rate_limit_cooldown_seconds": _prompt_int("限流冷却(秒)", existing.get("rate_limit_cooldown_seconds", 21600), 0),
         "update_period": _prompt_str("更新周期(如 12h)", existing.get("update_period", "12h")),
+        "update_period_grace_seconds": _prompt_int("更新周期容差(秒)", existing.get("update_period_grace_seconds", 120), 0),
         "format": fmt,
+        "media_mode": media_mode,
         "quality": quality,
         "fetch_strategy": fetch_strategy,
         "keep_last": _prompt_int("RSS 保留条数(0=不限)", existing.get("keep_last", 100), 0),
@@ -2320,7 +2229,7 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
             json_root=json_root,
             media_root=media_root,
             rss_root=rss_root,
-            media_base_url=args.media_base_url or "http://localhost:58743",
+            media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
         )
     except (ValueError, RuntimeError, OSError) as exc:
         _restore_file(media_dst, media_backup)
@@ -2331,8 +2240,14 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
 
     try:
         if args.publish_script:
-            subprocess.run([args.publish_script], check=True)
-    except subprocess.CalledProcessError as exc:
+            subprocess.run(
+                [args.publish_script], check=True,
+                timeout=_require_config().sync.timeouts.publish_seconds,
+            )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        _restore_file(media_dst, media_backup)
+        _restore_file(json_dst, json_backup)
+        _restore_file(rss_dst, rss_backup)
         print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
         sys.exit(EXIT_SYNC_FAIL)
 
@@ -2453,7 +2368,7 @@ def cmd_paid_rebuild_rss(args: argparse.Namespace) -> None:
             json_root=json_root,
             media_root=media_root,
             rss_root=rss_root,
-            media_base_url=args.media_base_url or "http://localhost:58743",
+            media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
         )
     except ValueError as exc:
         message = str(exc)

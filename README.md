@@ -67,6 +67,8 @@ bilibili-podcast --series demo-series --token "__MEDIA_PLACEHOLDER__" --apply
 
 配置根定位顺序是显式 `ConfigManager(root)`、`BILIBILI_PODCAST_CONFIG_ROOT`、可确认的仓库根 `config/`；找不到时明确失败。除 `BILIBILI_PODCAST_CONFIG_ROOT` 外，旧持久配置环境变量不再生效，检测到时会给出目标字段和迁移命令。
 
+`sync.toml` 的 `timeouts.sync_seconds`、`preview_seconds`、`publish_seconds` 分别控制手动同步、预览和本机发布钩子；`scheduler.toml` 的 `timeouts.command_seconds` 控制 cron/systemd 管理命令。手动同步使用 `downloads.max_per_run`，生成的调度任务使用 `downloads.scheduled_max_per_run`。自定义 systemd 主任务名称时，`units.sync_glob` 必须是恰好含一个 `*` 的 `.service` 文件名模式。
+
 ```bash
 bilibili-podcast-config validate
 bilibili-podcast-config validate --templates

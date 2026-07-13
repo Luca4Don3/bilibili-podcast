@@ -48,6 +48,7 @@ SYNC_FIELDS = (
     FieldSpec("browser.user_data_root", str, required=True, owner="sync", legacy_aliases=("BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT",)),
     FieldSpec("browser.playwright_browsers_path", str, required=True, owner="sync", legacy_aliases=("PLAYWRIGHT_BROWSERS_PATH",)),
     FieldSpec("browser.login_wait_seconds", (int, float), 5.0, minimum=0, owner="sync"),
+    FieldSpec("timeouts.sync_seconds", int, 300, minimum=1, owner="sync"),
     FieldSpec("timeouts.preview_seconds", int, 120, minimum=1, owner="sync"),
     FieldSpec("timeouts.publish_seconds", int, 60, minimum=1, owner="sync"),
     FieldSpec("logging.level", str, "INFO", owner="sync", legacy_aliases=("BILIBILI_PODCAST_SYNC_LOG_LEVEL",)),

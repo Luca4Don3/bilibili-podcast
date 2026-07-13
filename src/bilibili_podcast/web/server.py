@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -29,6 +30,8 @@ from ..services import validation
 from ..cli_admin import (
     _get_allowed_media_dirs,
     _get_series_quality,
+    _file_backup,
+    _restore_file,
     is_allowed_manual_media_path,
     rebuild_paid_rss,
 )
@@ -40,6 +43,7 @@ DB_PATH = ""
 PASSWORD = ""
 _CONFIG_MANAGER: ConfigManager | None = None
 _CONFIG_SNAPSHOT: ConfigSnapshot | None = None
+_CONFIGURED_APP: FastAPI | None = None
 _COOKIE_NAME = "bilibili_podcast_session"
 _SESSION_MAX_AGE = 86400  # 24 hours
 _HTTPS = False
@@ -91,6 +95,14 @@ def _runtime_config() -> ConfigSnapshot:
     if _CONFIG_SNAPSHOT is None:
         raise RuntimeError("web configuration was not injected")
     return _CONFIG_SNAPSHOT
+
+
+def _scheduler_service() -> SchedulerService:
+    config = _runtime_config()
+    return SchedulerService(
+        DB_PATH,
+        command_timeout_seconds=config.scheduler.command_timeout_seconds,
+    )
 
 
 def csrf_token() -> str:
@@ -168,7 +180,7 @@ async def login_page(request: Request):
 
 @router.post("/login")
 async def login_post(request: Request, password: str = Form(...)):
-    if password == PASSWORD:
+    if hmac.compare_digest(password, PASSWORD):
         resp = RedirectResponse(url="/series", status_code=302)
         resp.set_cookie(_COOKIE_NAME, _session_token(),
                         max_age=_SESSION_MAX_AGE, httponly=True, samesite="lax",
@@ -786,7 +798,7 @@ async def cron_page(request: Request, series: str):
     if redirect:
         return redirect
 
-    svc = SchedulerService(DB_PATH)
+    svc = _scheduler_service()
     schedules = svc.list_schedules(series)
 
     # Get systemd timer status for this series
@@ -823,7 +835,7 @@ async def cron_update(
     parsed_retries = [line.strip() for line in retry_schedules.split("\n") if line.strip()]
 
     try:
-        SchedulerService(DB_PATH).replace_schedules(series, parsed, parsed_retries)
+        _scheduler_service().replace_schedules(series, parsed, parsed_retries)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1036,15 +1048,17 @@ async def manual_media_attach(
     rss_root = config.app.paths.rss_root
     media_base_url = config.publish.publish.media_base_url
     dst = media_root / series / dst_name
+    rss_path = rss_root / f"{series}.xml"
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     if dst.exists() and replace != "1":
         return _manual_media_redirect(series, error="target exists; use replace")
 
-    shutil.copy2(str(resolved), str(dst))
-    dst.chmod(0o644)
-
+    media_backup = _file_backup(dst)
+    rss_backup = _file_backup(rss_path)
     try:
+        shutil.copy2(str(resolved), str(dst))
+        dst.chmod(0o644)
         rebuild_paid_rss(
             DB_PATH,
             series,
@@ -1053,7 +1067,9 @@ async def manual_media_attach(
             rss_root=rss_root,
             media_base_url=media_base_url,
         )
-    except ValueError as exc:
+    except (OSError, ValueError) as exc:
+        _restore_file(dst, media_backup)
+        _restore_file(rss_path, rss_backup)
         return _manual_media_redirect(series, error=f"rss rebuild failed: {exc}")
 
     publish_script = (
@@ -1063,8 +1079,13 @@ async def manual_media_attach(
     )
     if publish_script is not None:
         try:
-            subprocess.run([str(publish_script)], check=True)
-        except (OSError, subprocess.CalledProcessError) as exc:
+            subprocess.run(
+                [str(publish_script)], check=True,
+                timeout=config.sync.timeouts.publish_seconds,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            _restore_file(dst, media_backup)
+            _restore_file(rss_path, rss_backup)
             return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
 
     return _manual_media_redirect(series, success="media attached and RSS updated")
@@ -1077,7 +1098,7 @@ async def scheduler_page(request: Request):
     if redirect:
         return redirect
 
-    svc = SchedulerService(DB_PATH)
+    svc = _scheduler_service()
     try:
         cron_status = svc.status(backend="cron")
     except NotImplementedError:
@@ -1101,7 +1122,7 @@ def create_app(
 ) -> FastAPI:
     """Configure and return the ASGI app from one immutable snapshot."""
     global DB_PATH, PASSWORD, _COOKIE_NAME, _SESSION_MAX_AGE, _HTTPS
-    global _SECRET_KEY, _serializer, _CONFIG_MANAGER, _CONFIG_SNAPSHOT
+    global _SECRET_KEY, _serializer, _CONFIG_MANAGER, _CONFIG_SNAPSHOT, _CONFIGURED_APP
 
     if snapshot is not None:
         selected_manager = manager or ConfigManager(snapshot.root, environ={})
@@ -1113,6 +1134,10 @@ def create_app(
         raise RuntimeError("web.server.enabled is false")
     if not selected.web.security.password:
         raise RuntimeError("web.security.password is required")
+    if _CONFIGURED_APP is not None:
+        if selected != _CONFIG_SNAPSHOT:
+            raise RuntimeError("web process configuration is already initialized")
+        return _CONFIGURED_APP
     DB_PATH = str(selected.app.database.path)
     PASSWORD = selected.web.security.password
     _COOKIE_NAME = selected.web.security.cookie_name
@@ -1128,4 +1153,5 @@ def create_app(
     configured_app = FastAPI(title="bilibili-podcast Manager")
     configured_app.include_router(router)
     configured_app.state.config = selected
+    _CONFIGURED_APP = configured_app
     return configured_app

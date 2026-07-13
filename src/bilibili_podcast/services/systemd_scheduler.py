@@ -127,8 +127,14 @@ def generate_timer(series: str, oncalendars: list[str]) -> str:
 
 def unit_name(series: str, suffix: str = "service", *, scheduled_retry: bool = False) -> str:
     """Return the systemd unit file name, e.g. ``bilibili-podcast-sync@myseries.service``."""
-    prefix = "bilibili-podcast-retry" if scheduled_retry else "bilibili-podcast-sync"
-    return f"{prefix}@{series}.{suffix}"
+    if scheduled_retry:
+        return f"bilibili-podcast-retry@{series}.{suffix}"
+    units = getattr(getattr(_CONFIG, "scheduler", None), "units", None)
+    pattern = getattr(units, "sync_glob", "bilibili-podcast-sync@*.service")
+    service_name = pattern.replace("*", series)
+    if suffix == "service":
+        return service_name
+    return f"{service_name.removesuffix('.service')}.{suffix}"
 
 
 # ── systemd interaction helpers ───────────────────────────────────────
@@ -273,15 +279,15 @@ def write_unit(series: str, suffix: str, content: str, *, scheduled_retry: bool 
         sudo_tmp_path = path.parent / f".{path.name}.{tmp_path.name}.tmp"
         subprocess.run(
             ["sudo", "cp", str(tmp_path), str(sudo_tmp_path)],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT, check=True,
         )
         subprocess.run(
             ["sudo", "chmod", "644", str(sudo_tmp_path)],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT, check=True,
         )
         subprocess.run(
             ["sudo", "mv", str(sudo_tmp_path), str(path)],
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT, check=True,
         )
         command = ["sudo", "mv", str(sudo_tmp_path), str(path)]
         sudo_tmp_path = None
@@ -303,7 +309,7 @@ def write_unit(series: str, suffix: str, content: str, *, scheduled_retry: bool 
             try:
                 subprocess.run(
                     ["sudo", "rm", "-f", str(sudo_tmp_path)],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
                 )
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -340,7 +346,7 @@ def remove_unit(series: str, suffix: str, *, scheduled_retry: bool = False) -> S
                 command,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=COMMAND_TIMEOUT,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return SchedulerCommandResult(
@@ -387,7 +393,7 @@ def systemctl_show(unit: str) -> dict[str, str]:
     try:
         r = subprocess.run(
             ["systemctl", "show", unit],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
         )
     except FileNotFoundError:
         return {}

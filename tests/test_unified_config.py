@@ -66,6 +66,34 @@ def test_rejects_control_characters_without_echoing_value(tmp_path: Path) -> Non
     assert "bad" not in str(exc.value)
 
 
+def test_rejects_non_finite_numbers_and_unsafe_unit_names(tmp_path: Path) -> None:
+    root = _actual_config(tmp_path)
+    sync = root / "sync.toml"
+    sync.write_text(sync.read_text().replace("min_free_gb = 5.0", "min_free_gb = nan"))
+    with pytest.raises(ConfigError, match="non-finite"):
+        ConfigManager(root, environ={}).load()
+
+    root = _actual_config(tmp_path / "unit")
+    scheduler = root / "scheduler.toml"
+    scheduler.write_text(
+        scheduler.read_text().replace(
+            'web = "bilibili-podcast-web.service"', 'web = "../bilibili-podcast-web.service"'
+        )
+    )
+    with pytest.raises(ConfigError, match="invalid scheduler unit name"):
+        ConfigManager(root, environ={}).load()
+
+    root = _actual_config(tmp_path / "overlap")
+    scheduler = root / "scheduler.toml"
+    scheduler.write_text(
+        scheduler.read_text().replace(
+            'sync_glob = "bilibili-podcast-sync@*.service"', 'sync_glob = "bilibili-podcast-*.service"'
+        )
+    )
+    with pytest.raises(ConfigError, match="overlaps web unit"):
+        ConfigManager(root, environ={}).load()
+
+
 def test_rejects_unsafe_sensitive_permissions(tmp_path: Path) -> None:
     root = _actual_config(tmp_path)
     (root / "web.toml").chmod(0o644)
@@ -388,6 +416,29 @@ print(path.read_text())
     assert "--cookie-file" not in output
     assert "BILIBILI_PODCAST_RSYNC_" not in output
     assert "__MEDIA_PLACEHOLDER__" in output
+
+
+def test_crontab_explicit_paths_override_unified_scheduler_config(tmp_path: Path) -> None:
+    root = _actual_config(tmp_path)
+    db_path = ConfigManager(root, environ={}).load().app.database.path
+    db_path.parent.mkdir(parents=True)
+    db.migrate(db_path)
+    override = tmp_path / "one-run-wrappers"
+    result = subprocess.run(
+        [
+            sys.executable, "scripts/bilibili-podcast-crontab", "--print",
+            "--script-dir", str(override), "--cron-user", "one-run-user",
+        ],
+        cwd=Path(__file__).parents[1],
+        env={
+            "PATH": os.environ.get("PATH", ""), "PYTHONPATH": "src",
+            "BILIBILI_PODCAST_CONFIG_ROOT": str(root),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert f"wrapper scripts ready in {override}" in result.stderr
 
 
 def test_sync_cli_override_precedence(tmp_path: Path) -> None:

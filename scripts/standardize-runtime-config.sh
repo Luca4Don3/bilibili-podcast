@@ -54,6 +54,10 @@ SYNC_BIN="$(config_value app.executables.sync)"
 SERVICE_USER="$(config_value scheduler.runtime.user)"
 SERVICE_GROUP="$(config_value scheduler.runtime.group)"
 MAX_DOWNLOADS="$(config_value sync.downloads.scheduled_max_per_run)"
+WEB_UNIT="$(config_value scheduler.units.web)"
+SYNC_UNIT_GLOB="$(config_value scheduler.units.sync_glob)"
+SYNC_UNIT_PREFIX="${SYNC_UNIT_GLOB%%\**}"
+SYNC_UNIT_SUFFIX="${SYNC_UNIT_GLOB#*\*}"
 BACKUP_DIR="$(mktemp -d "$BILIBILI_PODCAST_CONFIG_ROOT/.backups/standardize-XXXXXXXX")"
 chmod 700 "$BACKUP_DIR"
 
@@ -105,8 +109,8 @@ write_sync_unit() {
         return 1
     fi
     name="$(basename "$unit")"
-    series="${name#bilibili-podcast-sync@}"
-    series="${series%.service}"
+    series="${name#"$SYNC_UNIT_PREFIX"}"
+    series="${series%"$SYNC_UNIT_SUFFIX"}"
     case "$series" in
         ""|*[!a-z0-9_-]*) echo "ERROR: invalid series in unit name: $name" >&2; exit 2 ;;
     esac
@@ -131,12 +135,13 @@ write_sync_unit() {
     mv "$temp" "$unit"
 }
 
-web_unit="$SYSTEMD_DIR/bilibili-podcast-web.service"
+web_unit="$SYSTEMD_DIR/$WEB_UNIT"
 if [ -f "$web_unit" ]; then
     write_web_unit "$web_unit"
 fi
-for unit in "$SYSTEMD_DIR"/bilibili-podcast-sync@*.service; do
+for unit in "$SYSTEMD_DIR"/$SYNC_UNIT_GLOB; do
     [ -f "$unit" ] || continue
+    [ "$(basename "$unit")" != "$WEB_UNIT" ] || continue
     write_sync_unit "$unit"
 done
 
