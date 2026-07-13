@@ -30,7 +30,8 @@ from ..services import validation
 from ..cli_admin import (
     _get_allowed_media_dirs,
     _get_series_quality,
-    _file_backup,
+    _file_backups,
+    _discard_file_backup,
     _restore_file,
     is_allowed_manual_media_path,
     rebuild_paid_rss,
@@ -1054,8 +1055,7 @@ async def manual_media_attach(
     if dst.exists() and replace != "1":
         return _manual_media_redirect(series, error="target exists; use replace")
 
-    media_backup = _file_backup(dst)
-    rss_backup = _file_backup(rss_path)
+    media_backup, rss_backup = _file_backups(dst, rss_path)
     try:
         shutil.copy2(str(resolved), str(dst))
         dst.chmod(0o644)
@@ -1088,6 +1088,8 @@ async def manual_media_attach(
             _restore_file(rss_path, rss_backup)
             return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
 
+    _discard_file_backup(media_backup)
+    _discard_file_backup(rss_backup)
     return _manual_media_redirect(series, success="media attached and RSS updated")
 
 

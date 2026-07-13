@@ -5,6 +5,7 @@ import tomllib
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -110,18 +111,79 @@ class SeriesRemovalService:
     def remove(self, series: str) -> SeriesRemovalPlan:
         plan = self.plan(series)
 
-        self._remove_path(Path(plan.media_dir))
-        self._remove_path(Path(plan.json_dir))
-        Path(plan.master_rss).unlink(missing_ok=True)
-        for path in plan.published_rss_files:
-            Path(path).unlink(missing_ok=True)
-        Path(plan.wrapper_script).unlink(missing_ok=True)
-        self._remove_path(Path(plan.browser_profile_dir))
-        self._remove_users_conf_reference(series)
-
-        with db.transaction(self.db_path) as conn:
-            conn.execute("DELETE FROM series WHERE series=?", (series,))
+        paths = [
+            Path(plan.media_dir), Path(plan.json_dir), Path(plan.master_rss),
+            *(Path(path) for path in plan.published_rss_files),
+            Path(plan.wrapper_script), Path(plan.browser_profile_dir),
+        ]
+        staged: list[tuple[Path, Path]] = []
+        users_backup = self._backup_users_conf()
+        try:
+            for path in paths:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                quarantine = path.with_name(
+                    f".{path.name}.bilibili-podcast-remove-{uuid.uuid4().hex}"
+                )
+                path.replace(quarantine)
+                staged.append((path, quarantine))
+            self._remove_users_conf_reference(series)
+            with db.transaction(self.db_path) as conn:
+                conn.execute("DELETE FROM series WHERE series=?", (series,))
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            try:
+                self._restore_users_conf(users_backup)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"rss users: {type(rollback_exc).__name__}")
+            for original, quarantine in reversed(staged):
+                try:
+                    if quarantine.exists() or quarantine.is_symlink():
+                        quarantine.replace(original)
+                except OSError as rollback_exc:
+                    rollback_errors.append(
+                        f"{original.name}: {type(rollback_exc).__name__}"
+                    )
+            if rollback_errors:
+                raise RuntimeError(
+                    "series removal failed and rollback was incomplete: "
+                    + ", ".join(rollback_errors)
+                ) from exc
+            raise
+        for _, quarantine in staged:
+            self._remove_path(quarantine)
         return plan
+
+    def _backup_users_conf(self) -> tuple[bool, bytes, int]:
+        if not self.users_conf.exists():
+            return False, b"", 0
+        return True, self.users_conf.read_bytes(), self.users_conf.stat().st_mode & 0o777
+
+    def _restore_users_conf(self, backup: tuple[bool, bytes, int]) -> None:
+        existed, content, mode = backup
+        if not existed:
+            self.users_conf.unlink(missing_ok=True)
+            return
+        self.users_conf.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write_users_conf(content, mode)
+
+    def _atomic_write_users_conf(self, content: bytes, mode: int) -> None:
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=self.users_conf.parent,
+                prefix=f".{self.users_conf.name}.", suffix=".tmp", delete=False,
+            ) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temporary = Path(handle.name)
+            temporary.chmod(mode)
+            temporary.replace(self.users_conf)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _file_count(path: Path) -> int:
@@ -140,9 +202,8 @@ class SeriesRemovalService:
         if not self.users_conf.exists():
             return 0
         if self.users_conf.suffix == ".toml":
-            with self.users_conf.open("rb") as handle:
-                users = (tomllib.load(handle).get("users") or {}).values()
-            return sum(1 for user in users if series in user.get("series", []))
+            users = self._read_toml_users()
+            return sum(1 for user in users.values() if series in user["series"])
         count = 0
         for raw in self.users_conf.read_text(encoding="utf-8").splitlines():
             content = raw.split("#", 1)[0].strip()
@@ -158,22 +219,15 @@ class SeriesRemovalService:
         if not self.users_conf.exists():
             return
         if self.users_conf.suffix == ".toml":
-            with self.users_conf.open("rb") as handle:
-                users = tomllib.load(handle).get("users") or {}
+            users = self._read_toml_users()
             output: list[str] = []
             changed = False
             for name, user in users.items():
-                if not isinstance(name, str) or not isinstance(user, dict):
-                    raise ValueError("invalid rss-users.toml user entry")
                 names = [item for item in user.get("series", []) if item != series]
                 changed = changed or len(names) != len(user.get("series", []))
                 if not names:
                     continue
                 token = user.get("token")
-                if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
-                    raise ValueError("invalid rss-users.toml token")
-                if not all(isinstance(item, str) for item in names):
-                    raise ValueError("invalid rss-users.toml series list")
                 encoded_series = ", ".join(json.dumps(item, ensure_ascii=False) for item in names)
                 output.extend((
                     f"[users.{json.dumps(name, ensure_ascii=False)}]",
@@ -181,16 +235,10 @@ class SeriesRemovalService:
                     f"series = [{encoded_series}]", "",
                 ))
             if changed:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=self.users_conf.parent,
-                    prefix=f".{self.users_conf.name}.", suffix=".tmp", delete=False,
-                ) as handle:
-                    handle.write("\n".join(output))
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                    temporary = Path(handle.name)
-                temporary.chmod(self.users_conf.stat().st_mode & 0o777)
-                temporary.replace(self.users_conf)
+                self._atomic_write_users_conf(
+                    "\n".join(output).encode("utf-8"),
+                    self.users_conf.stat().st_mode & 0o777,
+                )
             return
         output: list[str] = []
         changed = False
@@ -213,4 +261,26 @@ class SeriesRemovalService:
                 rebuilt += f" #{comment}"
             output.append(rebuilt)
         if changed:
-            self.users_conf.write_text("\n".join(output) + "\n", encoding="utf-8")
+            self._atomic_write_users_conf(
+                ("\n".join(output) + "\n").encode("utf-8"),
+                self.users_conf.stat().st_mode & 0o777,
+            )
+
+    def _read_toml_users(self) -> dict[str, dict[str, Any]]:
+        with self.users_conf.open("rb") as handle:
+            data = tomllib.load(handle)
+        users = data.get("users") or {}
+        if not isinstance(users, dict):
+            raise ValueError("invalid rss-users.toml users table")
+        for name, user in users.items():
+            if not isinstance(name, str) or not name or not isinstance(user, dict):
+                raise ValueError("invalid rss-users.toml user entry")
+            if set(user) - {"token", "series"}:
+                raise ValueError("unknown rss-users.toml user field")
+            token = user.get("token")
+            series = user.get("series")
+            if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
+                raise ValueError("invalid rss-users.toml token")
+            if not isinstance(series, list) or not all(isinstance(item, str) for item in series):
+                raise ValueError("invalid rss-users.toml series list")
+        return users
