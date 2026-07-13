@@ -174,8 +174,20 @@ def _load_configs_from_db(db_path: str) -> list[dict]:
                 backend_row is not None and backend_row["backend"] == "systemd"
             ) or systemd_timer_is_enabled(cfg.series):
                 continue
+            retry_row = conn.execute(
+                "SELECT 1 FROM cron_schedule "
+                "WHERE series=? AND enabled=1 AND kind='retry' LIMIT 1",
+                (cfg.series,),
+            ).fetchone()
+            if retry_row is not None:
+                print(
+                    f"ERROR: cron backend does not support retry schedules: {cfg.series}",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
             row = conn.execute(
-                "SELECT schedule FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
+                "SELECT schedule FROM cron_schedule "
+                "WHERE series=? AND enabled=1 AND kind='primary' ORDER BY position",
                 (cfg.series,),
             ).fetchall()
             schedules = [r["schedule"] for r in row]

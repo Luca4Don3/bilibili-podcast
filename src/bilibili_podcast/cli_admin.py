@@ -19,7 +19,7 @@ from .services.config_service import ConfigService
 from .services.filter_service import FilterRuleService
 from .services.sync_policy_service import SyncPolicyService, SYNC_POLICY_DEFAULTS
 from .services.preview_service import PreviewService
-from .services.scheduler_service import SchedulerService
+from .services.scheduler_service import ScheduleEntry, SchedulerService, validate_schedules
 from .services.series_removal_service import SeriesRemovalPlan, SeriesRemovalService
 from .utils.bilibili_url import parse_space_source
 
@@ -88,6 +88,20 @@ def _ts_str(ts: int) -> str:
 def _load_full_config(conn, series: str) -> dict[str, Any]:
     cs = ConfigService(conn)
     return cs.load_full_config(series) or {}
+
+
+def _validate_schedule_values(
+    series: str,
+    update_period: object,
+    schedules: list[str],
+    retry_schedules: list[str] | None = None,
+) -> None:
+    entries = [(schedule, "primary") for schedule in schedules]
+    entries.extend((schedule, "retry") for schedule in (retry_schedules or []))
+    validate_schedules([
+        ScheduleEntry(None, series, schedule, True, pos, kind)
+        for pos, (schedule, kind) in enumerate(entries)
+    ], update_period)
 
 
 def _resolve_bilibili_url(url: str) -> dict[str, Any]:
@@ -211,6 +225,9 @@ def cmd_show(args: argparse.Namespace) -> None:
 
     print(f"\n  ⏰ Cron ({len(cfg['cron'])} 条)")
     for sched in cfg["cron"]:
+        print(f"    {sched}")
+    print(f"  ⏰ 兜底 Cron ({len(cfg.get('retry_cron', []))} 条)")
+    for sched in cfg.get("retry_cron", []):
         print(f"    {sched}")
 
     print(f"\n  📊 同步状态")
@@ -367,6 +384,9 @@ def cmd_add(args: argparse.Namespace) -> None:
 
     print("\n=== Cron 设置 ===")
     cron_schedules = _interactive_collect_cron()
+    _validate_schedule_values(
+        data["series"], sync.get("update_period", "12h"), cron_schedules or [],
+    )
 
     # Summary
     print("\n" + "=" * 50)
@@ -527,6 +547,8 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
     existing_sync: dict[str, Any] = {}
     existing_source: dict[str, Any] = {}
     existing_pp: dict[str, Any] = {}
+    existing_cron: list[str] = []
+    existing_retry_cron: list[str] = []
     with db.transaction(db_path) as conn:
         existing_row = conn.execute("SELECT 1 FROM series WHERE series=?", (series,)).fetchone()
         if existing_row:
@@ -537,6 +559,8 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
                 existing_sync = cfg.get("sync", {})
                 existing_source = cfg.get("source", {})
                 existing_pp = cfg.get("paid_preview", {})
+                existing_cron = cfg.get("cron", [])
+                existing_retry_cron = cfg.get("retry_cron", [])
             else:
                 print(f"❌ 系列标识 '{series}' 已存在（使用 --update-existing 覆盖更新）")
                 sys.exit(EXIT_VALIDATION)
@@ -599,6 +623,10 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
         "min_duration_seconds": _get_sv("min_duration_seconds", 0),
         "max_duration_seconds": _get_sv("max_duration_seconds", 0),
     }
+    final_cron = cron_schedules or existing_cron
+    _validate_schedule_values(
+        series, sync["update_period"], final_cron, existing_retry_cron,
+    )
 
     # Source: existing values → draft → defaults
     if existing_source:
@@ -753,7 +781,9 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
         )
 
         if cron_schedules:
-            conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
+            conn.execute(
+                "DELETE FROM cron_schedule WHERE series=? AND kind='primary'", (series,),
+            )
             for pos, sched in enumerate(cron_schedules):
                 conn.execute(
                     "INSERT INTO cron_schedule (series, enabled, schedule, position) VALUES (?, 1, ?, ?)",
@@ -815,6 +845,16 @@ def cmd_edit(args: argparse.Namespace) -> None:
 
     print("\n=== Cron 设置 ===")
     cron_schedules = _interactive_collect_cron(cfg.get("cron"))
+    print("\n=== 兜底 Cron 设置 ===")
+    retry_schedules = _interactive_collect_cron(cfg.get("retry_cron"))
+    final_schedules = cfg.get("cron", []) if cron_schedules is None else cron_schedules
+    final_retry_schedules = (
+        cfg.get("retry_cron", []) if retry_schedules is None else retry_schedules
+    )
+    _validate_schedule_values(
+        args.series, new_sync.get("update_period", "12h"),
+        final_schedules, final_retry_schedules,
+    )
 
     if args.dry_run:
         print("\n⚠️  --dry-run 模式，不写入数据库")
@@ -892,12 +932,14 @@ def cmd_edit(args: argparse.Namespace) -> None:
         )
 
         # Cron — only update if user provided new schedules (not just Enter)
-        if cron_schedules is not None:
+        if cron_schedules is not None or retry_schedules is not None:
             conn.execute("DELETE FROM cron_schedule WHERE series=?", (args.series,))
-            for pos, sched in enumerate(cron_schedules):
+            entries = [(schedule, "primary") for schedule in final_schedules]
+            entries.extend((schedule, "retry") for schedule in final_retry_schedules)
+            for pos, (sched, kind) in enumerate(entries):
                 conn.execute(
-                    "INSERT INTO cron_schedule (series, enabled, schedule, position) VALUES (?, 1, ?, ?)",
-                    (args.series, sched, pos),
+                    "INSERT INTO cron_schedule (series, enabled, schedule, position, kind) VALUES (?, 1, ?, ?, ?)",
+                    (args.series, sched, pos, kind),
                 )
 
     print(f"\n✅ 系列 {args.series} 已更新")
@@ -1356,7 +1398,8 @@ def cmd_cron_show(args: argparse.Namespace) -> None:
         _run_json(args, {
             "series": args.series,
             "schedules": [
-                {"id": s.id, "schedule": s.schedule, "enabled": s.enabled, "position": s.position}
+                {"id": s.id, "schedule": s.schedule, "enabled": s.enabled,
+                 "position": s.position, "kind": s.kind}
                 for s in schedules
             ],
         })
@@ -1366,7 +1409,8 @@ def cmd_cron_show(args: argparse.Namespace) -> None:
         return
     print(f"\n=== Cron: {args.series} ===")
     for s in schedules:
-        print(f"  {_bool_str(s.enabled)}  {s.schedule}  (id={s.id}, pos={s.position})")
+        print(f"  {_bool_str(s.enabled)}  {s.schedule}  "
+              f"(kind={s.kind}, id={s.id}, pos={s.position})")
     print()
 
 
@@ -1469,14 +1513,22 @@ def cmd_scheduler_status(args: argparse.Namespace) -> None:
         print("  （无系列配置）")
         return
 
-    headers = ["系列", "启用", "调度数"]
+    is_systemd = args.scheduler_backend == "systemd"
+    headers = (["系列", "主Timer启用", "主Timer运行", "兜底Timer启用", "兜底Timer运行", "调度数"]
+               if is_systemd else ["系列", "启用", "调度数"])
     data = []
     for s in status_list:
-        data.append([
-            s["series"],
-            _bool_str(s["enabled"]),
-            str(s["schedule_count"] or 0),
-        ])
+        if is_systemd:
+            data.append([
+                s["series"], _bool_str(s["enabled"]), _bool_str(s["active"]),
+                _bool_str(s["retry_enabled"]), _bool_str(s["retry_active"]),
+                str(s["schedule_count"] or 0),
+            ])
+        else:
+            data.append([
+                s["series"], _bool_str(s["enabled"]),
+                str(s["schedule_count"] or 0),
+            ])
     _print_table(headers, data)
 
 

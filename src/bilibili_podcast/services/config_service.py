@@ -38,10 +38,11 @@ class ConfigService:
         row = self.conn.execute("SELECT * FROM paid_preview_policy WHERE series=?", (series,)).fetchone()
         return dict(row) if row else {}
 
-    def load_cron_schedules(self, series: str) -> list[str]:
+    def load_cron_schedules(self, series: str, kind: str = "primary") -> list[str]:
         rows = self.conn.execute(
-            "SELECT schedule FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
-            (series,),
+            "SELECT schedule FROM cron_schedule "
+            "WHERE series=? AND enabled=1 AND kind=? ORDER BY position",
+            (series, kind),
         ).fetchall()
         return [s["schedule"] for s in rows]
 
@@ -86,6 +87,7 @@ class ConfigService:
             "filters": self.load_filter_rules(series, only_enabled=False),
             "paid_preview": self.load_paid_preview(series),
             "cron": self.load_cron_schedules(series),
+            "retry_cron": self.load_cron_schedules(series, "retry"),
             "state": self.load_sync_state(series),
         }
 

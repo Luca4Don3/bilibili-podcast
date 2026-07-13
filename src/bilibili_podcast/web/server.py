@@ -581,26 +581,29 @@ async def sync_policy_update(
     if guard:
         return guard
 
-    with db.transaction(DB_PATH) as conn:
-        SyncPolicyService(conn).upsert(series, {
-            "page_size": page_size,
-            "incremental_page_size": incremental_page_size,
-            "max_pages": max_pages,
-            "max_requests_per_series": max_requests_per_series,
-            "request_interval_seconds": request_interval_seconds,
-            "request_jitter_seconds": request_jitter_seconds,
-            "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
-            "update_period": update_period,
-            "format": format,
-            "quality": quality,
-            "keep_last": keep_last,
-            "fetch_strategy": fetch_strategy,
-            "browser_fallback": browser_fallback,
-            "browser_wait_min_seconds": browser_wait_min_seconds,
-            "browser_wait_max_seconds": browser_wait_max_seconds,
-            "browser_fallback_cooldown_seconds": browser_fallback_cooldown_seconds,
-            "require_paid_state_confirmation": require_paid_state_confirmation,
-        })
+    try:
+        with db.transaction(DB_PATH) as conn:
+            SyncPolicyService(conn).upsert(series, {
+                "page_size": page_size,
+                "incremental_page_size": incremental_page_size,
+                "max_pages": max_pages,
+                "max_requests_per_series": max_requests_per_series,
+                "request_interval_seconds": request_interval_seconds,
+                "request_jitter_seconds": request_jitter_seconds,
+                "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
+                "update_period": update_period,
+                "format": format,
+                "quality": quality,
+                "keep_last": keep_last,
+                "fetch_strategy": fetch_strategy,
+                "browser_fallback": browser_fallback,
+                "browser_wait_min_seconds": browser_wait_min_seconds,
+                "browser_wait_max_seconds": browser_wait_max_seconds,
+                "browser_fallback_cooldown_seconds": browser_fallback_cooldown_seconds,
+                "require_paid_state_confirmation": require_paid_state_confirmation,
+            })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return RedirectResponse(url=f"/series/{series}/sync", status_code=302)
 
