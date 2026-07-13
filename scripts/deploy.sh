@@ -31,6 +31,38 @@ LOG_DIR="/var/log/bilibili-podcast"
 
 SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
 PYTHON_BIN="$VENV_DIR/bin/python3"
+CONSTRAINTS_FILE="$CODE_DIR/requirements.lock"
+PYTHON_SOURCE_VERSION="3.14.6"
+PLAYWRIGHT_PACKAGE_SPEC="playwright>=1.60,<2"
+SUPPORTED_PYTHON_CANDIDATES=(
+    /usr/local/bin/python3.14
+    /usr/bin/python3.14
+    /usr/local/bin/python3.13
+    /usr/bin/python3.13
+    /usr/local/bin/python3
+    /usr/bin/python3
+)
+FALLBACK_RUNTIME_PACKAGES=(
+    "aiohttp>=3.14.1,<4"
+    PyYAML
+    feedgen
+    lxml
+    pillow
+    requests
+    pycryptodomex
+    "curl_cffi>=0.15.0,<0.16"
+    "yt-dlp>=2026.6.9,<2027"
+    bilibili-api-python
+)
+REQUIRED_PYTHON_MODULES=(
+    sqlite3:sqlite3
+    yaml:PyYAML
+    aiohttp:aiohttp
+    curl_cffi:curl_cffi
+    feedgen:feedgen
+    lxml:lxml
+    bilibili_api:bilibili-api
+)
 
 echo "========================================"
 echo " Phase 2: SQLite 迁移部署"
@@ -122,35 +154,72 @@ if [ "$UNCOMMITTED" -gt 0 ] && [ "$APPLY" = true ]; then
     echo "  ⚠ 代码目录有 $UNCOMMITTED 个未提交文件（通常是 bilibili-podcast-env.sh）"
 fi
 
-# 查找系统 Python，优先 3.13
+# 查找系统 Python，优先 3.14，允许 3.13 回退
+_python_supported() {
+    "$1" -c "import sys; raise SystemExit(0 if (3, 13) <= sys.version_info[:2] < (3, 15) else 1)" \
+        >/dev/null 2>&1
+}
+
+_supported_python_candidates() {
+    printf '%s\n' "${SUPPORTED_PYTHON_CANDIDATES[@]}"
+}
+
 _find_system_python() {
-    for p in /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/bin/python3.11 \
-             /usr/bin/python3.10 /usr/bin/python3.9 /usr/bin/python3; do
-        if [ -x "$p" ]; then
+    local p
+    while IFS= read -r p; do
+        if [ -x "$p" ] && _python_supported "$p"; then
             echo "$p"
             return 0
         fi
-    done
+    done < <(_supported_python_candidates)
     return 1
 }
 
-# 下载并编译 Python 3.13.13
-_install_python_313() {
-    echo "  未找到系统 Python，下载编译 Python 3.13.13 ..."
-    local SRC="/tmp/Python-3.13.13"
-    if [ ! -d "$SRC" ]; then
-        curl -sL "https://www.python.org/ftp/python/3.13.13/Python-3.13.13.tgz" \
-            | tar xz -C /tmp 2>&1 | tail -1
+_pip_install() {
+    if [ -f "$CONSTRAINTS_FILE" ]; then
+        "$VENV_DIR/bin/pip" install -c "$CONSTRAINTS_FILE" "$@"
+    else
+        "$VENV_DIR/bin/pip" install "$@"
     fi
-    cd "$SRC"
-    echo "  配置 (--enable-shared --prefix=/usr/local) ..."
-    ./configure --enable-shared --prefix=/usr/local --quiet 2>&1 | tail -1 | sed 's/^/  /'
-    echo "  编译 ..."
-    make -j$(nproc) 2>&1 | tail -3 | sed 's/^/  /'
-    echo "  安装到 /usr/local ..."
-    make install 2>&1 | tail -3 | sed 's/^/  /'
-    ldconfig
-    echo "/usr/local/bin/python3.13"
+}
+
+_log_constraints_status() {
+    if [ -f "$CONSTRAINTS_FILE" ]; then
+        echo "  使用依赖约束: $CONSTRAINTS_FILE"
+    else
+        echo "  ⚠ 未找到依赖约束文件: $CONSTRAINTS_FILE"
+    fi
+}
+
+# 下载并编译 Python 3.14.6
+_install_python_314() {
+    {
+        echo "  未找到 Python 3.14/3.13，下载编译 Python ${PYTHON_SOURCE_VERSION} ..."
+        local SRC="/tmp/Python-${PYTHON_SOURCE_VERSION}"
+        if [ ! -d "$SRC" ]; then
+            curl -sL "https://www.python.org/ftp/python/${PYTHON_SOURCE_VERSION}/Python-${PYTHON_SOURCE_VERSION}.tgz" \
+                | tar xz -C /tmp 2>&1 | tail -1
+        fi
+        cd "$SRC"
+        echo "  配置 (--enable-shared --prefix=/usr/local) ..."
+        ./configure --enable-shared --prefix=/usr/local --quiet 2>&1 | tail -1 | sed 's/^/  /'
+        echo "  编译 ..."
+        make -j$(nproc) 2>&1 | tail -3 | sed 's/^/  /'
+        echo "  安装到 /usr/local ..."
+        make install 2>&1 | tail -3 | sed 's/^/  /'
+        ldconfig
+    } >&2
+    echo "/usr/local/bin/python3.14"
+}
+
+_verify_required_modules() {
+    local entry mod label
+    ALL_OK=true
+    for entry in "${REQUIRED_PYTHON_MODULES[@]}"; do
+        mod="${entry%%:*}"
+        label="${entry#*:}"
+        _verify_module "$mod" "$label" || ALL_OK=false
+    done
 }
 
 # 如果 venv 不存在，自动创建
@@ -159,11 +228,11 @@ if [ ! -f "$PYTHON_BIN" ]; then
     SYSTEM_PY=$(_find_system_python) || true
     if [ -z "$SYSTEM_PY" ]; then
         if [ "$APPLY" = true ]; then
-            SYSTEM_PY=$(_install_python_313)
+            SYSTEM_PY=$(_install_python_314)
             PYTHON_BIN="$SYSTEM_PY"
         else
-            echo "  (干跑，将下载编译 Python 3.13.13 并创建 venv)"
-            SYSTEM_PY="/usr/local/bin/python3.13"
+            echo "  (干跑，将下载编译 Python 3.14.6 并创建 venv)"
+            SYSTEM_PY="/usr/local/bin/python3.14"
         fi
     else
         echo "  找到系统 Python: $($SYSTEM_PY --version 2>&1)"
@@ -173,18 +242,38 @@ if [ ! -f "$PYTHON_BIN" ]; then
         echo "  ✓ venv 已创建: $VENV_DIR"
         PYTHON_BIN="$VENV_DIR/bin/python3"
         SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
+    else
+        PYTHON_BIN="$SYSTEM_PY"
     fi
 fi
 
-echo "  ✓ Python: $("$PYTHON_BIN" --version 2>&1)"
+if [ -x "$PYTHON_BIN" ]; then
+    echo "  ✓ Python: $("$PYTHON_BIN" --version 2>&1)"
+elif [ "$APPLY" = true ]; then
+    echo "  ✗ Python 不存在或不可执行: $PYTHON_BIN"
+    exit 1
+else
+    echo "  (干跑，目标 Python 尚不存在，将在 --apply 时创建)"
+fi
+
+if [ -x "$PYTHON_BIN" ] && ! _python_supported "$PYTHON_BIN"; then
+    echo "  ✗ Python 版本不受支持，需 3.13.x 或 3.14.x"
+    exit 1
+fi
 
 # ── 2. _sqlite3 编译 ──────────────────────────────
 echo "▶ [2/9] Python 版本检测 + _sqlite3 编译 ..."
-PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [ -x "$PYTHON_BIN" ]; then
+    PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+else
+    PY_VER="planned"
+fi
 echo "  版本: $PY_VER"
 
 SQLITE3_OK=false
-if "$PYTHON_BIN" -c "import sqlite3" 2>/dev/null; then
+if [ ! -x "$PYTHON_BIN" ] && [ "$APPLY" != true ]; then
+    echo "  (干跑，将在目标 Python 创建后验证 sqlite3)"
+elif "$PYTHON_BIN" -c "import sqlite3" 2>/dev/null; then
     SQLITE3_OK=true
     echo "  ✓ sqlite3"
 else
@@ -230,24 +319,30 @@ else
             }
         fi
 
-        # 编译失败 → 回退 Python 3.11
+        # 编译失败 → 尝试用其他兼容 Python 重建 venv
         if [ "$SQLITE3_OK" != true ]; then
-            echo "  ⚠ _sqlite3 编译失败，尝试用 Python 3.11 重建 venv"
-            if [ -f /usr/bin/python3.11 ] && /usr/bin/python3.11 -c "import sqlite3" 2>/dev/null; then
-                TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-                mv "$VENV_DIR" "${VENV_DIR}-py313.${TIMESTAMP}"
-                /usr/bin/python3.11 -m venv "$VENV_DIR"
-                PYTHON_BIN="$VENV_DIR/bin/python3"
-                SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
-                SQLITE3_OK=true
-                echo "  ✓ venv 已重建（Python 3.11）"
-            else
-                echo "  ✗ Python 3.11 也不支持 sqlite3，中止"
+            echo "  ⚠ _sqlite3 编译失败，尝试用其他 Python 3.14/3.13 重建 venv"
+            ALT_PY=""
+            while IFS= read -r p; do
+                if [ -x "$p" ] && _python_supported "$p" && "$p" -c "import sqlite3" 2>/dev/null; then
+                    ALT_PY="$p"
+                    break
+                fi
+            done < <(_supported_python_candidates)
+            if [ -z "$ALT_PY" ]; then
+                echo "  ✗ 未找到支持 sqlite3 的 Python 3.14/3.13，中止"
                 exit 1
             fi
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            mv "$VENV_DIR" "${VENV_DIR}-py${PY_VER}.${TIMESTAMP}"
+            "$ALT_PY" -m venv "$VENV_DIR"
+            PYTHON_BIN="$VENV_DIR/bin/python3"
+            SYNC_BIN="$VENV_DIR/bin/bilibili-podcast"
+            SQLITE3_OK=true
+            echo "  ✓ venv 已重建 ($("$PYTHON_BIN" --version 2>&1))"
         fi
     else
-        echo "  (干跑，将尝试编译 _sqlite3 或回退 Python 3.11)"
+        echo "  (干跑，将尝试编译 _sqlite3 或回退其他 Python 3.14/3.13)"
     fi
 fi
 
@@ -274,9 +369,11 @@ fi
 echo "▶ [4/9] 安装 Python 包 ..."
 
 if [ "$APPLY" = true ]; then
-    # 先尝试正常安装（含 bilibili-api-python 从 GitHub dev 分支）
+    _log_constraints_status
+
+    # 先尝试正常安装（含固定 commit 的 bilibili-api-python）
     INSTALL_OK=false
-    if PIP_OUTPUT=$("$VENV_DIR/bin/pip" install -e "$CODE_DIR" 2>&1); then
+    if PIP_OUTPUT=$(_pip_install -e "$CODE_DIR" 2>&1); then
         INSTALL_OK=true
         echo "$PIP_OUTPUT" | tail -3 | sed 's/^/  /'
     else
@@ -286,9 +383,7 @@ if [ "$APPLY" = true ]; then
 
     # 失败时手动安装所有依赖，bilibili-api-python 走 PyPI
     if [ "$INSTALL_OK" != true ]; then
-        "$VENV_DIR/bin/pip" install \
-            "aiohttp==3.12.15" PyYAML feedgen lxml pillow requests pycryptodomex curl_cffi \
-            bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
+        _pip_install "${FALLBACK_RUNTIME_PACKAGES[@]}" 2>&1 | tail -3 | sed 's/^/  /'
 
         # 装回项目本身（不需依赖解析）
         "$VENV_DIR/bin/pip" install -e "$CODE_DIR" --no-deps 2>&1 | tail -3 | sed 's/^/  /'
@@ -296,7 +391,11 @@ if [ "$APPLY" = true ]; then
 
     echo "  ✓ 包已更新"
 else
-    echo "  (干跑，执行命令: pip install -e $CODE_DIR)"
+    if [ -f "$CONSTRAINTS_FILE" ]; then
+        echo "  (干跑，执行命令: pip install -c $CONSTRAINTS_FILE -e $CODE_DIR)"
+    else
+        echo "  (干跑，执行命令: pip install -e $CODE_DIR)"
+    fi
     echo "  (如果 GitHub 不可达，回退: pip install aiohttp PyYAML ... bilibili-api-python)"
 fi
 
@@ -314,14 +413,7 @@ _verify_module() {
     return 1
 }
 
-ALL_OK=true
-
-_verify_module sqlite3 || ALL_OK=false
-_verify_module yaml PyYAML || ALL_OK=false
-_verify_module aiohttp || ALL_OK=false
-_verify_module feedgen || ALL_OK=false
-_verify_module lxml || ALL_OK=false
-_verify_module "bilibili_api" "bilibili-api" || ALL_OK=false
+_verify_required_modules
 
 # yt-dlp 单独验证
 if "$VENV_DIR/bin/yt-dlp" --version >/dev/null 2>&1; then
@@ -333,19 +425,13 @@ fi
 
 if [ "$ALL_OK" != true ] && [ "$APPLY" = true ]; then
     echo "  ⚠ 部分模块缺失，尝试安装缺失项 ..."
-    "$VENV_DIR/bin/pip" install \
-        "aiohttp==3.12.15" PyYAML feedgen lxml bilibili-api-python 2>&1 | tail -3 | sed 's/^/  /'
-    "$VENV_DIR/bin/pip" install -U yt-dlp 2>&1 | tail -1 | sed 's/^/  /'
+    _pip_install "${FALLBACK_RUNTIME_PACKAGES[@]}" 2>&1 | tail -3 | sed 's/^/  /'
 
     # 最终确认
-    _verify_module sqlite3 || true
-    _verify_module yaml || true
-    _verify_module aiohttp || true
-    _verify_module feedgen || true
-    _verify_module lxml || true
-    _verify_module "bilibili_api" "bilibili-api" || {
+    _verify_required_modules
+    if ! "$PYTHON_BIN" -c "import bilibili_api" 2>/dev/null; then
         echo "  ✗ 严重: bilibili-api-python 安装失败，后续步骤可能出错"
-    }
+    fi
 fi
 
 # ── 5b. Playwright/Chromium ──────────────────────────
@@ -357,8 +443,8 @@ if "$PYTHON_BIN" -c "import playwright" 2>/dev/null; then
 else
     if [ "$APPLY" = true ]; then
         echo "  安装 playwright 包（优先国内镜像）..."
-        PIP_OUT="$( "$VENV_DIR/bin/pip" install playwright -i https://pypi.tuna.tsinghua.edu.cn/simple 2>&1 )" || \
-        PIP_OUT="$( "$VENV_DIR/bin/pip" install playwright 2>&1 )" || {
+        PIP_OUT="$( _pip_install -i https://pypi.tuna.tsinghua.edu.cn/simple "$PLAYWRIGHT_PACKAGE_SPEC" 2>&1 )" || \
+        PIP_OUT="$( _pip_install "$PLAYWRIGHT_PACKAGE_SPEC" 2>&1 )" || {
             echo "  ✗ playwright 安装失败"
             echo "$PIP_OUT" | tail -5 | sed 's/^/  /'
             exit 1
@@ -653,7 +739,7 @@ fi
 if [ "$APPLY" = true ]; then
     echo ""
     echo "▶ 清理临时文件 ..."
-    rm -rf /tmp/Python-3.13.13 /tmp/Python-3.13.*  2>/dev/null || true
+    rm -rf /tmp/Python-3.14.6 /tmp/Python-3.14.* /tmp/Python-3.13.*  2>/dev/null || true
     echo "  ✓ 已清理 /tmp/Python-*"
 fi
 
