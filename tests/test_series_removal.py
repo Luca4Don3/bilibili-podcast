@@ -1,4 +1,7 @@
 from pathlib import Path
+import sqlite3
+
+import pytest
 
 from bilibili_podcast import db
 from bilibili_podcast.services.series_removal_service import SeriesRemovalService
@@ -104,6 +107,58 @@ def test_remove_deletes_database_and_local_artifacts(tmp_path: Path) -> None:
             assert conn.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE series='demo'"
             ).fetchone()[0] == 0
+
+
+def test_remove_rolls_back_files_and_users_when_database_delete_fails(tmp_path: Path) -> None:
+    service, db_path = _service(tmp_path)
+    _insert_series(db_path, "demo", 123)
+    media = tmp_path / "media" / "demo" / "a.mp3"
+    media.parent.mkdir(parents=True)
+    media.write_text("audio")
+    rss = tmp_path / "rss" / "demo.xml"
+    rss.parent.mkdir()
+    rss.write_text("<rss/>")
+    users_conf = tmp_path / "rss-publish-users.conf"
+    original_users = "<user_token>:demo,other\n"
+    users_conf.write_text(original_users)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "CREATE TRIGGER prevent_demo_delete BEFORE DELETE ON series "
+            "WHEN OLD.series='demo' BEGIN SELECT RAISE(ABORT, 'blocked'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="blocked"):
+        service.remove("demo")
+
+    assert media.read_text() == "audio"
+    assert rss.read_text() == "<rss/>"
+    assert users_conf.read_text() == original_users
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM series WHERE series='demo'"
+        ).fetchone() is not None
+    assert not list(tmp_path.rglob("*.bilipod-remove-*"))
+
+
+def test_remove_rejects_changed_invalid_rss_users_before_staging(tmp_path: Path) -> None:
+    service, db_path = _service(tmp_path)
+    _insert_series(db_path, "demo", 123)
+    media = tmp_path / "media" / "demo" / "a.mp3"
+    media.parent.mkdir(parents=True)
+    media.write_text("audio")
+    service.users_conf = tmp_path / "rss-users.toml"
+    service.users_conf.write_text(
+        '[users.example]\ntoken = "<user_token>"\nseries = "demo"\n'
+    )
+
+    with pytest.raises(ValueError, match="series list"):
+        service.remove("demo")
+
+    assert media.read_text() == "audio"
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT 1 FROM series WHERE series='demo'"
+        ).fetchone() is not None
 
 
 def test_list_series_for_uid_returns_all_matching_series(tmp_path: Path) -> None:

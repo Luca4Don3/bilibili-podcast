@@ -233,6 +233,7 @@ def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tm
     assert "Manual paid item" in rss
     assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in rss
     run.assert_not_called()
+    assert not list(tmp_path.rglob("*.backup-*"))
 
     src.write_text("replacement")
     original_rss = (rss_root / "paidweb.xml").read_text()
@@ -248,6 +249,7 @@ def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tm
     assert "error=" in failed.headers["location"]
     assert (media_root / "paidweb" / f"{bvid}_64K.mp3").read_text() == "audio"
     assert (rss_root / "paidweb.xml").read_text() == original_rss
+    assert not list(tmp_path.rglob("*.backup-*"))
 
 
 def test_manual_media_attach_rejects_unknown_series(monkeypatch, tmp_path: Path) -> None:

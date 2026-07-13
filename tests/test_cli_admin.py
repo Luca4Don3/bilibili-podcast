@@ -1471,6 +1471,7 @@ def test_paid_add_item_converts_media_and_writes_single_metadata(tmp_path: Path,
     content = rss_file.read_text()
     assert "Single manual item" in content
     assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in content
+    assert not list(tmp_path.rglob("*.backup-*"))
 
 
 def test_paid_add_item_existing_media_fails_before_network_or_transcode(tmp_path: Path, monkeypatch) -> None:
@@ -1617,6 +1618,7 @@ def test_paid_add_item_rebuild_failure_restores_replaced_files(tmp_path: Path, m
     assert media_file.read_bytes() == b"old-media"
     assert json_file.read_text() == '{"bvid":"old"}'
     assert rss_file.read_text() == "<rss>old</rss>"
+    assert not list(tmp_path.rglob("*.backup-*"))
 
 
 def test_paid_refresh_metadata_writes_192K_json(tmp_path: Path, monkeypatch) -> None:

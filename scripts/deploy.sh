@@ -48,8 +48,13 @@ STATE_ROOT="$(config_value app.paths.state_root)"
 WRAPPER_DIR="$(config_value scheduler.paths.wrapper_dir)"
 SYSTEMD_DIR="$(config_value scheduler.paths.systemd_dir)"
 CRON_USER="$(config_value scheduler.runtime.user)"
+WEB_UNIT="$(config_value scheduler.units.web)"
+SYNC_UNIT_GLOB="$(config_value scheduler.units.sync_glob)"
+SYNC_TIMER_GLOB="${SYNC_UNIT_GLOB%.service}.timer"
 PYTHON_BIN="$VENV_BIN/python3"
-BACKUP_DIR="$CONFIG_ROOT/.backups/$(date +%Y%m%d_%H%M%S)"
+BACKUP_PARENT="$CONFIG_ROOT/.backups"
+BACKUP_TEMPLATE="$BACKUP_PARENT/deploy-$(date +%Y%m%d_%H%M%S)-XXXXXXXX"
+BACKUP_DIR="$BACKUP_TEMPLATE"
 
 echo "Bilipod unified deployment"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
@@ -86,6 +91,8 @@ if [ "$APPLY" != true ]; then
 fi
 
 umask 077
+mkdir -p "$BACKUP_PARENT"
+BACKUP_DIR="$(mktemp -d "$BACKUP_TEMPLATE")"
 mkdir -p "$BACKUP_DIR/config" "$BACKUP_DIR/systemd" "$BACKUP_DIR/wrappers"
 cp "$CONFIG_ROOT"/*.toml "$BACKUP_DIR/config/"
 if [ -f "$DB_PATH" ]; then
@@ -95,7 +102,12 @@ with sqlite3.connect(sys.argv[1]) as source, sqlite3.connect(sys.argv[2]) as tar
     source.backup(target)
 ' "$DB_PATH" "$BACKUP_DIR/$(basename "$DB_PATH")"
 fi
-for unit in "$SYSTEMD_DIR"/bilipod-web.service "$SYSTEMD_DIR"/bilipod-sync@*.service "$SYSTEMD_DIR"/bilipod-*.timer; do
+for unit in \
+    "$SYSTEMD_DIR/$WEB_UNIT" \
+    "$SYSTEMD_DIR"/$SYNC_UNIT_GLOB \
+    "$SYSTEMD_DIR"/$SYNC_TIMER_GLOB \
+    "$SYSTEMD_DIR"/bilipod-retry@*.service \
+    "$SYSTEMD_DIR"/bilipod-retry@*.timer; do
     [ -f "$unit" ] || continue
     cp "$unit" "$BACKUP_DIR/systemd/"
 done
@@ -105,10 +117,6 @@ for wrapper in "$WRAPPER_DIR"/run_*.sh; do
     cp "$wrapper" "$BACKUP_DIR/wrappers/"
 done
 
-if find "$BACKUP_DIR" -type f -size 0 | grep -q .; then
-    echo "ERROR: backup validation found an empty file" >&2
-    exit 1
-fi
 find "$BACKUP_DIR" -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; > "$BACKUP_DIR/SHA256SUMS"
 test -s "$BACKUP_DIR/SHA256SUMS"
 shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"

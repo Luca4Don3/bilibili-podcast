@@ -1931,20 +1931,48 @@ def _write_metadata_file(json_root: Path, series: str, bvid: str, quality: str, 
     return dst
 
 
-def _file_backup(path: Path) -> tuple[bool, bytes]:
+def _file_backup(path: Path) -> tuple[bool, Path | None]:
     if not path.exists():
-        return False, b""
-    return True, path.read_bytes()
+        return False, None
+    import shutil
+    import tempfile
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.backup-", dir=path.parent)
+    os.close(fd)
+    backup = Path(name)
+    try:
+        shutil.copy2(path, backup)
+    except Exception:
+        backup.unlink(missing_ok=True)
+        raise
+    return True, backup
 
 
-def _restore_file(path: Path, backup: tuple[bool, bytes]) -> None:
-    existed, data = backup
+def _restore_file(path: Path, backup: tuple[bool, Path | None]) -> None:
+    existed, backup_path = backup
     if existed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        path.chmod(0o644)
+        if backup_path is None:
+            raise RuntimeError("file backup is missing")
+        backup_path.replace(path)
     else:
         path.unlink(missing_ok=True)
+
+
+def _discard_file_backup(backup: tuple[bool, Path | None]) -> None:
+    _, backup_path = backup
+    if backup_path is not None:
+        backup_path.unlink(missing_ok=True)
+
+
+def _file_backups(*paths: Path) -> tuple[tuple[bool, Path | None], ...]:
+    backups: list[tuple[bool, Path | None]] = []
+    try:
+        for path in paths:
+            backups.append(_file_backup(path))
+    except Exception:
+        for backup in backups:
+            _discard_file_backup(backup)
+        raise
+    return tuple(backups)
 
 
 def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
@@ -2200,9 +2228,9 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         print("   使用 --replace 覆盖")
         sys.exit(EXIT_VALIDATION)
 
-    media_backup = _file_backup(media_dst)
-    json_backup = _file_backup(json_dst)
-    rss_backup = _file_backup(rss_dst)
+    media_backup, json_backup, rss_backup = _file_backups(
+        media_dst, json_dst, rss_dst,
+    )
     try:
         metadata = _fetch_single_video_metadata(
             args.url, args.cookie_file or str(config.sync.paths.cookie_file)
@@ -2250,6 +2278,9 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         _restore_file(rss_dst, rss_backup)
         print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
         sys.exit(EXIT_SYNC_FAIL)
+
+    for backup in (media_backup, json_backup, rss_backup):
+        _discard_file_backup(backup)
 
     result = {
         "series": args.series,
