@@ -76,6 +76,45 @@ paid_preview:
     assert config.paid_preview["enabled"] is True
 
 
+def test_series_config_normalizes_exclude_season_ids(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        "season-filter",
+        """
+series: season-filter
+title: Season Filter
+author: Demo Author
+source:
+  uid: 123456
+filters:
+  exclude_season_ids: [123, "456"]
+""",
+    )
+
+    config = SeriesConfig.from_yaml(config_path)
+
+    assert config.filters["exclude_season_ids"] == [123, 456]
+
+
+def test_series_config_rejects_invalid_exclude_season_ids(tmp_path):
+    config_path = _write_config(
+        tmp_path,
+        "bad-season-filter",
+        """
+series: bad-season-filter
+title: Bad Season Filter
+author: Demo Author
+source:
+  uid: 123456
+filters:
+  exclude_season_ids: [0]
+""",
+    )
+
+    with pytest.raises(ValueError, match="positive integers"):
+        SeriesConfig.from_yaml(config_path)
+
+
 def test_series_config_rejects_unsafe_series_slug(tmp_path):
     config_path = tmp_path / "bad slug.yaml"
     config_path.write_text(

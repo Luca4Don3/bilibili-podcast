@@ -16,6 +16,7 @@ SOURCE_TYPE_VALUES = {"space", "season", "series"}
 RULE_TYPE_VALUES = {
     "exclude_paid", "exclude_bvid", "advertisement_bvid",
     "exclude_keyword", "advertisement_keyword", "include_keyword",
+    "exclude_season_id",
 }
 SCHEDULER_BACKEND_SQL = """
 CREATE TABLE IF NOT EXISTS scheduler_backend (
@@ -373,6 +374,7 @@ def _row_to_config(conn: sqlite3.Connection, row) -> SeriesConfig:
         "exclude_paid": True,
         "exclude_bvids": [],
         "advertisement_bvids": [],
+        "exclude_season_ids": [],
         "exclude_keywords": [],
         "advertisement_keywords": [],
         "include_keywords": [],
@@ -386,6 +388,8 @@ def _row_to_config(conn: sqlite3.Connection, row) -> SeriesConfig:
             filters["exclude_bvids"].append(val)
         elif rt == "advertisement_bvid":
             filters["advertisement_bvids"].append(val)
+        elif rt == "exclude_season_id":
+            filters["exclude_season_ids"].append(int(val))
         elif rt == "exclude_keyword":
             filters["exclude_keywords"].append(val)
         elif rt == "advertisement_keyword":
