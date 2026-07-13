@@ -81,3 +81,19 @@ def test_http_only_netscape_cookies_are_parsed(tmp_path):
 
     assert cookies[0]["name"] == "SESSDATA"
     assert cookies[0]["domain"] == ".bilibili.com"
+
+
+def test_exclude_season_ids_filters_matching_raw_season_only():
+    config = _paid_preview_config()
+    config.filters = {"exclude_paid": False, "exclude_season_ids": [5492168]}
+    config.paid_preview = {"enabled": False}
+    episodes = [
+        {"bvid": "BV_SEASON", "title": "Excluded", "raw": {"season_id": 5492168}},
+        {"bvid": "BV_ZERO", "title": "Zero", "raw": {"season_id": 0}},
+        {"bvid": "BV_MISSING", "title": "Missing", "raw": {}},
+    ]
+
+    filtered, excluded = apply_filters(config, episodes)
+
+    assert [episode["bvid"] for episode in filtered] == ["BV_ZERO", "BV_MISSING"]
+    assert excluded["season"] == {"BV_SEASON"}

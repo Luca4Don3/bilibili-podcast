@@ -61,6 +61,13 @@ def _bool_str(val: Any) -> str:
     return "✅ 启用" if val else "❌ 禁用"
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _run_json(args: argparse.Namespace, data: Any) -> None:
     """Print data as JSON and exit."""
     print(json.dumps(data, ensure_ascii=False, default=str))
@@ -370,7 +377,7 @@ def cmd_add(args: argparse.Namespace) -> None:
     print(f"  作者: {data['author']}")
     print(f"  来源: {source['type']} (UID={source['uid']})")
     print(f"  同步策略: 质量={sync.get('quality', '64K')}, 保留={sync.get('keep_last', 100)}")
-    print(f"  过滤规则: {len(filters[0]) + len(filters[1]) + len(filters[2]) + len(filters[3]) + len(filters[4])} 条")
+    print(f"  过滤规则: {sum(len(values) for values in filters)} 条")
     print(f"  Cron: {len(cron_schedules)} 条")
     print()
 
@@ -454,6 +461,9 @@ def cmd_add(args: argparse.Namespace) -> None:
         for kw in filters[4]:  # include_keywords
             conn.execute("INSERT INTO filter_rule (series, rule_type, value, position) VALUES (?, ?, ?, ?)",
                          (data["series"], "include_keyword", kw, pos)); pos += 1
+        for season_id in filters[5]:  # exclude_season_ids
+            conn.execute("INSERT INTO filter_rule (series, rule_type, value, position) VALUES (?, ?, ?, ?)",
+                         (data["series"], "exclude_season_id", str(season_id), pos)); pos += 1
 
         conn.execute(
             """INSERT INTO paid_preview_policy (series, enabled, retry_after_days)
@@ -559,6 +569,7 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
         args.exclude_keyword if args.exclude_keyword else [],
         args.ad_keyword if args.ad_keyword else [],
         args.include_keyword if args.include_keyword else [],
+        args.exclude_season_id if args.exclude_season_id else [],
     )
 
     paid_preview_enabled = False
@@ -722,6 +733,7 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
             ("exclude_keyword", filters[2]),
             ("advertisement_keyword", filters[3]),
             ("include_keyword", filters[4]),
+            ("exclude_season_id", filters[5]),
         ]
         for rtype, values in filter_type_map:
             for val in values:
@@ -942,6 +954,9 @@ def cmd_filters_add(args: argparse.Namespace) -> None:
     if args.ad_bvid:
         for bvid in args.ad_bvid:
             pairs.append(("advertisement_bvid", bvid))
+    if args.exclude_season_id:
+        for season_id in args.exclude_season_id:
+            pairs.append(("exclude_season_id", str(season_id)))
 
     if not pairs and not args.exclude_paid:
         print("⚠️ 未提供任何规则参数。使用 --exclude-keyword, --include-keyword, --ad-keyword, --exclude-bvid, --ad-bvid")
@@ -989,6 +1004,8 @@ def cmd_filters_remove(args: argparse.Namespace) -> None:
         conditions.append(("exclude_bvid", bvid))
     for bvid in args.ad_bvid:
         conditions.append(("advertisement_bvid", bvid))
+    for season_id in args.exclude_season_id:
+        conditions.append(("exclude_season_id", str(season_id)))
 
     if not conditions and not args.exclude_paid:
         print("⚠️ 未提供规则参数")
@@ -1046,6 +1063,7 @@ def cmd_filters_import(args: argparse.Namespace) -> None:
         "exclude_bvid": "exclude_bvid",
         "ad_bvid": "advertisement_bvid",
         "advertisement_bvid": "advertisement_bvid",
+        "exclude_season_id": "exclude_season_id",
     }
     rtype = rule_type_map.get(args.type)
     if not rtype:
@@ -1062,6 +1080,13 @@ def cmd_filters_import(args: argparse.Namespace) -> None:
     if not lines:
         print("⚠️ 文件为空，无规则可导入")
         return
+
+    if rtype == "exclude_season_id":
+        try:
+            lines = [str(_positive_int(line)) for line in lines]
+        except (TypeError, ValueError, argparse.ArgumentTypeError) as exc:
+            print(f"❌ 合集 ID 必须是正整数: {exc}")
+            sys.exit(EXIT_VALIDATION)
 
     pairs = [(rtype, val) for val in lines]
 
@@ -1665,6 +1690,7 @@ def _interactive_collect_filters() -> tuple:
     exclude_keywords: list[str] = []
     ad_keywords: list[str] = []
     include_keywords: list[str] = []
+    exclude_season_ids: list[int] = []
 
     print("  输入过滤规则，每行一条，空行结束。")
     print("  黑名单关键词:")
@@ -1708,7 +1734,17 @@ def _interactive_collect_filters() -> tuple:
         else:
             print(f"    ⚠️ 不是有效的 BVID: {line}（应以 BV 开头，共 12 位）")
 
-    return (exclude_bvids, ad_bvids, exclude_keywords, ad_keywords, include_keywords)
+    print("  排除合集 ID:")
+    while True:
+        line = input("    > ").strip()
+        if not line:
+            break
+        try:
+            exclude_season_ids.append(_positive_int(line))
+        except (ValueError, argparse.ArgumentTypeError):
+            print(f"    ⚠️ 不是有效的合集 ID: {line}（应为正整数）")
+
+    return (exclude_bvids, ad_bvids, exclude_keywords, ad_keywords, include_keywords, exclude_season_ids)
 
 
 def _interactive_collect_cron(existing: list[str] | None = None) -> list[str] | None:
@@ -1973,6 +2009,36 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
         credential = load_cookie_file(cookie_file)
 
     print(f"🔄 刷新 metadata: {args.series} ...")
+    requested_bvid = args.bvid or (_bvid_from_text(args.url) if args.url else "")
+    if args.bvid or args.url:
+        if not requested_bvid or not validation.validate_bvid(requested_bvid):
+            print(f"❌ 无效 BVID 或视频 URL: {args.bvid or args.url}")
+            sys.exit(EXIT_VALIDATION)
+        video_url = args.url or f"https://www.bilibili.com/video/{requested_bvid}/"
+        try:
+            metadata = _fetch_single_video_metadata(video_url, cookie_file or None)
+        except RuntimeError as exc:
+            print(f"❌ API 获取失败: {exc}")
+            sys.exit(EXIT_SYNC_FAIL)
+        metadata_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id")
+        if metadata_bvid and metadata_bvid != requested_bvid:
+            print(f"❌ metadata BVID 与请求不一致: {metadata_bvid} != {requested_bvid}")
+            sys.exit(EXIT_VALIDATION)
+        quality = _get_series_quality(db_path, args.series)
+        normalized = _episode_from_metadata(metadata, requested_bvid)
+        path = _write_metadata_file(Path(args.json_root), args.series, requested_bvid, quality, normalized)
+        result = {
+            "series": args.series,
+            "bvid": requested_bvid,
+            "metadata_written": 1,
+            "json_path": str(path),
+        }
+        if _should_json(args):
+            _run_json(args, result)
+        else:
+            print(f"  ✅ metadata 已刷新: {path.name}")
+        return
+
     try:
         if config.source.get("sid"):
             info, episodes, count = asyncio.run(fetch_series_episodes(config, credential))
@@ -2402,6 +2468,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--ad-keyword", action="append", default=[], help="广告关键词")
     p_add.add_argument("--exclude-bvid", action="append", default=[], help="排除 BVID")
     p_add.add_argument("--ad-bvid", action="append", default=[], help="广告 BVID")
+    p_add.add_argument("--exclude-season-id", action="append", type=_positive_int, default=[], help="排除合集 ID")
     p_add.add_argument("--keep-last", type=int, help="RSS 保留条数")
     p_add.add_argument("--update-period", help="更新周期（如 12h）")
     p_add.add_argument("--quality", choices=["64K", "132K", "192K"], help="音频质量")
@@ -2439,6 +2506,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fa.add_argument("--ad-keyword", action="append", default=[], help="广告关键词")
     p_fa.add_argument("--exclude-bvid", action="append", default=[], help="排除 BVID")
     p_fa.add_argument("--ad-bvid", action="append", default=[], help="广告 BVID")
+    p_fa.add_argument("--exclude-season-id", action="append", type=_positive_int, default=[], help="排除合集 ID")
     p_fa.add_argument("--exclude-paid", action="store_true", help="排除付费内容")
     p_fa.add_argument("--yes", dest="fa_yes", action="store_true", help="跳过确认")
 
@@ -2451,6 +2519,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fr.add_argument("--ad-keyword", action="append", default=[], help="广告关键词")
     p_fr.add_argument("--exclude-bvid", action="append", default=[], help="排除 BVID")
     p_fr.add_argument("--ad-bvid", action="append", default=[], help="广告 BVID")
+    p_fr.add_argument("--exclude-season-id", action="append", type=_positive_int, default=[], help="排除合集 ID")
     p_fr.add_argument("--exclude-paid", action="store_true", help="排除付费内容")
     p_fr.add_argument("--delete", action="store_true", help="物理删除（默认仅禁用）")
 
@@ -2473,6 +2542,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_fi.add_argument("--type", required=True, choices=[
         "exclude_keyword", "include_keyword", "ad_keyword",
         "exclude_bvid", "ad_bvid",
+        "exclude_season_id",
     ], help="规则类型")
     p_fi.add_argument("--file", required=True, help="规则文件，每行一条")
 
@@ -2593,6 +2663,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_refresh.add_argument("series")
     p_refresh.add_argument("--json-root", default="/var/lib/bilipod/json", help="JSON metadata 目录")
     p_refresh.add_argument("--cookie-file", help="Netscape cookie 文件路径")
+    refresh_target = p_refresh.add_mutually_exclusive_group()
+    refresh_target.add_argument("--bvid", help="仅刷新指定 BVID")
+    refresh_target.add_argument("--url", help="仅刷新指定 B 站视频 URL")
     p_refresh.set_defaults(handler=cmd_paid_refresh_metadata)
 
     p_list = paid_sub.add_parser("list-missing", help="列出缺失 media 的条目")

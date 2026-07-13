@@ -111,6 +111,10 @@
     <p class="text-muted">广告 BV 号黑名单。每行一个。</p>
     <textarea name="advertisement_bvids" rows="4" placeholder="BV1zz99999">{{ filters.advertisement_bvids | join('\n') }}</textarea>
 
+    <h2>🗂️ 排除合集 ID</h2>
+    <p class="text-muted">精确排除 B 站合集（season_id）。每行一个正整数。</p>
+    <textarea name="exclude_season_ids" rows="4" placeholder="123456">{{ filters.exclude_season_ids | join('\n') }}</textarea>
+
     <div class="actions" style="margin-top:1.5rem;">
       <button type="submit" class="btn btn-success">💾 保存</button>
       <a href="/series/{{ series }}/preview" class="btn btn-outline">🔍 干跑预览</a>

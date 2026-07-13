@@ -651,6 +651,7 @@ async def filters_update(
     exclude_keywords: str = Form(""),
     advertisement_keywords: str = Form(""),
     include_keywords: str = Form(""),
+    exclude_season_ids: str = Form(""),
     paid_preview_enabled: bool = Form(False),
     retry_after_days: int = Form(4),
     min_duration_seconds: int = Form(0),
@@ -663,6 +664,13 @@ async def filters_update(
     def _parse(text: str) -> list[str]:
         return [line.strip() for line in text.split("\n") if line.strip()]
 
+    try:
+        parsed_season_ids = [int(value) for value in _parse(exclude_season_ids)]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="exclude_season_ids must contain positive integers") from exc
+    if any(value <= 0 for value in parsed_season_ids):
+        raise HTTPException(status_code=400, detail="exclude_season_ids must contain positive integers")
+
     with db.transaction(DB_PATH) as conn:
         # Update filter rules
         filters_dict: dict[str, Any] = {
@@ -672,6 +680,7 @@ async def filters_update(
             "exclude_keywords": _parse(exclude_keywords),
             "advertisement_keywords": _parse(advertisement_keywords),
             "include_keywords": _parse(include_keywords),
+            "exclude_season_ids": parsed_season_ids,
         }
         FilterRuleService(conn).replace_all(series, filters_dict)
 

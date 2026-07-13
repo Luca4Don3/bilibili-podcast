@@ -11,6 +11,7 @@ FORMAT_VALUES = {"audio", "video"}
 RULE_TYPE_VALUES = {
     "exclude_paid", "exclude_bvid", "advertisement_bvid",
     "exclude_keyword", "advertisement_keyword", "include_keyword",
+    "exclude_season_id",
 }
 
 

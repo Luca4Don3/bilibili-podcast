@@ -69,6 +69,9 @@
     {% if filters.advertisement_bvids %}
     <tr><th>广告 BVID</th><td><code>{{ filters.advertisement_bvids | join(', ') }}</code></td></tr>
     {% endif %}
+    {% if filters.exclude_season_ids %}
+    <tr><th>排除合集 ID</th><td><code>{{ filters.exclude_season_ids | join(', ') }}</code></td></tr>
+    {% endif %}
     <tr><th>最小时长</th><td>{{ sync.min_duration_seconds or 0 }} 秒</td></tr>
     <tr><th>最大时长</th><td>{{ sync.max_duration_seconds or 0 }} 秒</td></tr>
     <tr><th>付费预览</th><td>{{ '开启' if paid_preview.enabled else '关闭' }}{% if paid_preview.enabled %} ({{ paid_preview.retry_after_days }}天后重试){% endif %}</td></tr>
