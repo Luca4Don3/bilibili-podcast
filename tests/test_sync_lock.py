@@ -138,6 +138,37 @@ def test_merge_existing_rss_items_handles_paid_content_without_crash(tmp_path):
     assert all(ep["bvid"] != "BVpaid00001" for ep in result)
 
 
+def test_rss_padding_does_not_restore_excluded_items(tmp_path):
+    from bilibili_podcast.sync import pad_with_existing_rss_items
+
+    cfg = type("Config", (), {
+        "series": "test", "keep_last": 1, "filters": {}, "sync": {},
+    })()
+    paths = type("Paths", (), {
+        "media_root": tmp_path / "media",
+        "json_root": tmp_path / "json",
+        "rss_root": tmp_path / "rss",
+        "media_base_url": "http://localhost:8080",
+    })()
+    paths.rss_root.mkdir()
+    (paths.rss_root / "test.xml").write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel>
+  <item><title>Excluded keyword item</title><guid>BVexcluded01</guid>
+    <enclosure url="http://example.test/BVexcluded01.mp3?token=__MEDIA_PLACEHOLDER__" length="1" type="audio/mpeg" />
+  </item>
+  <item><title>Allowed item</title><guid>BVallowed001</guid>
+    <enclosure url="http://example.test/BVallowed001.mp3?token=__MEDIA_PLACEHOLDER__" length="1" type="audio/mpeg" />
+  </item>
+</channel></rss>""",
+        encoding="utf-8",
+    )
+
+    result = pad_with_existing_rss_items(cfg, paths, [], {"BVexcluded01"})
+
+    assert [item["bvid"] for item in result] == ["BVallowed001"]
+
+
 def test_cleanup_retention_media_zero_keep_last_noop(tmp_path):
     from bilibili_podcast.sync import cleanup_retention_media
 

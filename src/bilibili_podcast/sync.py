@@ -33,6 +33,8 @@ QUALITY_TO_AUDIO = {
     "high": "192K",
 }
 DEFAULT_REQUEST_INTERVAL_SECONDS = 2.0
+LOG_RETENTION_DAYS = 30
+LOG_BACKUP_NAMES = ("sync.log", "sync.error.log", "playwright.log")
 DEFAULT_REQUEST_JITTER_SECONDS = 0.5
 DEFAULT_INCREMENTAL_PAGE_SIZE = 5
 DEFAULT_MAX_REQUESTS_PER_SERIES = 8
@@ -74,6 +76,36 @@ def parse_log_level(value: str) -> str:
         choices = ", ".join(LOG_LEVELS)
         raise argparse.ArgumentTypeError(f"invalid log level {value!r}; choose one of: {choices}")
     return level
+
+
+def cleanup_old_log_backups(
+    log_root: Path,
+    retention_days: int = LOG_RETENTION_DAYS,
+    *,
+    now: float | None = None,
+) -> int:
+    """Delete recognized rotated log backups older than the retention window."""
+    cutoff = (time.time() if now is None else now) - retention_days * 86400
+    removed = 0
+    for base_name in LOG_BACKUP_NAMES:
+        for candidate in log_root.glob(f"{base_name}.*"):
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                if candidate.stat().st_mtime >= cutoff:
+                    continue
+                candidate.unlink()
+                removed += 1
+            except OSError as exc:
+                LOGGER.warning("log cleanup failed path=%s error=%s", candidate, exc)
+    if removed:
+        LOGGER.info(
+            "log cleanup complete log_dir=%s retention_days=%s removed=%s",
+            log_root,
+            retention_days,
+            removed,
+        )
+    return removed
 
 
 def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) -> Path:
@@ -120,6 +152,7 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
     try:
         log_root.mkdir(parents=True, exist_ok=True)
         configure_handlers(log_root)
+        cleanup_old_log_backups(log_root)
     except OSError as exc:
         fallback = Path("/tmp/bilibili-podcast-logs")
         fallback.mkdir(parents=True, exist_ok=True)
@@ -129,6 +162,7 @@ def setup_logging(log_dir: str, log_level: str = "INFO", debug: bool = False) ->
         )
         log_root = fallback
         configure_handlers(log_root)
+        cleanup_old_log_backups(log_root)
 
     LOGGER.info(
         "logging initialized log_dir=%s pid=%s log_level=%s debug=%s",
@@ -1213,7 +1247,7 @@ def existing_rss_items(rss_path: Path) -> list[dict]:
 
 def merge_existing_rss_items(
     config: SeriesConfig, paths: SyncPaths, episodes: list[dict],
-    exclude_paid_bvids: set | None = None,
+    excluded_bvids: set | None = None,
     *, apply_limit: bool = True,
 ) -> list[dict]:
     existing = existing_rss_items(paths.rss_root / f"{config.series}.xml")
@@ -1222,8 +1256,7 @@ def merge_existing_rss_items(
     static_exclude = set()
     static_exclude.update(filters.get("exclude_bvids", []))
     static_exclude.update(filters.get("advertisement_bvids", []))
-    excluded_bvid = exclude_paid_bvids or set()
-    excluded_bvid |= static_exclude
+    excluded_bvid = set(excluded_bvids or ()) | static_exclude
     removed_count = 0
     paid_removed = 0
     surviving = []
@@ -1263,6 +1296,35 @@ def merge_existing_rss_items(
             config.series, removed_count, paid_removed,
         )
     return result
+
+
+def pad_with_existing_rss_items(
+    config: SeriesConfig,
+    paths: SyncPaths,
+    playable_episodes: list[dict],
+    excluded_bvids: set,
+) -> list[dict]:
+    """Pad a sparse feed from old RSS items without restoring exclusions."""
+    if config.keep_last <= 0 or len(playable_episodes) >= config.keep_last:
+        return playable_episodes
+    existing = existing_rss_items(paths.rss_root / f"{config.series}.xml")
+    existing_bvids = {episode["bvid"] for episode in playable_episodes}
+    padded = list(playable_episodes)
+    for item in existing:
+        if item["bvid"] in excluded_bvids or item["bvid"] in existing_bvids:
+            continue
+        enclosure_url = item.get("_existing_enclosure_url", "")
+        if enclosure_url and is_safe_enclosure_url(enclosure_url):
+            padded.append(item)
+            existing_bvids.add(item["bvid"])
+        if len(padded) >= config.keep_last:
+            break
+    if len(padded) > len(playable_episodes):
+        LOGGER.info(
+            "rss padding series=%s playable_before=%s after_padding=%s keep_last=%s",
+            config.series, len(playable_episodes), len(padded), config.keep_last,
+        )
+    return padded
 
 
 def cleanup_paid_media(
@@ -1705,24 +1767,9 @@ async def sync_series(
                 )
             )
         ]
-        playable_before = len(playable_episodes)
-        if config.keep_last > 0 and len(playable_episodes) < config.keep_last:
-            existing = existing_rss_items(paths.rss_root / f"{config.series}.xml")
-            existing_bvids = {ep["bvid"] for ep in playable_episodes}
-            for item in existing:
-                if item["bvid"] in existing_bvids:
-                    continue
-                if item.get("_existing_enclosure_url") and is_safe_enclosure_url(item["_existing_enclosure_url"]):
-                    playable_episodes.append(item)
-                    existing_bvids.add(item["bvid"])
-                if len(playable_episodes) >= config.keep_last:
-                    break
-            if len(playable_episodes) > playable_before:
-                LOGGER.info(
-                    "rss padding series=%s playable_before=%s after_padding=%s keep_last=%s",
-                    config.series, playable_before, len(playable_episodes),
-                    config.keep_last,
-                )
+        playable_episodes = pad_with_existing_rss_items(
+            config, paths, playable_episodes, all_exclude_bvids,
+        )
         playable_episodes = limit_episodes(config, playable_episodes)
         cleanup_retention_media(config, paths, filtered)
         generate_rss(config, paths, up_info, playable_episodes, token, dry_run=False)
