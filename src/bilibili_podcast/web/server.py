@@ -581,26 +581,29 @@ async def sync_policy_update(
     if guard:
         return guard
 
-    with db.transaction(DB_PATH) as conn:
-        SyncPolicyService(conn).upsert(series, {
-            "page_size": page_size,
-            "incremental_page_size": incremental_page_size,
-            "max_pages": max_pages,
-            "max_requests_per_series": max_requests_per_series,
-            "request_interval_seconds": request_interval_seconds,
-            "request_jitter_seconds": request_jitter_seconds,
-            "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
-            "update_period": update_period,
-            "format": format,
-            "quality": quality,
-            "keep_last": keep_last,
-            "fetch_strategy": fetch_strategy,
-            "browser_fallback": browser_fallback,
-            "browser_wait_min_seconds": browser_wait_min_seconds,
-            "browser_wait_max_seconds": browser_wait_max_seconds,
-            "browser_fallback_cooldown_seconds": browser_fallback_cooldown_seconds,
-            "require_paid_state_confirmation": require_paid_state_confirmation,
-        })
+    try:
+        with db.transaction(DB_PATH) as conn:
+            SyncPolicyService(conn).upsert(series, {
+                "page_size": page_size,
+                "incremental_page_size": incremental_page_size,
+                "max_pages": max_pages,
+                "max_requests_per_series": max_requests_per_series,
+                "request_interval_seconds": request_interval_seconds,
+                "request_jitter_seconds": request_jitter_seconds,
+                "rate_limit_cooldown_seconds": rate_limit_cooldown_seconds,
+                "update_period": update_period,
+                "format": format,
+                "quality": quality,
+                "keep_last": keep_last,
+                "fetch_strategy": fetch_strategy,
+                "browser_fallback": browser_fallback,
+                "browser_wait_min_seconds": browser_wait_min_seconds,
+                "browser_wait_max_seconds": browser_wait_max_seconds,
+                "browser_fallback_cooldown_seconds": browser_fallback_cooldown_seconds,
+                "require_paid_state_confirmation": require_paid_state_confirmation,
+            })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return RedirectResponse(url=f"/series/{series}/sync", status_code=302)
 
@@ -766,7 +769,8 @@ async def cron_page(request: Request, series: str):
 
     return templates.TemplateResponse(request, "cron.html", {
         "series": series,
-        "schedules": [s.schedule for s in schedules],
+        "schedules": [s.schedule for s in schedules if s.kind == "primary"],
+        "retry_schedules": [s.schedule for s in schedules if s.kind == "retry"],
         "sysd_status": sysd_status,
         "csrf_token": csrf_token(),
     })
@@ -778,14 +782,19 @@ async def cron_update(
     series: str,
     csrf_token: str = Form(""),
     schedules: str = Form(""),
+    retry_schedules: str = Form(""),
 ):
     guard = _csrf_guard(request, csrf_token)
     if guard:
         return guard
 
     parsed = [line.strip() for line in schedules.split("\n") if line.strip()]
+    parsed_retries = [line.strip() for line in retry_schedules.split("\n") if line.strip()]
 
-    SchedulerService(DB_PATH).replace_schedules(series, parsed)
+    try:
+        SchedulerService(DB_PATH).replace_schedules(series, parsed, parsed_retries)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return RedirectResponse(url=f"/series/{series}/cron", status_code=302)
 

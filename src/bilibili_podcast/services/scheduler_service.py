@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +30,92 @@ class ScheduleEntry:
     schedule: str
     enabled: bool
     position: int
+    kind: str = "primary"
+
+
+def _period_seconds(value: object) -> int:
+    text = str(value or "12h").strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if not match:
+        raise ValueError(f"invalid update_period: {value}")
+    amount = float(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    return int(amount * multiplier)
+
+
+def _cron_values(field: str, minimum: int, maximum: int) -> set[int]:
+    values: set[int] = set()
+    for part in field.split(","):
+        base, separator, step_text = part.partition("/")
+        try:
+            step = int(step_text) if separator else 1
+        except ValueError as exc:
+            raise ValueError(f"invalid cron field: {field}") from exc
+        if step <= 0:
+            raise ValueError(f"invalid cron field: {field}")
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            start_text, end_text = base.split("-", 1)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"invalid cron field: {field}") from exc
+        else:
+            try:
+                start = end = int(base)
+            except ValueError as exc:
+                raise ValueError(f"invalid cron field: {field}") from exc
+        if start < minimum or end > maximum or start > end:
+            raise ValueError(f"invalid cron field: {field}")
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def _weekly_occurrences(schedule: str) -> set[int]:
+    fields = schedule.split()
+    if len(fields) != 5 or fields[2:4] != ["*", "*"]:
+        raise ValueError(f"unsupported schedule expression: {schedule}")
+    minutes = _cron_values(fields[0], 0, 59)
+    hours = _cron_values(fields[1], 0, 23)
+    days = _cron_values(fields[4], 0, 7)
+    days = {0 if day == 7 else day for day in days}
+    return {
+        day * 86400 + hour * 3600 + minute * 60
+        for day in days for hour in hours for minute in minutes
+    }
+
+
+def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> None:
+    seen: dict[int, ScheduleEntry] = {}
+    primary_points: set[int] = set()
+    if any(entry.kind == "retry" for entry in entries) and not any(
+        entry.kind == "primary" for entry in entries
+    ):
+        raise ValueError("at least one primary schedule is required when retry schedules are configured")
+    for entry in entries:
+        for point in _weekly_occurrences(entry.schedule):
+            if point in seen:
+                other = seen[point]
+                raise ValueError(
+                    f"duplicate schedule: {other.schedule} ({other.kind}) and "
+                    f"{entry.schedule} ({entry.kind})"
+                )
+            seen[point] = entry
+            if entry.kind == "primary":
+                primary_points.add(point)
+    if len(primary_points) < 2:
+        return
+    period = _period_seconds(update_period)
+    ordered = sorted(primary_points)
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    gaps.append(7 * 86400 + ordered[0] - ordered[-1])
+    shortest = min(gaps)
+    if shortest < period:
+        raise ValueError(
+            f"primary schedules conflict: shortest interval {shortest}s "
+            f"is less than update_period {period}s"
+        )
 
 
 def _find_crontab_script() -> Optional[str]:
@@ -88,6 +175,13 @@ class SchedulerService:
         self._require_cron_backend(backend)
         if backend == "systemd":
             return self._plan_systemd(series)
+        retry_series = self._cron_retry_series()
+        if retry_series:
+            return SchedulerCommandResult(
+                backend="cron", action="plan", returncode=-1,
+                stdout="", stderr="",
+                error="cron backend does not support retry schedules: " + ", ".join(retry_series),
+            )
 
         # ── cron backend ──
         cmd: list[str] = []
@@ -154,15 +248,14 @@ class SchedulerService:
                 stdout="", stderr="",
                 error=f"no schedules found for series '{series}'",
             )
-
         # Convert schedules and build output
         lines: list[str] = []
-        converted: list[str] = []
+        converted: list[tuple[ScheduleEntry, str, str]] = []
         unconverted: list[str] = []
         for s in schedules:
             oc = sysd.cron_to_oncalendar(s.schedule)
             if oc:
-                converted.append((s.schedule, oc))
+                converted.append((s, s.schedule, oc))
             else:
                 unconverted.append(s.schedule)
 
@@ -171,12 +264,22 @@ class SchedulerService:
             for expr in unconverted:
                 lines.append(f"#    {expr}")
             lines.append("# 修复后重试，或继续使用 cron backend。")
+        else:
+            try:
+                validate_schedules(schedules, self._update_period(series))
+            except ValueError as exc:
+                return SchedulerCommandResult(
+                    backend="systemd", action="plan", returncode=-1,
+                    stdout="", stderr="", error=str(exc),
+                )
 
-        for expr, oc in converted:
+        primary_converted = [(expr, oc) for entry, expr, oc in converted if entry.kind == "primary"]
+        retry_converted = [(expr, oc) for entry, expr, oc in converted if entry.kind == "retry"]
+        for expr, oc in primary_converted:
             lines.append(f"# cron: {expr}  →  OnCalendar={oc}")
             svc = sysd.generate_service(series)
             # Collect ALL OnCalendar lines
-            all_oc = [oc for _, oc in converted]
+            all_oc = [value for _, value in primary_converted]
             timer = sysd.generate_timer(series, all_oc)
             lines.append("")
             lines.append(f"# --- bilipod-sync@{series}.service ---")
@@ -186,6 +289,15 @@ class SchedulerService:
             lines.extend(timer.splitlines())
             lines.append("")
             break  # one service + one timer with all OnCalendar lines
+
+        if retry_converted:
+            retry_oc = [value for _, value in retry_converted]
+            lines.append("")
+            lines.append(f"# --- {sysd.unit_name(series, 'service', scheduled_retry=True)} ---")
+            lines.extend(sysd.generate_service(series, scheduled_retry=True).splitlines())
+            lines.append("")
+            lines.append(f"# --- {sysd.unit_name(series, 'timer', scheduled_retry=True)} ---")
+            lines.extend(sysd.generate_timer(series, retry_oc).splitlines())
 
         # Check if unit files already exist
         sysd_dir = sysd.SYSTEMD_DIR
@@ -222,6 +334,13 @@ class SchedulerService:
         self._require_cron_backend(backend)
         if backend == "systemd":
             return self._apply_systemd(series)
+        retry_series = self._cron_retry_series()
+        if retry_series:
+            return SchedulerCommandResult(
+                backend="cron", action="apply", returncode=-1,
+                stdout="", stderr="",
+                error="cron backend does not support retry schedules: " + ", ".join(retry_series),
+            )
 
         # ── cron backend ──
 
@@ -280,9 +399,17 @@ class SchedulerService:
                 stdout="", stderr="",
                 error=f"no schedules found for series '{series}'",
             )
+        try:
+            validate_schedules(schedules, self._update_period(series))
+        except ValueError as exc:
+            return SchedulerCommandResult(
+                backend="systemd", action="apply", returncode=-1,
+                stdout="", stderr="", error=str(exc),
+            )
 
         # Build list of all OnCalendar lines
         oncalendars: list[str] = []
+        retry_oncalendars: list[str] = []
         for s in schedules:
             oc = sysd.cron_to_oncalendar(s.schedule)
             if oc is None:
@@ -291,136 +418,165 @@ class SchedulerService:
                     stdout="", stderr="",
                     error=f"unsupported cron expression: {s.schedule}",
                 )
-            oncalendars.append(oc)
+            if s.kind == "retry":
+                retry_oncalendars.append(oc)
+            else:
+                oncalendars.append(oc)
+        if not oncalendars:
+            return SchedulerCommandResult(
+                backend="systemd", action="apply", returncode=-1,
+                stdout="", stderr="", error="at least one primary schedule is required",
+            )
 
-        # 1. Write systemd units
-        original_units: dict[str, str | None] = {}
-        for suffix in ("service", "timer"):
-            path = sysd.SYSTEMD_DIR / sysd.unit_name(series, suffix)
+        unit_keys = [
+            (scheduled_retry, suffix)
+            for scheduled_retry in (False, True)
+            for suffix in ("service", "timer")
+        ]
+        original_units: dict[tuple[bool, str], str | None] = {}
+        for scheduled_retry, suffix in unit_keys:
+            path = sysd.SYSTEMD_DIR / sysd.unit_name(
+                series, suffix, scheduled_retry=scheduled_retry,
+            )
             try:
-                original_units[suffix] = path.read_text(encoding="utf-8") if path.exists() else None
+                original_units[(scheduled_retry, suffix)] = (
+                    path.read_text(encoding="utf-8") if path.exists() else None
+                )
             except OSError as exc:
                 return SchedulerCommandResult(
                     backend="systemd", action="apply", returncode=-1,
-                    stdout="", stderr="",
-                    error=f"failed to read existing unit {path}: {exc}",
+                    stdout="", stderr="", error=f"failed to read existing unit {path}: {exc}",
                 )
 
-        modified_units: list[str] = []
-        was_enabled = sysd.timer_is_enabled(series)
-        was_active = sysd.timer_is_active(series)
-
-        def rollback_units() -> list[str]:
-            errors: list[str] = []
-            for suffix in modified_units:
-                original = original_units[suffix]
-                if original is None:
-                    result = sysd.remove_unit(series, suffix)
-                else:
-                    result = sysd.write_unit(series, suffix, original)
-                if result.returncode != 0:
-                    errors.append(f"restore {suffix}: {result.stderr or result.error or 'failed'}")
-            if modified_units:
-                dr = sysd.daemon_reload()
-                if dr.returncode != 0:
-                    errors.append(f"daemon-reload: {dr.stderr.strip()}")
-            return errors
-
-        def rollback_timer_and_units() -> list[str]:
-            errors: list[str] = []
-            disabled = sysd.disable_timer(series)
-            if disabled.returncode != 0:
-                errors.append(f"disable timer: {disabled.stderr.strip()}")
-            errors.extend(rollback_units())
-            if was_enabled:
-                enabled = sysd.enable_timer(series)
-                if enabled.returncode != 0:
-                    errors.append(f"restore timer enable: {enabled.stderr.strip()}")
-            if was_active:
-                started = sysd.start_timer(series)
-                if started.returncode != 0:
-                    errors.append(f"restore timer active state: {started.stderr.strip()}")
-            return errors
+        original_timer_state = {
+            scheduled_retry: (
+                sysd.timer_is_enabled(series, scheduled_retry=scheduled_retry),
+                sysd.timer_is_active(series, scheduled_retry=scheduled_retry),
+            )
+            for scheduled_retry in (False, True)
+        }
+        original_backend = self._scheduler_backend(series)
+        modified_units: list[tuple[bool, str]] = []
 
         def with_rollback_error(message: str, errors: list[str]) -> str:
-            if not errors:
-                return message
-            return f"{message}; rollback errors: {'; '.join(errors)}"
+            return message if not errors else f"{message}; rollback errors: {'; '.join(errors)}"
 
-        for suf in ("service", "timer"):
-            if suf == "service":
-                content = sysd.generate_service(series)
-            else:
-                content = sysd.generate_timer(series, oncalendars)
-            written = sysd.write_unit(series, suf, content)
-            if written.returncode != 0:
-                rollback_errors = rollback_units()
-                if rollback_errors:
-                    written.error = with_rollback_error(written.error or "unit write failed", rollback_errors)
-                return written
-            modified_units.append(suf)
+        def rollback_all() -> list[str]:
+            errors: list[str] = []
+            for scheduled_retry in (False, True):
+                result = sysd.disable_timer(series, scheduled_retry=scheduled_retry)
+                if result.returncode != 0:
+                    errors.append(f"disable {'retry ' if scheduled_retry else ''}timer: {result.stderr.strip()}")
+            for scheduled_retry, suffix in reversed(modified_units):
+                original = original_units[(scheduled_retry, suffix)]
+                if original is None:
+                    result = sysd.remove_unit(
+                        series, suffix, scheduled_retry=scheduled_retry,
+                    )
+                else:
+                    result = sysd.write_unit(
+                        series, suffix, original, scheduled_retry=scheduled_retry,
+                    )
+                if result.returncode != 0:
+                    errors.append(f"restore {'retry ' if scheduled_retry else ''}{suffix}: {result.stderr or result.error or 'failed'}")
+            if modified_units:
+                result = sysd.daemon_reload()
+                if result.returncode != 0:
+                    errors.append(f"daemon-reload: {result.stderr.strip()}")
+            for scheduled_retry, (was_enabled, was_active) in original_timer_state.items():
+                if was_enabled:
+                    result = sysd.enable_timer(series, scheduled_retry=scheduled_retry)
+                    if result.returncode != 0:
+                        errors.append(f"restore {'retry ' if scheduled_retry else ''}timer enable: {result.stderr.strip()}")
+                if was_active:
+                    result = sysd.start_timer(series, scheduled_retry=scheduled_retry)
+                    if result.returncode != 0:
+                        errors.append(f"restore {'retry ' if scheduled_retry else ''}timer active: {result.stderr.strip()}")
+            try:
+                self._set_scheduler_backend(series, original_backend)
+            except Exception as exc:
+                errors.append(f"restore scheduler backend: {exc}")
+            return errors
 
-        # 2. daemon-reload
-        dr = sysd.daemon_reload()
-        if dr.returncode != 0:
-            rollback_errors = rollback_units()
-            if rollback_errors:
-                dr.error = with_rollback_error(dr.error or "daemon-reload failed", rollback_errors)
-            return dr
+        desired_units = [
+            (False, "service", sysd.generate_service(series)),
+            (False, "timer", sysd.generate_timer(series, oncalendars)),
+        ]
+        if retry_oncalendars:
+            desired_units.extend([
+                (True, "service", sysd.generate_service(series, scheduled_retry=True)),
+                (True, "timer", sysd.generate_timer(series, retry_oncalendars)),
+            ])
 
-        # 3. enable timer (symlink for auto-start on boot)
-        et = sysd.enable_timer(series)
-        if et.returncode != 0:
-            rollback_errors = rollback_timer_and_units()
-            if rollback_errors:
-                et.error = with_rollback_error(et.error or "enable timer failed", rollback_errors)
-            return et
-
-        # 3b. Restart timer so updated unit contents take effect. This arms the
-        # timer but does not run the service.
-        rt = sysd.restart_timer(series)
-        if rt.returncode != 0:
-            rollback_errors = rollback_timer_and_units()
-            return SchedulerCommandResult(
-                backend="systemd", action="apply", returncode=-1,
-                stdout="", stderr="",
-                error=with_rollback_error("restart timer failed — rolled back", rollback_errors),
+        for scheduled_retry, suffix, content in desired_units:
+            modified_units.append((scheduled_retry, suffix))
+            result = sysd.write_unit(
+                series, suffix, content, scheduled_retry=scheduled_retry,
             )
+            if result.returncode != 0:
+                rollback_errors = rollback_all()
+                result.error = with_rollback_error(result.error or "unit write failed", rollback_errors)
+                return result
 
-        # 3c. Verify timer is enabled
-        if not sysd.timer_is_enabled(series):
-            rollback_errors = rollback_timer_and_units()
-            return SchedulerCommandResult(
-                backend="systemd", action="apply", returncode=-1,
-                stdout="", stderr="",
-                error=with_rollback_error("timer enable verification failed — rolled back", rollback_errors),
-            )
+        result = sysd.daemon_reload()
+        if result.returncode != 0:
+            result.error = with_rollback_error(result.error or "daemon-reload failed", rollback_all())
+            return result
 
-        # 3d. Verify timer is active (armed in current boot cycle)
-        if not sysd.timer_is_active(series):
-            rollback_errors = rollback_timer_and_units()
-            return SchedulerCommandResult(
-                backend="systemd", action="apply", returncode=-1,
-                stdout="", stderr="",
-                error=with_rollback_error("timer active verification failed — rolled back", rollback_errors),
-            )
+        for scheduled_retry in ([False, True] if retry_oncalendars else [False]):
+            result = sysd.enable_timer(series, scheduled_retry=scheduled_retry)
+            if result.returncode != 0:
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error=with_rollback_error(
+                        f"{'retry ' if scheduled_retry else ''}timer enable failed — rolled back",
+                        rollback_all(),
+                    ),
+                )
+            result = sysd.restart_timer(series, scheduled_retry=scheduled_retry)
+            if result.returncode != 0:
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error=with_rollback_error(
+                        f"{'retry ' if scheduled_retry else ''}restart timer failed — rolled back",
+                        rollback_all(),
+                    ),
+                )
+            if not sysd.timer_is_enabled(series, scheduled_retry=scheduled_retry):
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error=with_rollback_error(
+                        f"{'retry ' if scheduled_retry else ''}timer enable verification failed — rolled back",
+                        rollback_all(),
+                    ),
+                )
+            if not sysd.timer_is_active(series, scheduled_retry=scheduled_retry):
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error=with_rollback_error(
+                        f"{'retry ' if scheduled_retry else ''}timer active verification failed — rolled back",
+                        rollback_all(),
+                    ),
+                )
 
-        # 4. Remove cron for this series (only after timer is confirmed active)
+        if not retry_oncalendars and any(original_timer_state[True]):
+            result = sysd.disable_timer(series, scheduled_retry=True)
+            if result.returncode != 0:
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error=with_rollback_error(
+                        "failed to disable stale retry timer", rollback_all(),
+                    ),
+                )
+
         try:
             self._set_scheduler_backend(series, "systemd")
             self._exclude_series_from_cron(series)
-        except Exception as e:
-            rollback_errors = rollback_timer_and_units()
-            try:
-                self._set_scheduler_backend(series, "cron")
-            except Exception as backend_exc:
-                rollback_errors.append(f"restore scheduler backend: {backend_exc}")
+        except Exception as exc:
             return SchedulerCommandResult(
                 backend="systemd", action="apply", returncode=-1,
-                stdout="", stderr="",
-                error=with_rollback_error(
-                    f"failed to disable cron for '{series}': {e} — timer has been rolled back",
-                    rollback_errors,
+                stdout="", stderr="", error=with_rollback_error(
+                    f"failed to disable cron for '{series}': {exc}", rollback_all(),
                 ),
             )
 
@@ -487,6 +643,23 @@ class SchedulerService:
         with db.transaction(self.db_path) as conn:
             db.set_scheduler_backend(conn, series, backend)
 
+    def _scheduler_backend(self, series: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT backend FROM scheduler_backend WHERE series=?", (series,),
+            ).fetchone()
+        return str(row[0] if row else "cron")
+
+    def _cron_retry_series(self) -> list[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT c.series FROM cron_schedule c "
+                "LEFT JOIN scheduler_backend b ON b.series=c.series "
+                "WHERE c.enabled=1 AND c.kind='retry' "
+                "AND COALESCE(b.backend, 'cron')='cron' ORDER BY c.series"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     @staticmethod
     def _cron_marker_title(title: Any, series: str) -> str:
         normalized = " ".join(str(title or "").splitlines()).strip()
@@ -494,7 +667,10 @@ class SchedulerService:
 
     def _restore_cron_for_series(self, series: str) -> None:
         """Restore only *series* to cron after its systemd timer is disabled."""
-        schedules = self.list_enabled_schedules(series)
+        schedules = [
+            entry for entry in self.list_enabled_schedules(series)
+            if entry.kind == "primary"
+        ]
         if not schedules:
             raise RuntimeError(f"no enabled schedules found for series '{series}'")
         if not self._cron_script_dir:
@@ -527,11 +703,18 @@ class SchedulerService:
 
     # ── list_schedules / replace_schedules (DB only) ──────────────────
 
+    def _update_period(self, series: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT update_period FROM sync_policy WHERE series=?", (series,),
+            ).fetchone()
+        return str(row[0] if row else "12h")
+
     def list_schedules(self, series: str) -> list[ScheduleEntry]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, series, schedule, enabled, position "
+                "SELECT id, series, schedule, enabled, position, kind "
                 "FROM cron_schedule WHERE series=? ORDER BY position",
                 (series,),
             ).fetchall()
@@ -542,6 +725,7 @@ class SchedulerService:
                 schedule=r["schedule"],
                 enabled=bool(r["enabled"]),
                 position=r["position"],
+                kind=r["kind"],
             )
             for r in rows
         ]
@@ -552,7 +736,7 @@ class SchedulerService:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, series, schedule, enabled, position "
+                "SELECT id, series, schedule, enabled, position, kind "
                 "FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
                 (series,),
             ).fetchall()
@@ -563,21 +747,41 @@ class SchedulerService:
                 schedule=r["schedule"],
                 enabled=bool(r["enabled"]),
                 position=r["position"],
+                kind=r["kind"],
             )
             for r in rows
         ]
 
-    def replace_schedules(self, series: str, schedules: list[str]) -> int:
+    def replace_schedules(
+        self,
+        series: str,
+        schedules: list[str],
+        retry_schedules: list[str] | None = None,
+    ) -> int:
+        retry_schedules = retry_schedules or []
         with sqlite3.connect(self.db_path) as conn:
+            entries = [(schedule, "primary") for schedule in schedules]
+            entries.extend((schedule, "retry") for schedule in retry_schedules)
+            period_row = conn.execute(
+                "SELECT update_period FROM sync_policy WHERE series=?", (series,),
+            ).fetchone()
+            update_period = period_row[0] if period_row else "12h"
+            validate_schedules(
+                [
+                    ScheduleEntry(None, series, schedule, True, pos, kind)
+                    for pos, (schedule, kind) in enumerate(entries)
+                ],
+                update_period,
+            )
             conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
-            for pos, sched in enumerate(schedules):
+            for pos, (sched, kind) in enumerate(entries):
                 conn.execute(
-                    "INSERT INTO cron_schedule (series, enabled, schedule, position) "
-                    "VALUES (?, 1, ?, ?)",
-                    (series, sched, pos),
+                    "INSERT INTO cron_schedule (series, enabled, schedule, position, kind) "
+                    "VALUES (?, 1, ?, ?, ?)",
+                    (series, sched, pos, kind),
                 )
             conn.commit()
-        return len(schedules)
+        return len(entries)
 
     # ── status ─────────────────────────────────────────────────────────
 
@@ -621,6 +825,9 @@ class SchedulerService:
             info["timer_unit"] = u
             info["enabled"] = sysd.timer_is_enabled(s)
             info["active"] = sysd.timer_is_active(s)
+            info["retry_timer_unit"] = sysd.unit_name(s, "timer", scheduled_retry=True)
+            info["retry_enabled"] = sysd.timer_is_enabled(s, scheduled_retry=True)
+            info["retry_active"] = sysd.timer_is_active(s, scheduled_retry=True)
             info["schedule_count"] = len(self.list_enabled_schedules(s))
 
             # Query systemctl show for detailed status
@@ -644,6 +851,12 @@ class SchedulerService:
         """Disable systemd timer for *series* and restore cron backend."""
         from . import systemd_scheduler as sysd
 
+        if any(entry.kind == "retry" for entry in self.list_enabled_schedules(series)):
+            return SchedulerCommandResult(
+                backend="systemd", action="disable", returncode=1,
+                stdout="", stderr="retry schedules are not supported by cron; remove them before restoring cron",
+            )
+
         was_enabled = sysd.timer_is_enabled(series)
         was_active = sysd.timer_is_active(series)
         dt = sysd.disable_timer(series)
@@ -652,6 +865,18 @@ class SchedulerService:
             return SchedulerCommandResult(
                 backend="systemd", action="disable", returncode=1,
                 stdout="", stderr=f"disable timer: {dt.stderr.strip()}",
+            )
+        retry_dt = sysd.disable_timer(series, scheduled_retry=True)
+        if retry_dt.returncode != 0 and not any(
+            marker in retry_dt.stderr.lower() for marker in missing_markers
+        ):
+            if was_enabled:
+                sysd.enable_timer(series)
+            if was_active:
+                sysd.start_timer(series)
+            return SchedulerCommandResult(
+                backend="systemd", action="disable", returncode=1,
+                stdout="", stderr=f"disable retry timer: {retry_dt.stderr.strip()}",
             )
 
         try:
@@ -681,10 +906,13 @@ class SchedulerService:
 
         errors: list[str] = []
         if delete_units:
-            for suffix in ("service", "timer"):
-                result = sysd.remove_unit(series, suffix)
-                if result.returncode != 0:
-                    errors.append(f"remove {suffix}: {result.stderr or result.error or 'failed'}")
+            for scheduled_retry in (False, True):
+                for suffix in ("service", "timer"):
+                    result = sysd.remove_unit(
+                        series, suffix, scheduled_retry=scheduled_retry,
+                    )
+                    if result.returncode != 0:
+                        errors.append(f"remove {'retry ' if scheduled_retry else ''}{suffix}: {result.stderr or result.error or 'failed'}")
             dr = sysd.daemon_reload()
             if dr.returncode != 0:
                 errors.append(f"daemon-reload: {dr.stderr.strip()}")
@@ -705,12 +933,26 @@ class SchedulerService:
         from . import systemd_scheduler as sysd
 
         errors: list[str] = []
+        was_enabled = sysd.timer_is_enabled(series)
+        was_active = sysd.timer_is_active(series)
         dt = sysd.disable_timer(series)
         missing_markers = ("not found", "not loaded", "does not exist", "systemctl not found")
         if dt.returncode != 0 and not any(marker in dt.stderr.lower() for marker in missing_markers):
             return SchedulerCommandResult(
                 backend="systemd", action="remove-series", returncode=1,
                 stdout="", stderr=f"disable timer: {dt.stderr.strip()}",
+            )
+        retry_dt = sysd.disable_timer(series, scheduled_retry=True)
+        if retry_dt.returncode != 0 and not any(
+            marker in retry_dt.stderr.lower() for marker in missing_markers
+        ):
+            if was_enabled:
+                sysd.enable_timer(series)
+            if was_active:
+                sysd.start_timer(series)
+            return SchedulerCommandResult(
+                backend="systemd", action="remove-series", returncode=1,
+                stdout="", stderr=f"disable retry timer: {retry_dt.stderr.strip()}",
             )
 
         try:
@@ -719,10 +961,13 @@ class SchedulerService:
             errors.append(f"remove cron: {e}")
 
         if delete_units:
-            for suffix in ("service", "timer"):
-                result = sysd.remove_unit(series, suffix)
-                if result.returncode != 0:
-                    errors.append(f"remove {suffix}: {result.stderr.strip()}")
+            for scheduled_retry in (False, True):
+                for suffix in ("service", "timer"):
+                    result = sysd.remove_unit(
+                        series, suffix, scheduled_retry=scheduled_retry,
+                    )
+                    if result.returncode != 0:
+                        errors.append(f"remove {'retry ' if scheduled_retry else ''}{suffix}: {result.stderr.strip()}")
 
         if "systemctl not found" not in dt.stderr.lower():
             dr = sysd.daemon_reload()

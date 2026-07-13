@@ -72,6 +72,7 @@ class SyncPolicyService:
 
     def upsert(self, series: str, sync: dict[str, Any]) -> None:
         """Insert or update the full sync_policy row."""
+        self._validate_update_period(series, sync.get("update_period", "12h"))
         values = _sync_values(sync)
         self.conn.execute(SQL_INSERT, (series, *values))
 
@@ -80,6 +81,8 @@ class SyncPolicyService:
         for unspecified fields via full upsert (insert-then-update)."""
         if not updates:
             return
+        if "update_period" in updates:
+            self._validate_update_period(series, updates["update_period"])
         # Ensure row exists
         existing = self.conn.execute(
             "SELECT 1 FROM sync_policy WHERE series=?", (series,),
@@ -97,3 +100,19 @@ class SyncPolicyService:
             f"UPDATE sync_policy SET {set_clause} WHERE series=?",
             (*values, series),
         )
+
+    def _validate_update_period(self, series: str, update_period: object) -> None:
+        from .scheduler_service import ScheduleEntry, validate_schedules
+
+        rows = self.conn.execute(
+            "SELECT id, schedule, enabled, position, kind "
+            "FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
+            (series,),
+        ).fetchall()
+        validate_schedules([
+            ScheduleEntry(
+                id=row[0], series=series, schedule=row[1],
+                enabled=bool(row[2]), position=row[3], kind=row[4],
+            )
+            for row in rows
+        ], update_period)
