@@ -7,6 +7,34 @@ from unittest.mock import patch
 import pytest
 
 from bilibili_podcast.services import systemd_scheduler as sysd
+from bilibili_podcast.services.scheduler_service import ScheduleEntry, validate_schedules
+
+
+def _entry(schedule: str, kind: str = "primary") -> ScheduleEntry:
+    return ScheduleEntry(None, "test", schedule, True, 0, kind)
+
+
+class TestScheduleValidation:
+    def test_duplicate_primary_and_retry_rejected(self):
+        with pytest.raises(ValueError, match="duplicate schedule"):
+            validate_schedules([_entry("0 10 * * *"), _entry("0 10 * * *", "retry")], "12h")
+
+    def test_primary_interval_shorter_than_period_rejected(self):
+        with pytest.raises(ValueError, match="less than update_period"):
+            validate_schedules([_entry("0 10 * * *"), _entry("0 20 * * *")], "12h")
+
+    def test_primary_interval_equal_to_period_allowed(self):
+        validate_schedules([_entry("0 0 * * *"), _entry("0 12 * * *")], "12h")
+
+    def test_retry_inside_update_period_allowed(self):
+        validate_schedules([_entry("0 10 * * *"), _entry("0 12 * * *", "retry")], "12h")
+
+    def test_cross_midnight_interval_rejected(self):
+        with pytest.raises(ValueError, match="less than update_period"):
+            validate_schedules([_entry("0 23 * * 1"), _entry("0 1 * * 2")], "3h")
+
+    def test_step_expression_is_validated(self):
+        validate_schedules([_entry("5 */12 * * *")], "12h")
 
 
 class TestMediaUrlTokenGuard:

@@ -766,7 +766,8 @@ async def cron_page(request: Request, series: str):
 
     return templates.TemplateResponse(request, "cron.html", {
         "series": series,
-        "schedules": [s.schedule for s in schedules],
+        "schedules": [s.schedule for s in schedules if s.kind == "primary"],
+        "retry_schedules": [s.schedule for s in schedules if s.kind == "retry"],
         "sysd_status": sysd_status,
         "csrf_token": csrf_token(),
     })
@@ -778,14 +779,19 @@ async def cron_update(
     series: str,
     csrf_token: str = Form(""),
     schedules: str = Form(""),
+    retry_schedules: str = Form(""),
 ):
     guard = _csrf_guard(request, csrf_token)
     if guard:
         return guard
 
     parsed = [line.strip() for line in schedules.split("\n") if line.strip()]
+    parsed_retries = [line.strip() for line in retry_schedules.split("\n") if line.strip()]
 
-    SchedulerService(DB_PATH).replace_schedules(series, parsed)
+    try:
+        SchedulerService(DB_PATH).replace_schedules(series, parsed, parsed_retries)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return RedirectResponse(url=f"/series/{series}/cron", status_code=302)
 

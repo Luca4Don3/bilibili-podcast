@@ -502,7 +502,7 @@ def test_cron_set_yes_writes_to_db(tmp_path: Path) -> None:
         ns = p.parse_args([
             "--config-db", db_path,
             "cron", "set", "crontest",
-            "--schedule", "5 */6 * * *",
+            "--schedule", "5 */12 * * *",
             "--yes",
         ])
         ns.yes = False
@@ -515,7 +515,7 @@ def test_cron_set_yes_writes_to_db(tmp_path: Path) -> None:
     ).fetchall()
     conn.close()
     assert len(cron) == 1
-    assert cron[0][0] == "5 */6 * * *"
+    assert cron[0][0] == "5 */12 * * *"
 
 
 def test_filters_add_yes_writes_to_db(tmp_path: Path) -> None:

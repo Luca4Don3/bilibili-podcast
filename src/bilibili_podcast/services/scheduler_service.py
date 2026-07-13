@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +30,88 @@ class ScheduleEntry:
     schedule: str
     enabled: bool
     position: int
+    kind: str = "primary"
+
+
+def _period_seconds(value: object) -> int:
+    text = str(value or "12h").strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhd]?)", text)
+    if not match:
+        raise ValueError(f"invalid update_period: {value}")
+    amount = float(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    return int(amount * multiplier)
+
+
+def _cron_values(field: str, minimum: int, maximum: int) -> set[int]:
+    values: set[int] = set()
+    for part in field.split(","):
+        base, separator, step_text = part.partition("/")
+        try:
+            step = int(step_text) if separator else 1
+        except ValueError as exc:
+            raise ValueError(f"invalid cron field: {field}") from exc
+        if step <= 0:
+            raise ValueError(f"invalid cron field: {field}")
+        if base == "*":
+            start, end = minimum, maximum
+        elif "-" in base:
+            start_text, end_text = base.split("-", 1)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"invalid cron field: {field}") from exc
+        else:
+            try:
+                start = end = int(base)
+            except ValueError as exc:
+                raise ValueError(f"invalid cron field: {field}") from exc
+        if start < minimum or end > maximum or start > end:
+            raise ValueError(f"invalid cron field: {field}")
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def _weekly_occurrences(schedule: str) -> set[int]:
+    fields = schedule.split()
+    if len(fields) != 5 or fields[2:4] != ["*", "*"]:
+        raise ValueError(f"unsupported schedule expression: {schedule}")
+    minutes = _cron_values(fields[0], 0, 59)
+    hours = _cron_values(fields[1], 0, 23)
+    days = _cron_values(fields[4], 0, 7)
+    days = {0 if day == 7 else day for day in days}
+    return {
+        day * 86400 + hour * 3600 + minute * 60
+        for day in days for hour in hours for minute in minutes
+    }
+
+
+def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> None:
+    seen: dict[int, ScheduleEntry] = {}
+    primary_points: set[int] = set()
+    for entry in entries:
+        for point in _weekly_occurrences(entry.schedule):
+            if point in seen:
+                other = seen[point]
+                raise ValueError(
+                    f"duplicate schedule: {other.schedule} ({other.kind}) and "
+                    f"{entry.schedule} ({entry.kind})"
+                )
+            seen[point] = entry
+            if entry.kind == "primary":
+                primary_points.add(point)
+    if len(primary_points) < 2:
+        return
+    period = _period_seconds(update_period)
+    ordered = sorted(primary_points)
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    gaps.append(7 * 86400 + ordered[0] - ordered[-1])
+    shortest = min(gaps)
+    if shortest < period:
+        raise ValueError(
+            f"primary schedules conflict: shortest interval {shortest}s "
+            f"is less than update_period {period}s"
+        )
 
 
 def _find_crontab_script() -> Optional[str]:
@@ -154,15 +237,14 @@ class SchedulerService:
                 stdout="", stderr="",
                 error=f"no schedules found for series '{series}'",
             )
-
         # Convert schedules and build output
         lines: list[str] = []
-        converted: list[str] = []
+        converted: list[tuple[ScheduleEntry, str, str]] = []
         unconverted: list[str] = []
         for s in schedules:
             oc = sysd.cron_to_oncalendar(s.schedule)
             if oc:
-                converted.append((s.schedule, oc))
+                converted.append((s, s.schedule, oc))
             else:
                 unconverted.append(s.schedule)
 
@@ -171,12 +253,22 @@ class SchedulerService:
             for expr in unconverted:
                 lines.append(f"#    {expr}")
             lines.append("# 修复后重试，或继续使用 cron backend。")
+        else:
+            try:
+                validate_schedules(schedules, self._update_period(series))
+            except ValueError as exc:
+                return SchedulerCommandResult(
+                    backend="systemd", action="plan", returncode=-1,
+                    stdout="", stderr="", error=str(exc),
+                )
 
-        for expr, oc in converted:
+        primary_converted = [(expr, oc) for entry, expr, oc in converted if entry.kind == "primary"]
+        retry_converted = [(expr, oc) for entry, expr, oc in converted if entry.kind == "retry"]
+        for expr, oc in primary_converted:
             lines.append(f"# cron: {expr}  →  OnCalendar={oc}")
             svc = sysd.generate_service(series)
             # Collect ALL OnCalendar lines
-            all_oc = [oc for _, oc in converted]
+            all_oc = [value for _, value in primary_converted]
             timer = sysd.generate_timer(series, all_oc)
             lines.append("")
             lines.append(f"# --- bilipod-sync@{series}.service ---")
@@ -186,6 +278,15 @@ class SchedulerService:
             lines.extend(timer.splitlines())
             lines.append("")
             break  # one service + one timer with all OnCalendar lines
+
+        if retry_converted:
+            retry_oc = [value for _, value in retry_converted]
+            lines.append("")
+            lines.append(f"# --- {sysd.unit_name(series, 'service', scheduled_retry=True)} ---")
+            lines.extend(sysd.generate_service(series, scheduled_retry=True).splitlines())
+            lines.append("")
+            lines.append(f"# --- {sysd.unit_name(series, 'timer', scheduled_retry=True)} ---")
+            lines.extend(sysd.generate_timer(series, retry_oc).splitlines())
 
         # Check if unit files already exist
         sysd_dir = sysd.SYSTEMD_DIR
@@ -280,9 +381,17 @@ class SchedulerService:
                 stdout="", stderr="",
                 error=f"no schedules found for series '{series}'",
             )
+        try:
+            validate_schedules(schedules, self._update_period(series))
+        except ValueError as exc:
+            return SchedulerCommandResult(
+                backend="systemd", action="apply", returncode=-1,
+                stdout="", stderr="", error=str(exc),
+            )
 
         # Build list of all OnCalendar lines
         oncalendars: list[str] = []
+        retry_oncalendars: list[str] = []
         for s in schedules:
             oc = sysd.cron_to_oncalendar(s.schedule)
             if oc is None:
@@ -291,7 +400,15 @@ class SchedulerService:
                     stdout="", stderr="",
                     error=f"unsupported cron expression: {s.schedule}",
                 )
-            oncalendars.append(oc)
+            if s.kind == "retry":
+                retry_oncalendars.append(oc)
+            else:
+                oncalendars.append(oc)
+        if not oncalendars:
+            return SchedulerCommandResult(
+                backend="systemd", action="apply", returncode=-1,
+                stdout="", stderr="", error="at least one primary schedule is required",
+            )
 
         # 1. Write systemd units
         original_units: dict[str, str | None] = {}
@@ -404,6 +521,40 @@ class SchedulerService:
                 stdout="", stderr="",
                 error=with_rollback_error("timer active verification failed — rolled back", rollback_errors),
             )
+
+        # 3e. Install a separate conditional retry service/timer.  The retry
+        # service carries --scheduled-retry so it can bypass update_period
+        # without bypassing rate-limit cooldown.
+        if retry_oncalendars:
+            retry_contents = {
+                "service": sysd.generate_service(series, scheduled_retry=True),
+                "timer": sysd.generate_timer(series, retry_oncalendars),
+            }
+            for suffix, content in retry_contents.items():
+                written = sysd.write_unit(
+                    series, suffix, content, scheduled_retry=True,
+                )
+                if written.returncode != 0:
+                    return written
+            dr = sysd.daemon_reload()
+            if dr.returncode != 0:
+                return dr
+            enabled = sysd.enable_timer(series, scheduled_retry=True)
+            if enabled.returncode != 0:
+                return enabled
+            restarted = sysd.restart_timer(series, scheduled_retry=True)
+            if restarted.returncode != 0:
+                return restarted
+            if not sysd.timer_is_enabled(series, scheduled_retry=True):
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error="retry timer enable verification failed",
+                )
+            if not sysd.timer_is_active(series, scheduled_retry=True):
+                return SchedulerCommandResult(
+                    backend="systemd", action="apply", returncode=-1,
+                    stdout="", stderr="", error="retry timer active verification failed",
+                )
 
         # 4. Remove cron for this series (only after timer is confirmed active)
         try:
@@ -527,11 +678,18 @@ class SchedulerService:
 
     # ── list_schedules / replace_schedules (DB only) ──────────────────
 
+    def _update_period(self, series: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT update_period FROM sync_policy WHERE series=?", (series,),
+            ).fetchone()
+        return str(row[0] if row else "12h")
+
     def list_schedules(self, series: str) -> list[ScheduleEntry]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, series, schedule, enabled, position "
+                "SELECT id, series, schedule, enabled, position, kind "
                 "FROM cron_schedule WHERE series=? ORDER BY position",
                 (series,),
             ).fetchall()
@@ -542,6 +700,7 @@ class SchedulerService:
                 schedule=r["schedule"],
                 enabled=bool(r["enabled"]),
                 position=r["position"],
+                kind=r["kind"],
             )
             for r in rows
         ]
@@ -552,7 +711,7 @@ class SchedulerService:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, series, schedule, enabled, position "
+                "SELECT id, series, schedule, enabled, position, kind "
                 "FROM cron_schedule WHERE series=? AND enabled=1 ORDER BY position",
                 (series,),
             ).fetchall()
@@ -563,21 +722,41 @@ class SchedulerService:
                 schedule=r["schedule"],
                 enabled=bool(r["enabled"]),
                 position=r["position"],
+                kind=r["kind"],
             )
             for r in rows
         ]
 
-    def replace_schedules(self, series: str, schedules: list[str]) -> int:
+    def replace_schedules(
+        self,
+        series: str,
+        schedules: list[str],
+        retry_schedules: list[str] | None = None,
+    ) -> int:
+        retry_schedules = retry_schedules or []
         with sqlite3.connect(self.db_path) as conn:
+            entries = [(schedule, "primary") for schedule in schedules]
+            entries.extend((schedule, "retry") for schedule in retry_schedules)
+            period_row = conn.execute(
+                "SELECT update_period FROM sync_policy WHERE series=?", (series,),
+            ).fetchone()
+            update_period = period_row[0] if period_row else "12h"
+            validate_schedules(
+                [
+                    ScheduleEntry(None, series, schedule, True, pos, kind)
+                    for pos, (schedule, kind) in enumerate(entries)
+                ],
+                update_period,
+            )
             conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
-            for pos, sched in enumerate(schedules):
+            for pos, (sched, kind) in enumerate(entries):
                 conn.execute(
-                    "INSERT INTO cron_schedule (series, enabled, schedule, position) "
-                    "VALUES (?, 1, ?, ?)",
-                    (series, sched, pos),
+                    "INSERT INTO cron_schedule (series, enabled, schedule, position, kind) "
+                    "VALUES (?, 1, ?, ?, ?)",
+                    (series, sched, pos, kind),
                 )
             conn.commit()
-        return len(schedules)
+        return len(entries)
 
     # ── status ─────────────────────────────────────────────────────────
 

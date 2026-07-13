@@ -1849,6 +1849,7 @@ async def run(args: argparse.Namespace) -> int:
     credential = load_cookie_file(args.cookie_file)
     dry_run = not args.apply
     had_error = False
+    completed_sync = False
 
     for config in configs:
         state = store.read_state(config.series)
@@ -1856,7 +1857,25 @@ async def run(args: argparse.Namespace) -> int:
             "state read series=%s keys=%s",
             config.series, sorted(state.keys()) if state else [],
         )
-        skip, skip_reason, next_run_at = should_skip_series(config, state, args.force)
+        scheduled_retry = bool(getattr(args, "scheduled_retry", False))
+        if scheduled_retry and not state.get("retry_pending", False):
+            result = {
+                "series": config.series,
+                "title": config.title,
+                "uid": config.uid,
+                "skipped": True,
+                "skip_reason": "retry_not_needed",
+            }
+            log_result(result)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            continue
+        if scheduled_retry:
+            rate_limited_until = int(state.get("rate_limited_until", 0) or 0)
+            skip = rate_limited_until > now_timestamp()
+            skip_reason = "rate_limit_cooldown" if skip else ""
+            next_run_at = rate_limited_until
+        else:
+            skip, skip_reason, next_run_at = should_skip_series(config, state, args.force)
         if skip:
             result = {
                 "series": config.series,
@@ -1901,6 +1920,8 @@ async def run(args: argparse.Namespace) -> int:
                 state["rate_limited_until"] = now_timestamp() + rate_limit_cooldown_seconds(config)
                 result["rate_limited_until"] = state["rate_limited_until"]
             if not dry_run:
+                if not scheduled_retry:
+                    state["retry_pending"] = True
                 store.write_state(config.series, state)
                 LOGGER.info("state saved series=%s (error)", config.series)
             LOGGER.exception("series failed series=%s uid=%s", config.series, config.uid)
@@ -1910,6 +1931,7 @@ async def run(args: argparse.Namespace) -> int:
 
         if not dry_run:
             state["last_success_at"] = now_timestamp()
+            state["retry_pending"] = False
             if "playwright" in result.get("fetch_source", ""):
                 state["last_browser_fallback_at"] = now_timestamp()
             if result.get("stopped_by_rate_limit"):
@@ -1920,12 +1942,13 @@ async def run(args: argparse.Namespace) -> int:
             LOGGER.info("state saved series=%s (success)", config.series)
         log_result(result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        completed_sync = True
 
     elapsed = time.time() - run_start
     LOGGER.info("run complete elapsed_seconds=%.1f", elapsed)
 
     # After successful sync with --apply, optionally run publish script.
-    if args.apply and getattr(args, "publish_script", None) and configs and not had_error:
+    if args.apply and getattr(args, "publish_script", None) and completed_sync and not had_error:
         LOGGER.info("running publish script: %s", args.publish_script)
         try:
             result = subprocess.run(
@@ -1977,6 +2000,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", type=parse_log_level, default="INFO", help="Log level: DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
     parser.add_argument("--debug", action="store_true", help="Shortcut for --log-level DEBUG (per-item details).")
     parser.add_argument("--force", action="store_true", help="Ignore per-series update and rate-limit cooldown gates.")
+    parser.add_argument("--scheduled-retry", action="store_true", help="Run only after a primary failure; bypass update-period gate only.")
     parser.add_argument("--apply", action="store_true", help="Write files and download missing media.")
     parser.add_argument("--publish-script", help="发布脚本路径；仅 --apply 全部成功后执行，失败返回非零。")
     return parser
