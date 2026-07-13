@@ -168,7 +168,7 @@ run_*.sh
 auto/
 
 # Real series configs (contains UIDs, cron schedules, keywords, etc.)
-# See configs/series.d/_template.yaml for the reference format.
+# See config/series.d/_template.yaml for the reference format.
 configs/series.d/
 
 # Unified runtime configuration. Track only redacted examples and the YAML

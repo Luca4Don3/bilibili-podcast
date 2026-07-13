@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .manager import ConfigError, ConfigManager
+from .manager import ConfigError, ConfigManager, UnsafeConfigError
 from .models import SeriesConfig
 from .repositories import LegacyYamlRepository
 from .schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
@@ -269,6 +269,9 @@ def migrate_legacy(
                 _write_migrated_series(validation_root / "series.db", configs)
         return MigrationResult(output, files, len(configs), normalizations, False)
 
+    for target in files:
+        if target.is_symlink():
+            raise UnsafeConfigError(f"unsafe migration target {target}: symlink")
     output.mkdir(parents=True, exist_ok=True)
     temp_parent = output / ".temp"
     backup_parent = output / ".backups"

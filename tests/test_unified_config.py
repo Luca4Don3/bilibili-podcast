@@ -208,6 +208,28 @@ def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) ->
     assert ConfigManager(output, environ={}).load().rss_users.users["user_1"].token == "test-token"
 
 
+def test_migration_apply_rejects_existing_config_symlink(tmp_path: Path) -> None:
+    env = _legacy_env(tmp_path)
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    series_dir = tmp_path / "series"
+    series_dir.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    linked = tmp_path / "linked-config"
+    linked.write_text("do not read or replace")
+    (output / "web.toml").symlink_to(linked)
+
+    with pytest.raises(UnsafeConfigError, match="unsafe migration target"):
+        migrate_legacy(
+            legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
+            legacy_rss_users=empty, output_root=output, apply=True,
+        )
+
+    assert (output / "web.toml").is_symlink()
+    assert linked.read_text() == "do not read or replace"
+
+
 def test_migration_preserves_primary_and_retry_schedules(tmp_path: Path) -> None:
     env = _legacy_env(tmp_path)
     web_env = tmp_path / "web.env"
