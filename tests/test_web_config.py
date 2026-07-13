@@ -50,6 +50,7 @@ def test_filters_form_can_disable_exclude_paid(monkeypatch, tmp_path: Path) -> N
                 exclude_keywords="",
                 advertisement_keywords="",
                 include_keywords="",
+                exclude_season_ids="5492168",
                 paid_preview_enabled=False,
                 retry_after_days=4,
                 min_duration_seconds=0,
@@ -66,6 +67,12 @@ def test_filters_form_can_disable_exclude_paid(monkeypatch, tmp_path: Path) -> N
     assert row is not None
     assert row["value"] == "false"
     assert row["enabled"] == 1
+    with db.transaction(str(db_path)) as conn:
+        season = conn.execute(
+            "SELECT value FROM filter_rule "
+            "WHERE series='webpaid' AND rule_type='exclude_season_id'"
+        ).fetchone()
+    assert season["value"] == "5492168"
 
 
 def test_preview_template_preserves_zero_keep_last() -> None:

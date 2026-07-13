@@ -63,6 +63,7 @@ def sample_config() -> SeriesConfig:
             "exclude_paid": True,
             "exclude_bvids": ["BV1xx", "BV2yy"],
             "advertisement_bvids": ["BV3zz"],
+            "exclude_season_ids": [5492168],
             "exclude_keywords": ["spam"],
             "advertisement_keywords": ["ad"],
             "include_keywords": [],
@@ -223,6 +224,7 @@ class TestUpsertFilters:
         assert "advertisement_bvid" in types
         assert "exclude_keyword" in types
         assert "advertisement_keyword" in types
+        assert "exclude_season_id" in types
 
     def test_upsert_filters_replaces(self, db_path: Path, sample_config: SeriesConfig):
         with db.transaction(str(db_path)) as conn:
@@ -330,6 +332,7 @@ class TestLoadSeriesConfigs:
         assert "BV1xx" in c.filters["exclude_bvids"]
         assert "BV2yy" in c.filters["exclude_bvids"]
         assert "BV3zz" in c.filters["advertisement_bvids"]
+        assert c.filters["exclude_season_ids"] == [5492168]
         assert "spam" in c.filters["exclude_keywords"]
         assert "ad" in c.filters["advertisement_keywords"]
         assert c.paid_preview["enabled"] is False
@@ -499,6 +502,7 @@ class TestListFilterEntries:
             "exclude_paid": True,
             "exclude_bvids": ["BV1"],
             "advertisement_bvids": ["BV2"],
+            "exclude_season_ids": [123456],
             "exclude_keywords": ["kw1"],
             "advertisement_keywords": ["kw2"],
             "include_keywords": ["kw3"],
@@ -507,6 +511,7 @@ class TestListFilterEntries:
         assert ("exclude_paid", "true") in entries
         assert ("exclude_bvid", "BV1") in entries
         assert ("advertisement_bvid", "BV2") in entries
+        assert ("exclude_season_id", "123456") in entries
         assert ("exclude_keyword", "kw1") in entries
         assert ("advertisement_keyword", "kw2") in entries
         assert ("include_keyword", "kw3") in entries

@@ -44,6 +44,7 @@ class SeriesConfig:
         path = Path(path)
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         sync = data.get("sync") or {}
+        filters = data.get("filters") or {}
         keep_last = sync.get("keep_last", 100)
 
         series = data.get("series")
@@ -64,6 +65,13 @@ class SeriesConfig:
             raise ValueError("source.space_url or source.uid is required")
         if not isinstance(keep_last, int) or keep_last < 0:
             raise ValueError("sync.keep_last must be 0 or a positive integer")
+        try:
+            exclude_season_ids = [int(value) for value in filters.get("exclude_season_ids", [])]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("filters.exclude_season_ids must contain positive integers") from exc
+        if any(value <= 0 for value in exclude_season_ids):
+            raise ValueError("filters.exclude_season_ids must contain positive integers")
+        filters["exclude_season_ids"] = exclude_season_ids
 
         return cls(
             series=series,
@@ -78,7 +86,7 @@ class SeriesConfig:
             lang=data.get("lang") or "zh-CN",
             source=source,
             sync=sync,
-            filters=data.get("filters") or {},
+            filters=filters,
             paid_preview=data.get("paid_preview") or {"enabled": False},
             keep_last=keep_last,
         )
