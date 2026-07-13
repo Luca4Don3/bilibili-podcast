@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from typing import Any
 
@@ -16,6 +17,52 @@ BOOL_FIELDS = {
     "browser_fallback",
     "require_paid_state_confirmation",
 }
+
+ENUM_FIELDS = {
+    "format": {"audio", "video"},
+    "media_mode": {"auto", "manual"},
+    "quality": {"64K", "132K", "192K"},
+    "fetch_strategy": {"api_first", "browser_first"},
+}
+POSITIVE_FIELDS = {
+    "page_size", "incremental_page_size", "max_pages", "max_requests_per_series",
+}
+
+
+def _validate_policy(sync: dict[str, Any]) -> None:
+    unknown = sorted(set(sync) - set(SYNC_POLICY_COLUMNS))
+    if unknown:
+        raise ValueError(f"unknown sync policy field: {unknown[0]}")
+    for key, default in SYNC_POLICY_DEFAULTS.items():
+        value = sync.get(key, default)
+        if key in BOOL_FIELDS:
+            if not isinstance(value, (bool, int)) or value not in (0, 1, False, True):
+                raise ValueError(f"invalid sync policy type: {key}")
+        elif isinstance(default, int):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"invalid sync policy type: {key}")
+        elif isinstance(default, float):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"invalid sync policy type: {key}")
+        elif not isinstance(value, str):
+            raise ValueError(f"invalid sync policy type: {key}")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if not math.isfinite(float(value)) or value < 0:
+                raise ValueError(f"invalid sync policy value: {key}")
+    for key, allowed in ENUM_FIELDS.items():
+        if sync.get(key, SYNC_POLICY_DEFAULTS[key]) not in allowed:
+            raise ValueError(f"invalid sync policy value: {key}")
+    for key in POSITIVE_FIELDS:
+        if sync.get(key, SYNC_POLICY_DEFAULTS[key]) <= 0:
+            raise ValueError(f"invalid sync policy value: {key}")
+    if sync.get("page_size", SYNC_POLICY_DEFAULTS["page_size"]) > 50:
+        raise ValueError("invalid sync policy value: page_size")
+    if sync.get("browser_wait_min_seconds", 0) > sync.get("browser_wait_max_seconds", 0):
+        raise ValueError("browser_wait_min_seconds exceeds browser_wait_max_seconds")
+    minimum = sync.get("min_duration_seconds", 0)
+    maximum = sync.get("max_duration_seconds", 0)
+    if maximum and minimum > maximum:
+        raise ValueError("min_duration_seconds exceeds max_duration_seconds")
 
 
 def _sync_values(sync: dict[str, Any]) -> list[Any]:
@@ -54,8 +101,10 @@ class SyncPolicyService:
 
     def upsert(self, series: str, sync: dict[str, Any]) -> None:
         """Insert or update the full sync_policy row."""
-        self._validate_update_period(series, sync.get("update_period", "12h"))
-        values = _sync_values(sync)
+        merged = {**SYNC_POLICY_DEFAULTS, **sync}
+        _validate_policy(merged)
+        self._validate_update_period(series, merged["update_period"])
+        values = _sync_values(merged)
         self.conn.execute(SQL_INSERT, (series, *values))
 
     def update_fields(self, series: str, updates: dict[str, Any]) -> None:
@@ -63,14 +112,17 @@ class SyncPolicyService:
         for unspecified fields via full upsert (insert-then-update)."""
         if not updates:
             return
-        if "update_period" in updates:
-            self._validate_update_period(series, updates["update_period"])
-        # Ensure row exists
         existing = self.conn.execute(
-            "SELECT 1 FROM sync_policy WHERE series=?", (series,),
+            f"SELECT {', '.join(SYNC_POLICY_COLUMNS)} FROM sync_policy WHERE series=?",
+            (series,),
         ).fetchone()
         if not existing:
-            self.conn.execute("INSERT INTO sync_policy (series) VALUES (?)", (series,))
+            merged = dict(SYNC_POLICY_DEFAULTS)
+        else:
+            merged = dict(zip(SYNC_POLICY_COLUMNS, existing))
+        merged.update(updates)
+        _validate_policy(merged)
+        self._validate_update_period(series, merged["update_period"])
 
         normalized = [
             (key, int(bool(value)) if key in BOOL_FIELDS else value)
@@ -78,6 +130,8 @@ class SyncPolicyService:
         ]
         set_clause = ", ".join(f"{key}=?" for key, _ in normalized)
         values = [value for _, value in normalized]
+        if not existing:
+            self.conn.execute("INSERT INTO sync_policy (series) VALUES (?)", (series,))
         self.conn.execute(
             f"UPDATE sync_policy SET {set_clause} WHERE series=?",
             (*values, series),

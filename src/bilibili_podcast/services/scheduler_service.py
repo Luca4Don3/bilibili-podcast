@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import re
 import sqlite3
@@ -39,8 +40,13 @@ def _period_seconds(value: object) -> int:
     if not match:
         raise ValueError(f"invalid update_period: {value}")
     amount = float(match.group(1))
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError(f"invalid update_period: {value}")
     multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
-    return int(amount * multiplier)
+    seconds = int(amount * multiplier)
+    if seconds < 1:
+        raise ValueError(f"invalid update_period: {value}")
+    return seconds
 
 
 def _cron_values(field: str, minimum: int, maximum: int) -> set[int]:
@@ -87,6 +93,7 @@ def _weekly_occurrences(schedule: str) -> set[int]:
 
 
 def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> None:
+    period = _period_seconds(update_period)
     seen: dict[int, ScheduleEntry] = {}
     primary_points: set[int] = set()
     if any(entry.kind == "retry" for entry in entries) and not any(
@@ -106,7 +113,6 @@ def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> N
                 primary_points.add(point)
     if len(primary_points) < 2:
         return
-    period = _period_seconds(update_period)
     ordered = sorted(primary_points)
     gaps = [right - left for left, right in zip(ordered, ordered[1:])]
     gaps.append(7 * 86400 + ordered[0] - ordered[-1])
@@ -168,11 +174,13 @@ class SchedulerService:
         python_executable: Optional[str] = None,
         crontab_script: Optional[str] = None,
         cron_script_dir: Optional[str] = None,
+        command_timeout_seconds: int = 30,
     ) -> None:
         self.db_path = db_path
         self._python = python_executable or sys.executable
         self._crontab = crontab_script or _find_crontab_script()
         self._cron_script_dir = cron_script_dir
+        self._command_timeout_seconds = command_timeout_seconds
 
     def _ensure_crontab(self) -> str:
         if not self._crontab:
@@ -224,7 +232,10 @@ class SchedulerService:
                 script_dir = tmp_dir
 
             cmd.extend(["--script-dir", script_dir, "--print"])
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=self._command_timeout_seconds,
+            )
             return SchedulerCommandResult(
                 backend=backend,
                 action="plan",
@@ -242,7 +253,7 @@ class SchedulerService:
                 stdout="",
                 stderr="",
                 command=cmd,
-                error=f"执行超时（30 秒）",
+                error=f"执行超时（{self._command_timeout_seconds} 秒）",
             )
         except Exception as e:
             return SchedulerCommandResult(
@@ -309,10 +320,10 @@ class SchedulerService:
             all_oc = [value for _, value in primary_converted]
             timer = sysd.generate_timer(series, all_oc)
             lines.append("")
-            lines.append(f"# --- bilipod-sync@{series}.service ---")
+            lines.append(f"# --- {sysd.unit_name(series, 'service')} ---")
             lines.extend(svc.splitlines())
             lines.append("")
-            lines.append(f"# --- bilipod-sync@{series}.timer ---")
+            lines.append(f"# --- {sysd.unit_name(series, 'timer')} ---")
             lines.extend(timer.splitlines())
             lines.append("")
             break  # one service + one timer with all OnCalendar lines
@@ -378,7 +389,10 @@ class SchedulerService:
             if cron_script_dir:
                 cmd.extend(["--script-dir", cron_script_dir])
             cmd.append("--apply")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=self._command_timeout_seconds,
+            )
             return SchedulerCommandResult(
                 backend=backend,
                 action="apply",
@@ -396,7 +410,7 @@ class SchedulerService:
                 stdout="",
                 stderr="",
                 command=cmd,
-                error=f"执行超时（30 秒）",
+                error=f"执行超时（{self._command_timeout_seconds} 秒）",
             )
         except Exception as e:
             return SchedulerCommandResult(
@@ -651,7 +665,8 @@ class SchedulerService:
 
     def _read_crontab(self) -> str:
         read_result = subprocess.run(
-            self._crontab_command("-l"), capture_output=True, text=True, timeout=10,
+            self._crontab_command("-l"), capture_output=True, text=True,
+            timeout=self._command_timeout_seconds,
         )
         if read_result.returncode == 0:
             return read_result.stdout
@@ -662,7 +677,8 @@ class SchedulerService:
     def _write_crontab(self, content: str) -> None:
         subprocess.run(
             self._crontab_command("-"), input=content,
-            capture_output=True, text=True, timeout=10, check=True,
+            capture_output=True, text=True,
+            timeout=self._command_timeout_seconds, check=True,
         )
 
     def _set_scheduler_backend(self, series: str, backend: str) -> None:

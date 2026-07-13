@@ -30,7 +30,9 @@ def _load_web_server(monkeypatch, db_path: Path):
         sync=SimpleNamespace(
             paths=SimpleNamespace(cookie_file=root / "cookie.txt", lock_file=root / "sync.lock"),
             browser=SimpleNamespace(user_data_root=root / "browser"),
+            timeouts=SimpleNamespace(publish_seconds=60),
         ),
+        scheduler=SimpleNamespace(command_timeout_seconds=30),
         publish=SimpleNamespace(publish=SimpleNamespace(
             enabled=False, media_base_url="https://media.example.invalid", script=None,
         )),
@@ -185,6 +187,7 @@ def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tm
         manual_media=SimpleNamespace(
             enabled=True, allowed_dirs=(allow_dir,), follow_symlinks=False,
         ),
+        sync=SimpleNamespace(timeouts=SimpleNamespace(publish_seconds=60)),
     )
     monkeypatch.setenv("BILIPOD_RSS_PUBLISH", str(publish_script))
 
@@ -230,6 +233,21 @@ def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tm
     assert "Manual paid item" in rss
     assert f"{bvid}_64K.mp3?token=__MEDIA_PLACEHOLDER__" in rss
     run.assert_not_called()
+
+    src.write_text("replacement")
+    original_rss = (rss_root / "paidweb.xml").read_text()
+    with patch.object(server, "_csrf_guard", return_value=None), patch.object(
+        server, "rebuild_paid_rss", side_effect=ValueError("rebuild failed")
+    ):
+        failed = asyncio.run(
+            server.manual_media_attach(
+                request=object(), series="paidweb", csrf_token="csrf", bvid=bvid,
+                server_path=str(src), replace="1",
+            )
+        )
+    assert "error=" in failed.headers["location"]
+    assert (media_root / "paidweb" / f"{bvid}_64K.mp3").read_text() == "audio"
+    assert (rss_root / "paidweb.xml").read_text() == original_rss
 
 
 def test_manual_media_attach_rejects_unknown_series(monkeypatch, tmp_path: Path) -> None:

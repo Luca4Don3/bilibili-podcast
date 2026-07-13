@@ -69,6 +69,7 @@ class BrowserConfig:
 
 @dataclass(frozen=True)
 class TimeoutConfig:
+    sync_seconds: int
     preview_seconds: int
     publish_seconds: int
 

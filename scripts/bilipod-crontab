@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import getpass
+import hashlib
 import os
 import re
 import shlex
@@ -24,6 +25,10 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+PROJECT_SRC = Path(__file__).resolve().parent.parent / "src"
+if PROJECT_SRC.is_dir():
+    sys.path.insert(0, str(PROJECT_SRC))
 
 try:
     import yaml
@@ -37,6 +42,8 @@ SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 # Markers for auto-generated crontab sections
 AUTO_BEGIN_MARKER = "# BEGIN BILIPOD AUTO"
 AUTO_END_MARKER = "# END BILIPOD AUTO"
+COMMAND_TIMEOUT = 10
+SYNC_UNIT_GLOB = "bilipod-sync@*.service"
 
 
 def cron_marker_title(title, series: str) -> str:
@@ -47,10 +54,11 @@ def cron_marker_title(title, series: str) -> str:
 
 def systemd_timer_is_enabled(series: str) -> bool:
     """Return whether an existing systemd timer should own this series."""
+    timer_unit = SYNC_UNIT_GLOB.replace("*", series).removesuffix(".service") + ".timer"
     try:
         result = subprocess.run(
-            ["systemctl", "is-enabled", f"bilipod-sync@{series}.timer"],
-            capture_output=True, text=True, timeout=10,
+            ["systemctl", "is-enabled", timer_unit],
+            capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -225,9 +233,11 @@ def derive_cron_from_period(hours: int, series_name: str) -> list[str]:
         return []
 
     # Use series name hash to pick a stable non-round minute
-    minute = (abs(hash(series_name)) % 54) + 2  # 2-55 range
+    minute_seed = int.from_bytes(hashlib.sha256(series_name.encode()).digest()[:8], "big")
+    minute = (minute_seed % 54) + 2  # 2-55 range
     # Pick a stable starting hour to avoid :00/:30
-    start_hour = (abs(hash(series_name + "_base")) % 6) + 1  # 1-6
+    hour_seed = int.from_bytes(hashlib.sha256(f"{series_name}_base".encode()).digest()[:8], "big")
+    start_hour = (hour_seed % 6) + 1  # 1-6
 
     num_entries = max(24 // hours, 1)
     if 24 % hours != 0:
@@ -308,17 +318,23 @@ def merge_with_existing_crontab(new_auto: str, user: str) -> str:
     current_user = getpass.getuser()
     try:
         if user and user != current_user:
-            existing = subprocess.run(
+            result = subprocess.run(
                 ["crontab", "-l", "-u", user],
-                capture_output=True, text=True, timeout=10,
-            ).stdout
+                capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
+            )
         else:
-            existing = subprocess.run(
+            result = subprocess.run(
                 ["crontab", "-l"],
-                capture_output=True, text=True, timeout=10,
-            ).stdout
-    except Exception:
+                capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cannot read existing crontab: {type(exc).__name__}") from None
+    if result.returncode == 0:
+        existing = result.stdout
+    elif "no crontab" in (result.stderr or "").lower():
         existing = ""
+    else:
+        raise RuntimeError("cannot read existing crontab: command failed")
 
     # Remove existing auto sections
     cleaned = re.sub(
@@ -349,12 +365,12 @@ def write_crontab(content: str, user: str):
     if user and user != current_user:
         proc = subprocess.run(
             ["crontab", "-u", user, "-"],
-            input=content, capture_output=True, text=True, timeout=10,
+            input=content, capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
         )
     else:
         proc = subprocess.run(
             ["crontab", "-"],
-            input=content, capture_output=True, text=True, timeout=10,
+            input=content, capture_output=True, text=True, timeout=COMMAND_TIMEOUT,
         )
     if proc.returncode != 0:
         print(f"  error writing crontab: {proc.stderr.strip()}", file=sys.stderr)
@@ -364,25 +380,42 @@ def write_crontab(content: str, user: str):
 
 
 def main():
+    global COMMAND_TIMEOUT, SYNC_UNIT_GLOB
     parser = argparse.ArgumentParser(description="Generate bilipod crontab from series configs")
     parser.add_argument("--config-dir", help="Explicit legacy YAML rollback directory")
     parser.add_argument("--config-db", default=None, help="SQLite database path (replaces --config-dir)")
     parser.add_argument("--apply", action="store_true", help="Write crontab and wrapper scripts")
     parser.add_argument("--print", action="store_true", help="Print generated crontab (default)")
-    parser.add_argument("--script-dir", default="auto", help="Directory for auto-generated scripts")
-    parser.add_argument("--cron-user", default="bilipod", help="Crontab user")
+    parser.add_argument("--script-dir", default=None, help="Directory for auto-generated scripts")
+    parser.add_argument("--cron-user", default=None, help="Crontab user")
     parser.add_argument("--force", action="store_true", help="Overwrite existing wrapper scripts")
     args = parser.parse_args()
 
-    if os.environ.get("BILIPOD_CONFIG_ROOT") and not args.config_db and not args.config_dir:
-        from bilibili_podcast.config import ConfigManager
+    snapshot = None
+    config_root = os.environ.get("BILIPOD_CONFIG_ROOT")
+    needs_unified_defaults = not args.config_db and not args.config_dir
+    if config_root and (needs_unified_defaults or Path(config_root).is_dir()):
+        from bilibili_podcast.config import ConfigError, ConfigManager
 
-        snapshot = ConfigManager().load()
-        args.config_db = str(snapshot.app.database.path)
-        args.script_dir = str(snapshot.scheduler.paths.wrapper_dir)
-        args.cron_user = snapshot.scheduler.runtime.user
+        try:
+            snapshot = ConfigManager().load()
+        except ConfigError as exc:
+            print(f"ERROR: configuration error: {exc}", file=sys.stderr)
+            raise SystemExit(exc.exit_code) from None
+        if not args.config_db and not args.config_dir:
+            args.config_db = str(snapshot.app.database.path)
+        if args.script_dir is None:
+            args.script_dir = str(snapshot.scheduler.paths.wrapper_dir)
+        if args.cron_user is None:
+            args.cron_user = snapshot.scheduler.runtime.user
+        COMMAND_TIMEOUT = snapshot.scheduler.command_timeout_seconds
+        SYNC_UNIT_GLOB = snapshot.scheduler.units.sync_glob
     elif not args.config_db and not args.config_dir:
         parser.error("--config-db or explicit --config-dir is required")
+    if args.script_dir is None:
+        args.script_dir = "auto"
+    if args.cron_user is None:
+        args.cron_user = "bilipod"
 
     # Default: print if neither --apply nor --print
     do_print = args.print or not args.apply
@@ -399,28 +432,6 @@ def main():
     print(f"loaded {len(configs)} configs from {source_label}", file=sys.stderr)
 
     script_dir = Path(args.script_dir)
-    if do_apply:
-        script_dir.mkdir(parents=True, exist_ok=True)
-
-    # Generate wrappers only for apply; read-only plans never write files.
-    generated_scripts = 0
-    if do_apply:
-        if not os.environ.get("BILIPOD_CONFIG_ROOT"):
-            parser.error("BILIPOD_CONFIG_ROOT is required with --apply")
-        for config in configs:
-            if not config.get("enabled", True):
-                continue
-            series = config.get("series", "")
-            if not series or not SERIES_SLUG_RE.match(series):
-                continue
-            schedules = parse_cron_schedules(config)
-            if not schedules:
-                continue
-            script_path = generate_wrapper_script(series, args.config_dir, args.config_db, str(script_dir), args.force)
-            if script_path:
-                generated_scripts += 1
-
-    print(f"  {generated_scripts} wrapper scripts ready in {script_dir}", file=sys.stderr)
 
     # Generate crontab
     crontab_text = generate_crontab(configs, args.config_dir, args.config_db, str(script_dir))
@@ -430,9 +441,36 @@ def main():
             print(crontab_text)
         else:
             print("# (no auto cron entries)")
+    if not do_apply:
+        print(f"  0 wrapper scripts ready in {script_dir}", file=sys.stderr)
 
     if do_apply:
-        merged = merge_with_existing_crontab(crontab_text, args.cron_user)
+        try:
+            merged = merge_with_existing_crontab(crontab_text, args.cron_user)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+
+        if not os.environ.get("BILIPOD_CONFIG_ROOT"):
+            parser.error("BILIPOD_CONFIG_ROOT is required with --apply")
+        script_dir.mkdir(parents=True, exist_ok=True)
+        generated_scripts = 0
+        for config in configs:
+            if not config.get("enabled", True):
+                continue
+            series = config.get("series", "")
+            if not series or not SERIES_SLUG_RE.match(series):
+                continue
+            schedules = parse_cron_schedules(config)
+            if not schedules:
+                continue
+            script_path = generate_wrapper_script(
+                series, args.config_dir, args.config_db, str(script_dir), args.force,
+            )
+            if script_path:
+                generated_scripts += 1
+        print(f"  {generated_scripts} wrapper scripts ready in {script_dir}", file=sys.stderr)
+
         if write_crontab(merged, args.cron_user):
             print("  ok — run 'crontab -l -u bilipod' to verify", file=sys.stderr)
         else:

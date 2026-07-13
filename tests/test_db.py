@@ -324,6 +324,32 @@ def test_sync_policy_update_rejects_new_schedule_conflict(db_path: Path):
     assert value == "12h"
 
 
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    [
+        ({"unknown_column": 1}, "unknown sync policy field"),
+        ({"update_period": "0h"}, "invalid update_period"),
+        ({"request_interval_seconds": float("nan")}, "invalid sync policy value"),
+        ({"quality": "lossless"}, "invalid sync policy value"),
+        ({"page_size": 0}, "invalid sync policy value"),
+        ({"browser_wait_min_seconds": 9.0, "browser_wait_max_seconds": 8.0}, "exceeds"),
+        ({"min_duration_seconds": 20, "max_duration_seconds": 10}, "exceeds"),
+    ],
+)
+def test_sync_policy_rejects_invalid_updates_without_inserting_row(
+    db_path: Path, updates: dict, message: str,
+) -> None:
+    from bilibili_podcast.services.sync_policy_service import SyncPolicyService
+
+    with db.transaction(str(db_path)) as conn:
+        conn.execute("INSERT INTO series(series,title,author) VALUES('invalid-policy','P','A')")
+        with pytest.raises(ValueError, match=message):
+            SyncPolicyService(conn).update_fields("invalid-policy", updates)
+        assert conn.execute(
+            "SELECT 1 FROM sync_policy WHERE series='invalid-policy'"
+        ).fetchone() is None
+
+
 # ── READ: load_series_configs ───────────────────────────────────────
 
 

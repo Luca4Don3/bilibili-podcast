@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import stat
@@ -223,6 +224,8 @@ class ConfigManager:
             if spec.path == "manual_media.allowed_dirs" and not all(isinstance(item, str) for item in value):
                 raise ConfigError(f"invalid configuration type {path}:{spec.path}")
             if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise ConfigError(f"non-finite configuration value {path}:{spec.path}")
                 if spec.minimum is not None and value < spec.minimum:
                     raise ConfigError(f"configuration value below minimum {path}:{spec.path}")
                 if spec.maximum is not None and value > spec.maximum:
@@ -289,6 +292,24 @@ class ConfigManager:
         )
         if any(not configured_path.is_absolute() for configured_path in required_paths):
             raise ConfigError("runtime paths must be absolute in unified configuration")
+        web_unit = snapshot.scheduler.units.web
+        sync_glob = snapshot.scheduler.units.sync_glob
+        if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", web_unit):
+            raise ConfigError("invalid scheduler unit name scheduler.toml:units.web")
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.@*-]+\.service", sync_glob)
+            or sync_glob.count("*") != 1
+        ):
+            raise ConfigError("invalid scheduler unit glob scheduler.toml:units.sync_glob")
+        sync_pattern = re.escape(sync_glob).replace(r"\*", ".*")
+        if re.fullmatch(sync_pattern, web_unit):
+            raise ConfigError("scheduler unit glob overlaps web unit scheduler.toml:units")
+        unit_values = (
+            str(snapshot.root), str(snapshot.app.install.app_dir),
+            str(snapshot.app.executables.sync), str(snapshot.scheduler.paths.systemd_dir),
+        )
+        if any(re.search(r'[\s"\\]', value) for value in unit_values):
+            raise ConfigError("systemd configuration paths contain unsupported characters")
         if snapshot.manual_media.enabled:
             if not snapshot.manual_media.allowed_dirs:
                 raise ConfigError("missing enabled dependency manual-media.toml:manual_media.allowed_dirs")
@@ -334,7 +355,10 @@ class ConfigManager:
                 downloads=DownloadConfig(s["downloads.max_per_run"], s["downloads.scheduled_max_per_run"], float(s["downloads.min_free_gb"])),
                 paths=SyncPathsConfig(_path(s["paths.cookie_file"]), _path(s["paths.lock_file"])),
                 browser=BrowserConfig(_path(s["browser.user_data_root"]), _path(s["browser.playwright_browsers_path"]), float(s["browser.login_wait_seconds"])),
-                timeouts=TimeoutConfig(s["timeouts.preview_seconds"], s["timeouts.publish_seconds"]),
+                timeouts=TimeoutConfig(
+                    s["timeouts.sync_seconds"], s["timeouts.preview_seconds"],
+                    s["timeouts.publish_seconds"],
+                ),
                 logging=LoggingConfig(s["logging.level"].upper(), s["logging.retention_days"], s["logging.max_bytes"], s["logging.backup_count"]),
             ),
             web=WebConfig(

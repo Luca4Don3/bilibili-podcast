@@ -65,6 +65,11 @@ class TestScheduleValidation:
         with pytest.raises(ValueError, match="at least one primary"):
             validate_schedules([_entry("0 12 * * *", "retry")], "12h")
 
+    @pytest.mark.parametrize("period", ["0", "0h", "0.1s"])
+    def test_non_positive_or_subsecond_update_period_rejected(self, period):
+        with pytest.raises(ValueError, match="invalid update_period"):
+            validate_schedules([], period)
+
 
 class TestRetryLifecycle:
     @staticmethod
@@ -288,6 +293,13 @@ class TestUnitGeneration:
     def test_unit_name(self):
         assert sysd.unit_name("demo-series") == "bilipod-sync@demo-series.service"
         assert sysd.unit_name("demo-series", "timer") == "bilipod-sync@demo-series.timer"
+
+    def test_unit_name_uses_configured_sync_glob(self):
+        sysd._CONFIG.scheduler.units = SimpleNamespace(sync_glob="podcast-*.service")
+        assert sysd.unit_name("demo-series") == "podcast-demo-series.service"
+        assert sysd.unit_name("demo-series", "timer") == "podcast-demo-series.timer"
+        assert sysd.unit_name("demo-series", scheduled_retry=True) == \
+            "bilipod-retry@demo-series.service"
 
     def test_write_unit_reports_sudo_chmod_failure(self, tmp_path: Path):
         import subprocess

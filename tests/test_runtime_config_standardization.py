@@ -14,13 +14,13 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
     for directory in (app_dir, venv_bin, systemd_dir, config_root / ".backups", fake_bin):
         directory.mkdir(parents=True)
 
-    sync_unit = systemd_dir / "bilipod-sync@demo.service"
+    sync_unit = systemd_dir / "podcast-sync-demo.service"
     sync_unit.write_text(
         "[Service]\nEnvironmentFile=/legacy.env\n"
         "Environment=PLAYWRIGHT_BROWSERS_PATH=/legacy/browser\n"
         "ExecStart=/legacy/sync --cookie-file /legacy/cookie\n"
     )
-    web_unit = systemd_dir / "bilipod-web.service"
+    web_unit = systemd_dir / "podcast-web.service"
     web_unit.write_text(
         "[Service]\nEnvironmentFile=/legacy-web.env\n"
         "Environment=BILIPOD_WEB_PASSWORD=legacy\n"
@@ -35,6 +35,7 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
         "scheduler": {
             "paths": {"systemd_dir": str(systemd_dir)},
             "runtime": {"user": "bilipod", "group": "bilipod"},
+            "units": {"web": "podcast-web.service", "sync_glob": "podcast-sync-*.service"},
         },
         "sync": {"downloads": {"scheduled_max_per_run": 1}},
     }
@@ -137,6 +138,7 @@ def test_standardize_restores_units_when_later_rewrite_fails(tmp_path: Path) -> 
         "scheduler": {
             "paths": {"systemd_dir": str(systemd_dir)},
             "runtime": {"user": "bilipod", "group": "bilipod"},
+            "units": {"web": "bilipod-web.service", "sync_glob": "bilipod-sync@*.service"},
         },
         "sync": {"downloads": {"scheduled_max_per_run": 1}},
     }

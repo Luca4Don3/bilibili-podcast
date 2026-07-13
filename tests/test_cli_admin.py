@@ -43,9 +43,10 @@ def reset_admin_config_snapshot(tmp_path: Path):
         sync=SimpleNamespace(
             paths=SimpleNamespace(cookie_file="", lock_file=tmp_path / "sync.lock"),
             browser=SimpleNamespace(user_data_root=tmp_path / "browser"),
-            downloads=SimpleNamespace(scheduled_max_per_run=1, min_free_gb=5.0),
-            timeouts=SimpleNamespace(preview_seconds=120, publish_seconds=60),
+            downloads=SimpleNamespace(max_per_run=20, scheduled_max_per_run=1, min_free_gb=5.0),
+            timeouts=SimpleNamespace(sync_seconds=300, preview_seconds=120, publish_seconds=60),
         ),
+        scheduler=SimpleNamespace(command_timeout_seconds=30),
         publish=SimpleNamespace(publish=SimpleNamespace(
             enabled=False, media_base_url="https://media.example.invalid", script=None,
         )),
@@ -505,6 +506,12 @@ def test_add_update_existing_preserves_unspecified_fields(tmp_path: Path) -> Non
         ns.add_yes = True
         cli_admin.cmd_add(ns)
 
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE sync_policy SET update_period_grace_seconds=321, media_mode='manual' "
+            "WHERE series='updtest'"
+        )
+
     with patch.object(sys, "stdin"), patch.object(sys, "stdout"):
         p = cli_admin.build_parser()
         ns = p.parse_args([
@@ -521,11 +528,15 @@ def test_add_update_existing_preserves_unspecified_fields(tmp_path: Path) -> Non
     row = conn.execute(
         "SELECT title, description, cover_art, category FROM series WHERE series='updtest'"
     ).fetchone()
+    sync_row = conn.execute(
+        "SELECT update_period_grace_seconds, media_mode FROM sync_policy WHERE series='updtest'"
+    ).fetchone()
     conn.close()
     assert row[0] == "Updated"
     assert row[1] == "keep me", f"description should be preserved, got '{row[1]}'"
     assert row[2] == "http://cover", f"cover_art should be preserved, got '{row[2]}'"
     assert row[3] == "tech", f"category should be preserved, got '{row[3]}'"
+    assert sync_row == (321, "manual")
 
 
 def test_cron_set_yes_writes_to_db(tmp_path: Path) -> None:
@@ -646,7 +657,29 @@ def test_sync_dry_run_has_production_params(tmp_path: Path) -> None:
     assert "--media-base-url" in cmd
     assert "--browser-user-data-root" in cmd
     assert "--max-downloads-per-run" in cmd
+    assert cmd[cmd.index("--max-downloads-per-run") + 1] == "20"
     assert "--min-free-gb" in cmd
+
+
+def test_sync_publish_timeout_returns_sync_failure(tmp_path: Path) -> None:
+    db_path = _migrate(tmp_path)
+    _create_minimal_series(db_path)
+    cli_admin._CONFIG.publish.publish.enabled = True
+    cli_admin._CONFIG.publish.publish.script = Path("/tmp/publish-hook")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "/tmp/publish-hook":
+            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    with patch.object(cli_admin, "_find_sync_bin", return_value="/tmp/bilibili-podcast"), \
+            patch.object(subprocess, "run", side_effect=fake_run):
+        args = cli_admin.build_parser().parse_args(
+            ["--config-db", db_path, "--yes", "sync", "synctest", "--apply"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_admin.cmd_sync(args)
+    assert exc.value.code == cli_admin.EXIT_SYNC_FAIL
 
 
 def test_sync_apply_ignores_legacy_publish_environment(tmp_path: Path) -> None:
@@ -802,6 +835,63 @@ def test_crontab_database_failure_does_not_write_scheduler_files(tmp_path: Path)
     assert result.returncode == 2
     assert "cannot load scheduling configuration" in result.stderr
     assert not wrapper_dir.exists()
+
+
+def test_crontab_read_failure_never_writes_replacement(monkeypatch) -> None:
+    import runpy
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    module = runpy.run_path(str(script))
+    calls = []
+
+    def failed_read(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "permission denied")
+
+    monkeypatch.setattr(subprocess, "run", failed_read)
+    with pytest.raises(RuntimeError, match="cannot read existing crontab"):
+        module["merge_with_existing_crontab"]("0 1 * * * /new\n", "bilipod")
+    assert len(calls) == 1
+
+    generated = MagicMock()
+    monkeypatch.setitem(module, "load_configs", lambda *_: [{
+        "series": "demo", "enabled": True,
+        "cron": {"enabled": True, "schedules": ["0 1 * * *"]},
+    }])
+    monkeypatch.setitem(
+        module, "merge_with_existing_crontab",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("cannot read existing crontab")),
+    )
+    monkeypatch.setitem(module, "generate_wrapper_script", generated)
+    monkeypatch.delenv("BILIPOD_CONFIG_ROOT", raising=False)
+    monkeypatch.setattr(sys, "argv", [
+        str(script), "--config-db", "/tmp/test.db", "--script-dir", "/tmp/wrappers",
+        "--apply",
+    ])
+    with pytest.raises(SystemExit) as exc:
+        module["main"]()
+    assert exc.value.code == 2
+    generated.assert_not_called()
+
+
+def test_crontab_derived_schedule_is_stable_across_hash_seeds() -> None:
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    code = (
+        "import runpy; "
+        f"m=runpy.run_path({str(script)!r}); "
+        "print(m['derive_cron_from_period'](12, 'stable-series'))"
+    )
+    outputs = []
+    for seed in ("1", "2"):
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.append(result.stdout)
+    assert outputs[0] == outputs[1]
 
 
 def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:
