@@ -36,6 +36,142 @@ class TestScheduleValidation:
     def test_step_expression_is_validated(self):
         validate_schedules([_entry("5 */12 * * *")], "12h")
 
+    def test_retry_without_primary_rejected(self):
+        with pytest.raises(ValueError, match="at least one primary"):
+            validate_schedules([_entry("0 12 * * *", "retry")], "12h")
+
+
+class TestRetryLifecycle:
+    @staticmethod
+    def _database(tmp_path: Path, *, retry: bool = True) -> Path:
+        from bilibili_podcast import db
+
+        db_path = tmp_path / "retry.db"
+        db.migrate(str(db_path))
+        with db.transaction(str(db_path)) as conn:
+            conn.execute("INSERT INTO series(series,title,author) VALUES('rt','R','A')")
+            conn.execute("INSERT INTO sync_policy(series,update_period) VALUES('rt','12h')")
+            conn.execute("INSERT INTO cron_schedule(series,schedule,kind,position) VALUES('rt','0 10 * * *','primary',0)")
+            if retry:
+                conn.execute("INSERT INTO cron_schedule(series,schedule,kind,position) VALUES('rt','0 12 * * *','retry',1)")
+        return db_path
+
+    def test_apply_installs_separate_retry_units(self, tmp_path: Path):
+        from bilibili_podcast.services.scheduler_service import SchedulerCommandResult, SchedulerService
+        import bilibili_podcast.services.systemd_scheduler as sysd_mod
+
+        db_path = self._database(tmp_path)
+        ok = SchedulerCommandResult("systemd", "ok", 0, "", "")
+        enabled_calls = {False: 0, True: 0}
+        active_calls = {False: 0, True: 0}
+
+        def enabled(series, *, scheduled_retry=False):
+            enabled_calls[scheduled_retry] += 1
+            return enabled_calls[scheduled_retry] > 1
+
+        def active(series, *, scheduled_retry=False):
+            active_calls[scheduled_retry] += 1
+            return active_calls[scheduled_retry] > 1
+
+        svc = SchedulerService(str(db_path))
+        with patch.object(sysd_mod, "SYSTEMD_DIR", tmp_path), \
+                patch.object(sysd_mod, "write_unit", return_value=ok) as write, \
+                patch.object(sysd_mod, "daemon_reload", return_value=ok), \
+                patch.object(sysd_mod, "enable_timer", return_value=ok), \
+                patch.object(sysd_mod, "restart_timer", return_value=ok), \
+                patch.object(sysd_mod, "timer_is_enabled", side_effect=enabled), \
+                patch.object(sysd_mod, "timer_is_active", side_effect=active), \
+                patch.object(svc, "_exclude_series_from_cron"):
+            result = svc.apply(backend="systemd", series="rt")
+
+        assert result.returncode == 0
+        retry_service = next(
+            call.args[2] for call in write.call_args_list
+            if call.kwargs.get("scheduled_retry") and call.args[1] == "service"
+        )
+        assert "--scheduled-retry" in retry_service
+
+    def test_apply_without_retry_disables_stale_retry_timer(self, tmp_path: Path):
+        from bilibili_podcast.services.scheduler_service import SchedulerCommandResult, SchedulerService
+        import bilibili_podcast.services.systemd_scheduler as sysd_mod
+
+        db_path = self._database(tmp_path, retry=False)
+        ok = SchedulerCommandResult("systemd", "ok", 0, "", "")
+        enabled_calls = {False: 0, True: 0}
+        active_calls = {False: 0, True: 0}
+
+        def enabled(series, *, scheduled_retry=False):
+            enabled_calls[scheduled_retry] += 1
+            return True if scheduled_retry else enabled_calls[False] > 1
+
+        def active(series, *, scheduled_retry=False):
+            active_calls[scheduled_retry] += 1
+            return True if scheduled_retry else active_calls[False] > 1
+
+        svc = SchedulerService(str(db_path))
+        with patch.object(sysd_mod, "SYSTEMD_DIR", tmp_path), \
+                patch.object(sysd_mod, "write_unit", return_value=ok), \
+                patch.object(sysd_mod, "daemon_reload", return_value=ok), \
+                patch.object(sysd_mod, "enable_timer", return_value=ok), \
+                patch.object(sysd_mod, "restart_timer", return_value=ok), \
+                patch.object(sysd_mod, "disable_timer", return_value=ok) as disable, \
+                patch.object(sysd_mod, "timer_is_enabled", side_effect=enabled), \
+                patch.object(sysd_mod, "timer_is_active", side_effect=active), \
+                patch.object(svc, "_exclude_series_from_cron"):
+            result = svc.apply(backend="systemd", series="rt")
+
+        assert result.returncode == 0
+        disable.assert_called_once_with("rt", scheduled_retry=True)
+
+    def test_retry_unit_write_failure_rolls_back_primary(self, tmp_path: Path):
+        from bilibili_podcast import db
+        from bilibili_podcast.services.scheduler_service import SchedulerCommandResult, SchedulerService
+        import bilibili_podcast.services.systemd_scheduler as sysd_mod
+
+        db_path = self._database(tmp_path)
+        ok = SchedulerCommandResult("systemd", "ok", 0, "", "")
+        failed = SchedulerCommandResult("systemd", "write", 1, "", "write failed")
+        svc = SchedulerService(str(db_path))
+        with patch.object(sysd_mod, "SYSTEMD_DIR", tmp_path), \
+                patch.object(sysd_mod, "write_unit", side_effect=[ok, ok, failed]), \
+                patch.object(sysd_mod, "remove_unit", return_value=ok) as remove, \
+                patch.object(sysd_mod, "disable_timer", return_value=ok) as disable, \
+                patch.object(sysd_mod, "daemon_reload", return_value=ok), \
+                patch.object(sysd_mod, "timer_is_enabled", return_value=False), \
+                patch.object(sysd_mod, "timer_is_active", return_value=False), \
+                patch.object(svc, "_exclude_series_from_cron") as exclude:
+            result = svc.apply(backend="systemd", series="rt")
+
+        assert result.returncode != 0
+        assert disable.call_count == 2
+        assert remove.call_count == 3
+        exclude.assert_not_called()
+        with db.transaction(str(db_path)) as conn:
+            assert db.get_scheduler_backend(conn, "rt") == "cron"
+
+    def test_cron_plan_rejects_retry_without_running_script(self, tmp_path: Path):
+        from bilibili_podcast.services.scheduler_service import SchedulerService
+
+        db_path = self._database(tmp_path)
+        with patch("subprocess.run") as run:
+            result = SchedulerService(str(db_path), crontab_script="/unused").plan(
+                backend="cron",
+            )
+        assert result.returncode != 0
+        assert "does not support retry" in (result.error or "")
+        run.assert_not_called()
+
+    def test_disable_rejects_retry_before_touching_timers(self, tmp_path: Path):
+        from bilibili_podcast.services.scheduler_service import SchedulerService
+        import bilibili_podcast.services.systemd_scheduler as sysd_mod
+
+        db_path = self._database(tmp_path)
+        with patch.object(sysd_mod, "disable_timer") as disable:
+            result = SchedulerService(str(db_path)).disable_systemd("rt")
+        assert result.returncode != 0
+        assert "remove them before restoring cron" in result.stderr
+        disable.assert_not_called()
+
 
 class TestMediaUrlTokenGuard:
     """media_url() must reject empty token to prevent tokenless enclosure URLs."""
@@ -97,7 +233,8 @@ class TestUnitGeneration:
         content = sysd.generate_service("testseries")
         assert "EnvironmentFile=" not in content
         assert "Environment=PLAYWRIGHT_BROWSERS_PATH=" in content
-        assert "ExecStartPost=" in content
+        assert "ExecStartPost=" not in content
+        assert "--publish-script" in content
 
     def test_env_file_value_reads_export_syntax(self, tmp_path: Path):
         env_file = tmp_path / "bilipod-env.sh"
@@ -271,7 +408,7 @@ class TestApply:
             result = SchedulerService(str(db_path)).apply(backend="systemd", series="pt")
 
         assert result.returncode == 1
-        assert call("pt", "service") in remove_unit.call_args_list
+        assert call("pt", "service", scheduled_retry=False) in remove_unit.call_args_list
 
     def test_apply_restores_existing_service_when_timer_write_fails(self, tmp_path: Path):
         from bilibili_podcast import db
@@ -299,7 +436,9 @@ class TestApply:
             result = SchedulerService(str(db_path)).apply(backend="systemd", series="pt")
 
         assert result.returncode == 1
-        write_unit.assert_any_call("pt", "service", "old service\n")
+        write_unit.assert_any_call(
+            "pt", "service", "old service\n", scheduled_retry=False,
+        )
 
     def test_apply_marks_systemd_backend_without_disabling_schedule(self, tmp_path: Path):
         from bilibili_podcast import db
@@ -321,8 +460,8 @@ class TestApply:
                 patch.object(sysd_mod, "daemon_reload", return_value=ok), \
                 patch.object(sysd_mod, "enable_timer", return_value=ok), \
                 patch.object(sysd_mod, "restart_timer", return_value=ok), \
-                patch.object(sysd_mod, "timer_is_enabled", side_effect=[False, True]), \
-                patch.object(sysd_mod, "timer_is_active", side_effect=[False, True]), \
+                patch.object(sysd_mod, "timer_is_enabled", side_effect=[False, False, True]), \
+                patch.object(sysd_mod, "timer_is_active", side_effect=[False, False, True]), \
                 patch.object(svc, "_exclude_series_from_cron"):
             result = svc.apply(backend="systemd", series="pt")
 
@@ -780,7 +919,12 @@ class TestSeriesScheduleRemoval:
             result = svc.disable_systemd("demo", delete_units=True)
 
         assert result.returncode == 0
-        assert remove_unit.call_args_list == [call("demo", "service"), call("demo", "timer")]
+        assert remove_unit.call_args_list == [
+            call("demo", "service", scheduled_retry=False),
+            call("demo", "timer", scheduled_retry=False),
+            call("demo", "service", scheduled_retry=True),
+            call("demo", "timer", scheduled_retry=True),
+        ]
         with db.transaction(str(db_path)) as conn:
             assert db.get_scheduler_backend(conn, "demo") == "cron"
 
@@ -880,7 +1024,7 @@ class TestSeriesScheduleRemoval:
             stdout="", stderr="permission denied",
         )
         with patch.object(sysd_mod, "disable_timer", return_value=ok), \
-             patch.object(sysd_mod, "remove_unit", side_effect=[failed, ok]), \
+             patch.object(sysd_mod, "remove_unit", side_effect=[failed, ok, ok, ok]), \
              patch.object(sysd_mod, "daemon_reload", return_value=ok), \
              patch.object(svc, "_exclude_series_from_cron"):
             result = svc.remove_series_schedule("demo")

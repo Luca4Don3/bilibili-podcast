@@ -259,7 +259,7 @@ def upsert_paid_preview(conn, config: SeriesConfig) -> None:
 
 
 def upsert_cron(conn, series: str, schedules: list[str]) -> None:
-    conn.execute("DELETE FROM cron_schedule WHERE series=?", (series,))
+    conn.execute("DELETE FROM cron_schedule WHERE series=? AND kind='primary'", (series,))
     for pos, sched in enumerate(schedules):
         conn.execute(
             "INSERT INTO cron_schedule (series, enabled, schedule, position) VALUES (?, 1, ?, ?)",

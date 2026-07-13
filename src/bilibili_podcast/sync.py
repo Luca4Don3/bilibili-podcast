@@ -1890,6 +1890,14 @@ async def run(args: argparse.Namespace) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2))
             continue
 
+        if scheduled_retry and not dry_run:
+            # Consume the pending retry before making the external request.
+            # A rate-limit skip above deliberately does not consume it.
+            state["retry_pending"] = False
+            state["last_attempt_at"] = now_timestamp()
+            store.write_state(config.series, state)
+            LOGGER.info("scheduled retry consumed series=%s", config.series)
+
         fallback_enabled = args.browser_fallback or bool(config.sync.get("browser_fallback", False))
         fallback_allowed_now = browser_fallback_allowed(config, state)
         state["last_attempt_at"] = now_timestamp()

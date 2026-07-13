@@ -80,7 +80,10 @@ def test_publish_script_absent_by_default() -> None:
     assert ns.publish_script is None
 
 
-def _sync_args(tmp_path, *, apply=True, publish_script="/tmp/publish.sh"):
+def _sync_args(
+    tmp_path, *, apply=True, publish_script="/tmp/publish.sh",
+    scheduled_retry=False,
+):
     return SimpleNamespace(
         config_dir="configs/series.d",
         config_db=None,
@@ -103,6 +106,7 @@ def _sync_args(tmp_path, *, apply=True, publish_script="/tmp/publish.sh"):
         log_level="INFO",
         debug=False,
         force=False,
+        scheduled_retry=scheduled_retry,
         apply=apply,
         publish_script=publish_script,
     )
@@ -158,6 +162,98 @@ def test_publish_script_skipped_after_sync_error(tmp_path) -> None:
 
     assert rc == EXIT_SYNC_ERROR
     run.assert_not_called()
+
+
+def test_scheduled_retry_not_needed_skips_sync_and_publish(tmp_path) -> None:
+    import asyncio
+
+    store = _sync_store()
+    store.read_state.return_value = {"retry_pending": False}
+    with patch.object(sync_mod, "make_store", return_value=store), \
+            patch.object(sync_mod, "sync_series") as sync_series, \
+            patch.object(sync_mod.subprocess, "run") as run:
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, scheduled_retry=True)))
+
+    assert rc == 0
+    sync_series.assert_not_called()
+    run.assert_not_called()
+
+
+def test_scheduled_retry_consumes_pending_before_request(tmp_path) -> None:
+    import asyncio
+
+    async def fake_sync_series(**kwargs):
+        return {"series": "synctest"}
+
+    store = _sync_store()
+    store.read_state.return_value = {
+        "retry_pending": True,
+        "last_success_at": sync_mod.now_timestamp(),
+    }
+    with patch.object(sync_mod, "make_store", return_value=store), \
+            patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
+        rc = asyncio.run(sync_mod.run(_sync_args(
+            tmp_path, scheduled_retry=True, publish_script=None,
+        )))
+
+    assert rc == 0
+    first_state = store.write_state.call_args_list[0].args[1]
+    assert first_state["retry_pending"] is False
+
+
+def test_rate_limit_does_not_consume_scheduled_retry(tmp_path) -> None:
+    import asyncio
+
+    store = _sync_store()
+    store.read_state.return_value = {
+        "retry_pending": True,
+        "rate_limited_until": sync_mod.now_timestamp() + 3600,
+    }
+    with patch.object(sync_mod, "make_store", return_value=store), \
+            patch.object(sync_mod, "sync_series") as sync_series:
+        rc = asyncio.run(sync_mod.run(_sync_args(
+            tmp_path, scheduled_retry=True, publish_script=None,
+        )))
+
+    assert rc == 0
+    sync_series.assert_not_called()
+    store.write_state.assert_not_called()
+
+
+def test_failed_scheduled_retry_remains_consumed(tmp_path) -> None:
+    import asyncio
+
+    async def fake_sync_series(**kwargs):
+        raise RuntimeError("retry failed")
+
+    store = _sync_store()
+    store.read_state.return_value = {"retry_pending": True}
+    with patch.object(sync_mod, "make_store", return_value=store), \
+            patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
+        rc = asyncio.run(sync_mod.run(_sync_args(
+            tmp_path, scheduled_retry=True, publish_script=None,
+        )))
+
+    assert rc == EXIT_SYNC_ERROR
+    assert all(
+        call.args[1]["retry_pending"] is False
+        for call in store.write_state.call_args_list
+    )
+
+
+def test_primary_failure_sets_retry_pending(tmp_path) -> None:
+    import asyncio
+
+    async def fake_sync_series(**kwargs):
+        raise RuntimeError("primary failed")
+
+    store = _sync_store()
+    with patch.object(sync_mod, "make_store", return_value=store), \
+            patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publish_script=None)))
+
+    assert rc == EXIT_SYNC_ERROR
+    assert store.write_state.call_args.args[1]["retry_pending"] is True
 
 
 def test_publish_script_failure_returns_nonzero(tmp_path) -> None:

@@ -728,6 +728,7 @@ systemd 调度的安全约束：
 - 主调度之间不得重复，且最短间隔不得小于该系列的 `update_period`；兜底调度必须通过 `--retry-schedule` 显式标记。
 - 主调度成功后，兜底 timer 当天触发时只记录 `retry_not_needed`，不会请求 B 站；主调度失败后，兜底可绕过 `update_period` 尝试一次。
 - `rate_limit_cooldown` 的优先级始终高于兜底调度，兜底不会绕过限流冷却。
+- cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
 - 如果使用 RSS 多用户分发，service 的同步成功后应触发发布脚本。

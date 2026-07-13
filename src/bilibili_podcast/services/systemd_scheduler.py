@@ -71,8 +71,7 @@ User=bilipod
 Group=bilipod
 WorkingDirectory={app_dir}
 Environment=PLAYWRIGHT_BROWSERS_PATH={pw_browsers}
-ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply{retry_args}{log_level_args}
-ExecStartPost={rss_publish}
+ExecStart={sync_bin} --config-db {db_path} --series {series} --cookie-file {cookie_file} --media-root {media_root} --json-root {json_root} --rss-root {rss_root} --state-root {state_dir} --lock-file {lock_file} --log-dir {log_dir} --media-base-url {media_base_url} --browser-user-data-root {browser_data_root} --max-downloads-per-run 1 --min-free-gb 5 --token __MEDIA_PLACEHOLDER__ --apply --publish-script {rss_publish}{retry_args}{log_level_args}
 Restart=no
 TimeoutStartSec=1800
 """
