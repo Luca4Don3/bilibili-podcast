@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .manager import ConfigError, ConfigManager
-from .migration import migrate_legacy, upgrade_installation
+from .migration import LEGACY_PROFILES, migrate_legacy, upgrade_installation
 from .repositories import SQLiteSeriesRepository
 
 
@@ -66,6 +66,8 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         legacy_rss_users=args.legacy_rss_users,
         output_root=args.output_root,
         apply=args.apply,
+        profile=args.profile,
+        layout_manifest=args.layout_manifest,
     )
     action = "applied" if result.applied else "dry-run"
     print(f"migration {action}: {len(result.files)} config files, {result.series_count} series")
@@ -139,6 +141,8 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("--format", choices=("text", "json"), default="text")
     show.set_defaults(handler=cmd_show)
     migrate = subparsers.add_parser("migrate")
+    migrate.add_argument("--profile", choices=LEGACY_PROFILES, default=LEGACY_PROFILES[0])
+    migrate.add_argument("--layout-manifest")
     migrate.add_argument("--legacy-env", required=True)
     migrate.add_argument("--legacy-web-env", required=True)
     migrate.add_argument("--legacy-series-dir", required=True)

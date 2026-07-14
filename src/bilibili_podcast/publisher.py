@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -17,6 +18,7 @@ from .config.models import ConfigSnapshot
 
 
 LOGGER = logging.getLogger(__name__)
+_GENERATION_RE = re.compile(r"^[0-9]+-[0-9a-f]{12}$")
 
 
 class PublishError(RuntimeError):
@@ -31,6 +33,8 @@ def token_digest(token: str) -> str:
 def _publish_lock(root: Path):
     root.mkdir(parents=True, exist_ok=True)
     lock_path = root / ".publish.lock"
+    if lock_path.is_symlink():
+        raise PublishError(f"unsafe publish lock: {lock_path}")
     with lock_path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -130,7 +134,12 @@ def publish(snapshot: ConfigSnapshot) -> str:
             try:
                 _fsync_dir(output_root)
                 retained = sorted(
-                    (item for item in generations.iterdir() if item.is_dir() and not item.name.startswith(".staging-")),
+                    (
+                        item for item in generations.iterdir()
+                        if item.is_dir()
+                        and not item.is_symlink()
+                        and _GENERATION_RE.fullmatch(item.name)
+                    ),
                     key=lambda item: item.name,
                     reverse=True,
                 )

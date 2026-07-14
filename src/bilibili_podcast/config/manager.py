@@ -345,7 +345,8 @@ class ConfigManager:
             raise ConfigError("scheduler unit glob overlaps web unit scheduler.toml:units")
         unit_values = (
             str(snapshot.root), str(snapshot.app.install.app_dir),
-            str(snapshot.app.executables.sync), str(snapshot.scheduler.paths.systemd_dir),
+            str(snapshot.app.install.venv_bin), str(snapshot.app.executables.sync),
+            str(snapshot.scheduler.paths.systemd_dir),
         )
         if any(re.search(r'[\s"\\]', value) for value in unit_values):
             raise ConfigError("systemd configuration paths contain unsupported characters")

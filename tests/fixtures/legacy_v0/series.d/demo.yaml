@@ -1,0 +1,7 @@
+series: demo
+title: Demo
+author: Fixture
+source:
+  uid: 123
+cron:
+  schedules: ["0 1 * * *"]

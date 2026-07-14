@@ -239,14 +239,13 @@ async def authorize_rss(token: str, series: str):
     user = _rss_user_for_token(token)
     if user is None or ("all" not in user.series and series not in user.series):
         return Response(status_code=403)
-    rss_path = config.app.paths.published_rss_root / "current" / hashlib.sha256(
-        token.encode("utf-8")
-    ).hexdigest() / f"{series}.xml"
-    if not rss_path.is_file():
-        return Response(status_code=404)
+    # File existence is intentionally left to Nginx ``try_files``. An
+    # ``auth_request`` subrequest only supports 2xx/401/403; returning 404
+    # here would turn an ordinary missing RSS file into a public 500.
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     return Response(
         status_code=204,
-        headers={"X-RSS-Token-Hash": rss_path.parent.name},
+        headers={"X-RSS-Token-Hash": token_hash},
     )
 
 
