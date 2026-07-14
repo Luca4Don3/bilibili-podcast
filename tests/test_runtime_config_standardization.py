@@ -1,5 +1,6 @@
 import json
 import os
+import pwd
 import stat
 import subprocess
 from pathlib import Path
@@ -14,14 +15,19 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
     for directory in (app_dir, venv_bin, systemd_dir, config_root / ".backups", fake_bin):
         directory.mkdir(parents=True)
 
-    sync_unit = systemd_dir / "podcast-sync-demo.service"
-    sync_unit.write_text(
+    legacy_product = "bili" + "pod"
+    legacy_sync_unit = systemd_dir / f"{legacy_product}-sync@demo.service"
+    sync_unit = systemd_dir / "bilibili-podcast-sync@demo.service"
+    legacy_sync_unit.write_text(
         "[Service]\nEnvironmentFile=/legacy.env\n"
         "Environment=PLAYWRIGHT_BROWSERS_PATH=/legacy/browser\n"
         "ExecStart=/legacy/sync --cookie-file /legacy/cookie\n"
     )
-    web_unit = systemd_dir / "podcast-web.service"
-    web_unit.write_text(
+    legacy_timer = systemd_dir / f"{legacy_product}-sync@demo.timer"
+    legacy_timer.write_text("[Timer]\nOnCalendar=*-*-* 01:00:00\n")
+    legacy_web_unit = systemd_dir / f"{legacy_product}-web.service"
+    web_unit = systemd_dir / "bilibili-podcast-web.service"
+    legacy_web_unit.write_text(
         "[Service]\nEnvironmentFile=/legacy-web.env\n"
         "Environment=BILIBILI_PODCAST_WEB_PASSWORD=legacy\n"
         "ExecStart=/legacy/uvicorn bilibili_podcast.web.server:app\n"
@@ -34,8 +40,14 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
         },
         "scheduler": {
             "paths": {"systemd_dir": str(systemd_dir)},
-            "runtime": {"user": "bilibili-podcast", "group": "bilibili-podcast"},
-            "units": {"web": "podcast-web.service", "sync_glob": "podcast-sync-*.service"},
+            "runtime": {
+                "user": pwd.getpwuid(os.getuid()).pw_name,
+                "group": pwd.getpwuid(os.getuid()).pw_name,
+            },
+            "units": {
+                "web": "bilibili-podcast-web.service",
+                "sync_glob": "bilibili-podcast-sync@*.service",
+            },
         },
         "sync": {"downloads": {"scheduled_max_per_run": 1}},
     }
@@ -87,6 +99,9 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
     assert "--cookie-file" not in sync_content
     assert not systemctl_marker.exists()
     assert "No systemd reload" in result.stdout
+    assert legacy_sync_unit.exists()
+    assert legacy_web_unit.exists()
+    assert (systemd_dir / "bilibili-podcast-sync@demo.timer").read_text() == legacy_timer.read_text()
 
 
 def test_standardize_dry_run_does_not_require_generated_output(tmp_path: Path) -> None:
@@ -130,6 +145,13 @@ def test_standardize_restores_units_when_later_rewrite_fails(tmp_path: Path) -> 
     original_web = "[Service]\nExecStart=/legacy/web\n"
     web_unit.write_text(original_web)
     (systemd_dir / "bilibili-podcast-sync@demo.service").write_text("")
+    legacy_product = "bili" + "pod"
+    legacy_new_service = systemd_dir / f"{legacy_product}-sync@new.service"
+    legacy_new_timer = systemd_dir / f"{legacy_product}-sync@new.timer"
+    legacy_new_service.write_text("[Service]\nExecStart=/legacy/new\n")
+    legacy_new_timer.write_text("[Timer]\nOnCalendar=*-*-* 01:00:00\n")
+    new_service = systemd_dir / "bilibili-podcast-sync@new.service"
+    new_timer = systemd_dir / "bilibili-podcast-sync@new.timer"
     config_json = {
         "app": {
             "install": {"app_dir": str(app_dir), "venv_bin": str(venv_bin)},
@@ -137,7 +159,10 @@ def test_standardize_restores_units_when_later_rewrite_fails(tmp_path: Path) -> 
         },
         "scheduler": {
             "paths": {"systemd_dir": str(systemd_dir)},
-            "runtime": {"user": "bilibili-podcast", "group": "bilibili-podcast"},
+            "runtime": {
+                "user": pwd.getpwuid(os.getuid()).pw_name,
+                "group": pwd.getpwuid(os.getuid()).pw_name,
+            },
             "units": {"web": "bilibili-podcast-web.service", "sync_glob": "bilibili-podcast-sync@*.service"},
         },
         "sync": {"downloads": {"scheduled_max_per_run": 1}},
@@ -175,3 +200,7 @@ def test_standardize_restores_units_when_later_rewrite_fails(tmp_path: Path) -> 
     assert result.returncode != 0
     assert "original units were restored" in result.stderr
     assert web_unit.read_text() == original_web
+    assert not new_service.exists()
+    assert not new_timer.exists()
+    assert legacy_new_service.exists()
+    assert legacy_new_timer.exists()

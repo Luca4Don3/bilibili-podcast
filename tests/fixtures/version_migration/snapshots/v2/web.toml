@@ -1,0 +1,11 @@
+[server]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+
+[security]
+password = "fixture-password-preserved"
+https = false
+cookie_name = "bilibili_podcast_session"
+previous_cookie_names = []
+session_max_age_seconds = 86400

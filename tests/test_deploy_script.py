@@ -52,13 +52,23 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
     _executable(
         fake_bin / "bilibili-podcast-config",
         "#!/bin/sh\n"
-        "if [ \"${1:-}\" = show ]; then\n"
+        "if [ \"${3:-}\" = upgrade ]; then\n"
+        "  echo '{\"action\":\"dry-run\",\"source_version\":3,\"target_version\":3,\"steps\":[],\"backup_root\":null}'\n"
+        "elif [ \"${1:-}\" = show ]; then\n"
         f"  echo '{json.dumps(config)}'\n"
         "fi\n"
         "exit 0\n",
     )
     _executable(fake_bin / "git", "#!/bin/sh\nexit 0\n")
-    _executable(venv_bin / "python3", "#!/bin/sh\nexit 0\n")
+    python_calls = tmp_path / "python-calls"
+    _executable(
+        venv_bin / "python3",
+        f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{python_calls}'\n"
+        "case \" $* \" in\n"
+        "  *\" upgrade \"*) echo '{\"action\":\"dry-run\",\"source_version\":2,\"target_version\":3,\"steps\":[\"initialize-versioned-installation\"],\"backup_root\":null}' ;;\n"
+        "esac\n"
+        "exit 0\n",
+    )
     _executable(venv_bin / "pip", "#!/bin/sh\nexit 0\n")
 
     script = Path(__file__).resolve().parent.parent / "scripts" / "deploy.sh"
@@ -82,3 +92,4 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
     }
     assert (backups[0].parent / "config" / "rss-users.toml").read_bytes() == b""
     assert "without service restart" in result.stdout
+    assert any("upgrade --apply" in line for line in python_calls.read_text().splitlines())

@@ -4,9 +4,11 @@
 log_format bilibili_podcast_safe '$remote_addr $status $body_bytes_sent '
                                  '$request_time $upstream_response_time';
 
-upstream bilibili_podcast_web {
-    server 127.0.0.1:<new_web_port> max_fails=1 fail_timeout=2s;
-    server 127.0.0.1:<old_web_port> backup;
+# Both auth upstreams must run the new API-compatible release. A legacy Web
+# process does not provide /auth routes and must not be used as auth backup.
+upstream bilibili_podcast_auth {
+    server 127.0.0.1:<new_auth_primary_port> max_fails=1 fail_timeout=2s;
+    server 127.0.0.1:<new_auth_backup_port> backup;
     keepalive 16;
 }
 
@@ -18,6 +20,8 @@ server {
     location ~ ^/rss/(?<rss_token>[^/]+)/(?<rss_series>[a-z0-9][a-z0-9_-]*)\.xml$ {
         auth_request /_auth_rss;
         auth_request_set $rss_token_hash $upstream_http_x_rss_token_hash;
+        auth_request_set $rss_denial_status $upstream_http_x_rss_denial_status;
+        error_page 403 = @rss_denied;
         root <server_path>/published-rss;
         try_files /current/$rss_token_hash/$rss_series.xml =404;
     }
@@ -26,7 +30,14 @@ server {
         internal;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
-        proxy_pass http://bilibili_podcast_web/auth/rss/$rss_token/$rss_series.xml;
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+        proxy_pass http://bilibili_podcast_auth/auth/rss/$rss_token/$rss_series.xml;
+    }
+
+    location @rss_denied {
+        if ($rss_denial_status = 410) { return 410; }
+        return 403;
     }
 
     location ~ ^/media/(?<media_series>[a-z0-9][a-z0-9_-]*)/(?<media_file>[A-Za-z0-9_.-]+)$ {
@@ -38,7 +49,9 @@ server {
         internal;
         proxy_pass_request_body off;
         proxy_set_header Content-Length "";
-        proxy_pass http://bilibili_podcast_web/auth/media/$arg_token/$media_series/$media_file;
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+        proxy_pass http://bilibili_podcast_auth/auth/media/$arg_token/$media_series/$media_file;
     }
 
 }

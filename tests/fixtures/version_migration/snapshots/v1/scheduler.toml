@@ -1,0 +1,15 @@
+[runtime]
+user = "__OLD_PRODUCT__"
+group = "__OLD_PRODUCT__"
+
+[paths]
+systemd_dir = "__ROOT__/runtime/systemd"
+cron_script_dir = "__ROOT__/runtime/cron"
+wrapper_dir = "__ROOT__/runtime/wrappers"
+
+[units]
+web = "__OLD_PRODUCT__-web.service"
+sync_glob = "__OLD_PRODUCT__-sync@*.service"
+
+[timeouts]
+command_seconds = 30

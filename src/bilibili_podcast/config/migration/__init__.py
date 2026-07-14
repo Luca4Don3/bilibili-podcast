@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import hashlib
 import re
 import shutil
 import sqlite3
@@ -279,6 +278,9 @@ def migrate_legacy(
     backup_root = Path(tempfile.mkdtemp(prefix="migrate-", dir=backup_parent))
     staged_db: Path | None = None
     db_path: Path | None = None
+    db_existed = False
+    db_backup: Path | None = None
+    database_changed = False
     replaced: list[tuple[Path, Path | None]] = []
     try:
         for name, content in generated.items():
@@ -287,75 +289,63 @@ def migrate_legacy(
             staged.chmod(0o600)
         ConfigManager(temp_root, environ={}).load()
         if configs:
-            from ... import db
-
             db_path = Path(merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db"))
+            if db_path.is_symlink():
+                raise UnsafeConfigError(f"unsafe migration database {db_path}: symlink")
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            if db_path.exists():
-                fd, staged_name = tempfile.mkstemp(prefix=f".{db_path.name}.", dir=db_path.parent)
-                os.close(fd)
-                staged_db = Path(staged_name)
+            db_existed = db_path.exists()
+            fd, staged_name = tempfile.mkstemp(prefix=f".{db_path.name}.", dir=db_path.parent)
+            os.close(fd)
+            staged_db = Path(staged_name)
+            if db_existed:
                 with sqlite3.connect(db_path) as source_conn, sqlite3.connect(staged_db) as staged_conn:
                     source_conn.backup(staged_conn)
-            else:
-                fd, staged_name = tempfile.mkstemp(prefix=f".{db_path.name}.", dir=db_path.parent)
-                os.close(fd)
-                staged_db = Path(staged_name)
-            db.migrate(staged_db)
-            with db.transaction(staged_db) as conn:
-                from ...services.scheduler_service import replace_schedules_in_connection
-                for migrated in configs:
-                    config = migrated.config
-                    db.upsert_series(conn, config)
-                    db.upsert_source(conn, config)
-                    db.upsert_sync_policy(conn, config)
-                    db.upsert_filters(conn, config)
-                    db.upsert_paid_preview(conn, config)
-                    replace_schedules_in_connection(
-                        conn, config.series,
-                        list(migrated.schedules), list(migrated.retry_schedules),
-                    )
+            _write_migrated_series(staged_db, configs)
             with sqlite3.connect(staged_db) as conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.execute("PRAGMA journal_mode=DELETE")
-        # Only replace live files after every staged artifact has validated.
+        from .versioning import _application_lock, _online_database_backup, _write_manifest
+
+        planned_configs: list[tuple[Path, Path, Path | None]] = []
         for name in generated:
             target = output / name
             backup: Path | None = None
             if target.exists():
                 backup = backup_root / name
                 shutil.copy2(target, backup)
-            (temp_root / name).replace(target)
-            replaced.append((target, backup))
-        if staged_db is not None and db_path is not None:
-            db_backup: Path | None = None
-            if db_path.exists():
-                db_backup = backup_root / db_path.name
-                shutil.copy2(db_path, db_backup)
-            staged_db.replace(db_path)
-            replaced.append((db_path, db_backup))
-            staged_db = None
+            planned_configs.append((target, temp_root / name, backup))
+        if db_existed and db_path is not None:
+            db_backup = backup_root / db_path.name
+            _online_database_backup(db_path, db_backup)
+        _write_manifest(backup_root)
+
+        # Only replace live files after every staged artifact and backup validates.
+        with _application_lock(Path(_require(merged, "BILIBILI_PODCAST_LOCK_FILE"))):
+            for target, staged, backup in planned_configs:
+                staged.replace(target)
+                replaced.append((target, backup))
+            if staged_db is not None and db_path is not None:
+                if db_existed:
+                    database_changed = True
+                    _write_migrated_series(db_path, configs)
+                else:
+                    staged_db.replace(db_path)
+                    replaced.append((db_path, None))
+                    staged_db = None
     except Exception:
         for target, backup in reversed(replaced):
             if backup is not None and backup.exists():
                 shutil.copy2(backup, target)
             else:
                 target.unlink(missing_ok=True)
+        if database_changed and db_backup is not None and db_path is not None:
+            with sqlite3.connect(db_backup) as source_conn, sqlite3.connect(db_path) as live_conn:
+                source_conn.backup(live_conn)
         raise
     finally:
         if staged_db is not None:
             staged_db.unlink(missing_ok=True)
         shutil.rmtree(temp_root, ignore_errors=True)
-    backup_files = sorted(path for path in backup_root.iterdir() if path.is_file())
-    if backup_files:
-        manifest = backup_root / "SHA256SUMS"
-        manifest.write_text("".join(
-            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-            for path in backup_files
-        ), encoding="utf-8")
-        manifest.chmod(0o600)
-    else:
-        backup_root.rmdir()
     from .versioning import upgrade_installation
 
     try:
@@ -366,6 +356,9 @@ def migrate_legacy(
                 shutil.copy2(backup, target)
             else:
                 target.unlink(missing_ok=True)
+        if database_changed and db_backup is not None and db_path is not None:
+            with sqlite3.connect(db_backup) as source_conn, sqlite3.connect(db_path) as live_conn:
+                source_conn.backup(live_conn)
         raise
     return MigrationResult(output, files, len(configs), normalizations, True)
 

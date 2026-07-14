@@ -4,6 +4,7 @@ import shutil
 import tomllib
 import json
 import os
+import re
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -61,6 +62,7 @@ class SeriesRemovalService:
         self.users_conf = Path(users_conf)
         if self.users_conf.name != "rss-users.toml":
             raise ValueError("users_conf must reference rss-users.toml")
+        self.publish_conf = self.users_conf.parent / "publish.toml"
 
     def list_series_for_uid(self, uid: int) -> list[str]:
         with db.transaction(self.db_path) as conn:
@@ -113,6 +115,7 @@ class SeriesRemovalService:
 
     def remove(self, series: str) -> SeriesRemovalPlan:
         plan = self.plan(series)
+        gone_series = self._read_gone_series()
 
         paths = [
             Path(plan.media_dir), Path(plan.json_dir), Path(plan.master_rss),
@@ -121,6 +124,7 @@ class SeriesRemovalService:
         ]
         staged: list[tuple[Path, Path]] = []
         users_backup = self._backup_users_conf()
+        publish_backup = self._backup_file(self.publish_conf)
         try:
             for path in paths:
                 if not path.exists() and not path.is_symlink():
@@ -131,6 +135,7 @@ class SeriesRemovalService:
                 path.replace(quarantine)
                 staged.append((path, quarantine))
             self._remove_users_conf_reference(series)
+            self._mark_series_gone(series, gone_series)
             with db.transaction(self.db_path) as conn:
                 conn.execute("DELETE FROM series WHERE series=?", (series,))
         except Exception as exc:
@@ -139,6 +144,10 @@ class SeriesRemovalService:
                 self._restore_users_conf(users_backup)
             except OSError as rollback_exc:
                 rollback_errors.append(f"rss users: {type(rollback_exc).__name__}")
+            try:
+                self._restore_file_backup(self.publish_conf, publish_backup)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"publish config: {type(rollback_exc).__name__}")
             for original, quarantine in reversed(staged):
                 try:
                     if quarantine.exists() or quarantine.is_symlink():
@@ -158,31 +167,42 @@ class SeriesRemovalService:
         return plan
 
     def _backup_users_conf(self) -> tuple[bool, bytes, int]:
-        if not self.users_conf.exists():
+        return self._backup_file(self.users_conf)
+
+    @staticmethod
+    def _backup_file(path: Path) -> tuple[bool, bytes, int]:
+        if not path.exists():
             return False, b"", 0
-        return True, self.users_conf.read_bytes(), self.users_conf.stat().st_mode & 0o777
+        return True, path.read_bytes(), path.stat().st_mode & 0o777
 
     def _restore_users_conf(self, backup: tuple[bool, bytes, int]) -> None:
+        self._restore_file_backup(self.users_conf, backup)
+
+    def _restore_file_backup(self, path: Path, backup: tuple[bool, bytes, int]) -> None:
         existed, content, mode = backup
         if not existed:
-            self.users_conf.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
             return
-        self.users_conf.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write_users_conf(content, mode)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._atomic_write(path, content, mode)
 
     def _atomic_write_users_conf(self, content: bytes, mode: int) -> None:
+        self._atomic_write(self.users_conf, content, mode)
+
+    @staticmethod
+    def _atomic_write(path: Path, content: bytes, mode: int) -> None:
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb", dir=self.users_conf.parent,
-                prefix=f".{self.users_conf.name}.", suffix=".tmp", delete=False,
+                mode="wb", dir=path.parent,
+                prefix=f".{path.name}.", suffix=".tmp", delete=False,
             ) as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
                 temporary = Path(handle.name)
             temporary.chmod(mode)
-            temporary.replace(self.users_conf)
+            temporary.replace(path)
             temporary = None
         finally:
             if temporary is not None:
@@ -230,6 +250,37 @@ class SeriesRemovalService:
                 "\n".join(output).encode("utf-8"),
                 self.users_conf.stat().st_mode & 0o777,
             )
+
+    def _read_gone_series(self) -> list[str]:
+        if not self.publish_conf.is_file():
+            raise ValueError("publish.toml is required for series removal")
+        try:
+            with self.publish_conf.open("rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError(f"invalid publish.toml: {type(exc).__name__}") from None
+        gone = (data.get("publish") or {}).get("gone_series")
+        if not isinstance(gone, list) or not all(isinstance(item, str) for item in gone):
+            raise ValueError("invalid publish.toml gone_series")
+        return gone
+
+    def _mark_series_gone(self, series: str, gone_series: list[str]) -> None:
+        if series in gone_series:
+            return
+        replacement = "gone_series = " + json.dumps([*gone_series, series], ensure_ascii=False)
+        content, count = re.subn(
+            r"(?m)^gone_series\s*=\s*\[[^\r\n]*\]\s*$",
+            replacement,
+            self.publish_conf.read_text(encoding="utf-8"),
+            count=1,
+        )
+        if count != 1:
+            raise ValueError("invalid publish.toml gone_series declaration")
+        self._atomic_write(
+            self.publish_conf,
+            content.encode("utf-8"),
+            self.publish_conf.stat().st_mode & 0o777,
+        )
 
     def _read_toml_users(self) -> dict[str, dict[str, Any]]:
         with self.users_conf.open("rb") as handle:

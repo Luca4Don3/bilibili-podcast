@@ -642,9 +642,11 @@ class SchedulerService:
 
         # Remove only the target series auto block
         import re
+        legacy_marker = ("BILI" + "POD").upper()
+        product_marker = rf"(?:BILIBILI_PODCAST|{re.escape(legacy_marker)})"
         cleaned = re.sub(
-            rf"^# BEGIN BILIBILI_PODCAST AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
-            rf"^# END BILIBILI_PODCAST AUTO\r?\n?",
+            rf"^# BEGIN {product_marker} AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
+            rf"^# END {product_marker} AUTO\r?\n?",
             "", existing, flags=re.DOTALL | re.MULTILINE,
         ).strip()
 
@@ -738,9 +740,11 @@ class SchedulerService:
 
         existing = self._read_crontab()
         import re
+        legacy_marker = ("BILI" + "POD").upper()
+        product_marker = rf"(?:BILIBILI_PODCAST|{re.escape(legacy_marker)})"
         cleaned = re.sub(
-            rf"^# BEGIN BILIBILI_PODCAST AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
-            rf"^# END BILIBILI_PODCAST AUTO\r?\n?",
+            rf"^# BEGIN {product_marker} AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
+            rf"^# END {product_marker} AUTO\r?\n?",
             "", existing, flags=re.DOTALL | re.MULTILINE,
         ).strip()
         content = f"{cleaned}\n\n{block}\n" if cleaned else f"{block}\n"

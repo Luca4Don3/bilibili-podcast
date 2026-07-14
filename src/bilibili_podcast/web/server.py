@@ -233,7 +233,9 @@ async def logout():
 async def authorize_rss(token: str, series: str):
     config = _runtime_config()
     if series in config.publish.publish.gone_series:
-        return Response(status_code=410)
+        # ``auth_request`` only propagates 401/403. Nginx maps this explicit
+        # denial marker to the public 410 response.
+        return Response(status_code=403, headers={"X-RSS-Denial-Status": "410"})
     user = _rss_user_for_token(token)
     if user is None or ("all" not in user.series and series not in user.series):
         return Response(status_code=403)
@@ -250,6 +252,8 @@ async def authorize_rss(token: str, series: str):
 
 @router.get("/auth/media/{token}/{series}/{filename}", include_in_schema=False)
 async def authorize_media(token: str, series: str, filename: str):
+    if series in _runtime_config().publish.publish.gone_series:
+        return Response(status_code=403)
     user = _rss_user_for_token(token)
     if user is None or ("all" not in user.series and series not in user.series):
         return Response(status_code=403)

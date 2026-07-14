@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from ..manager import ConfigError, ConfigManager, UnsafeConfigError
+from ..manager import ConfigError, ConfigManager, MIGRATION_LOCK_NAME, UnsafeConfigError
 
 
 EARLIEST_UNIFIED_VERSION = 1
@@ -32,6 +32,19 @@ _OLD_PRODUCT = "bili" + "pod"
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _fsync_file(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True)
@@ -122,15 +135,22 @@ def _version_rows(db_path: Path) -> tuple[int, ...]:
         raise ConfigError(f"cannot inspect migration database {db_path}: {type(exc).__name__}") from None
 
 
+def _validate_database_path(db_path: Path) -> None:
+    if not db_path.is_absolute():
+        raise ConfigError("migration database path must be absolute")
+    if db_path.is_symlink():
+        raise UnsafeConfigError(f"unsafe migration database {db_path}: symlink")
+
+
 def detect_version(root: str | Path) -> int:
     config_root = Path(root).expanduser().resolve()
     missing = [name for name in CONFIG_FILES if not (config_root / name).is_file()]
     if missing:
         raise ConfigError(f"incomplete migration source {config_root}: missing {missing[0]}")
     marker = config_root / VERSION_FILE
+    if marker.is_symlink():
+        raise UnsafeConfigError(f"unsafe migration version marker {marker}: symlink")
     if marker.exists():
-        if marker.is_symlink():
-            raise UnsafeConfigError(f"unsafe migration version marker {marker}: symlink")
         try:
             version = int(marker.read_text(encoding="ascii").strip())
         except (OSError, UnicodeError, ValueError):
@@ -139,6 +159,7 @@ def detect_version(root: str | Path) -> int:
             raise ConfigError(f"unsupported migration source version: {version}")
         app = _read_toml(config_root / "app.toml")
         db_path = Path(str(app.get("database", {}).get("path", "")))
+        _validate_database_path(db_path)
         rows = _version_rows(db_path)
         if rows and rows != (version,):
             raise ConfigError("migration version mismatch between config and SQLite")
@@ -147,6 +168,8 @@ def detect_version(root: str | Path) -> int:
         return version
 
     app = _read_toml(config_root / "app.toml")
+    db_path = Path(str(app.get("database", {}).get("path", "")))
+    _validate_database_path(db_path)
     web = _read_toml(config_root / "web.toml")
     publish = _read_toml(config_root / "publish.toml")
     executables = app.get("executables") or {}
@@ -177,43 +200,46 @@ def plan_upgrade(root: str | Path, *, target_version: int = LATEST_VERSION) -> V
     )
 
 
-def _replace_product(value: object) -> object:
-    if isinstance(value, str):
-        return value.replace(_OLD_PRODUCT, "bilibili-podcast").replace(
-            _OLD_PRODUCT.upper(), "BILIBILI_PODCAST"
-        )
-    if isinstance(value, list):
-        return [_replace_product(item) for item in value]
-    if isinstance(value, dict):
-        return {str(_replace_product(key)): _replace_product(item) for key, item in value.items()}
-    return value
+def _replace_command_name(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    path = Path(value)
+    replacement = path.name.replace(_OLD_PRODUCT, "bilibili-podcast")
+    return str(path.with_name(replacement)) if replacement != path.name else value
 
 
 def _upgrade_v1_to_v2(stage: Path) -> None:
     for name in CONFIG_FILES:
         path = stage / name
-        source = _read_toml(path)
-        data = _replace_product(source)
+        data = _read_toml(path)
         if name == "app.toml":
             executables = data.setdefault("executables", {})
             old_key = f"{_OLD_PRODUCT}_config"
-            replaced_key = "bilibili-podcast_config"
-            old_value = executables.pop(old_key, executables.pop(replaced_key, None))
+            old_value = executables.pop(old_key, None)
             if old_value is not None:
-                executables["bilibili_podcast_config"] = str(old_value).replace(
-                    _OLD_PRODUCT, "bilibili-podcast"
-                )
+                executables["bilibili_podcast_config"] = _replace_command_name(old_value)
+            if "sync" in executables:
+                executables["sync"] = _replace_command_name(executables["sync"])
         elif name == "sync.toml":
             data.setdefault("timeouts", {}).setdefault("sync_seconds", 300)
         elif name == "web.toml":
             security = data.setdefault("security", {})
-            old_cookie = f"{_OLD_PRODUCT}_session"
             previous = list(security.get("previous_cookie_names") or [])
-            source_cookie = (source.get("security") or {}).get("cookie_name")
-            if source_cookie == old_cookie and old_cookie not in previous:
-                previous.append(old_cookie)
+            source_cookie = security.get("cookie_name")
+            if isinstance(source_cookie, str) and source_cookie != "bilibili_podcast_session":
+                if source_cookie not in previous:
+                    previous.append(source_cookie)
             security["cookie_name"] = "bilibili_podcast_session"
             security["previous_cookie_names"] = previous
+        elif name == "scheduler.toml":
+            runtime = data.setdefault("runtime", {})
+            for field in ("user", "group"):
+                if runtime.get(field) == _OLD_PRODUCT:
+                    runtime[field] = "bilibili-podcast"
+            units = data.setdefault("units", {})
+            for field in ("web", "sync_glob"):
+                if field in units:
+                    units[field] = _replace_command_name(units[field])
         elif name == "publish.toml":
             settings = data.setdefault("publish", {})
             settings.pop("script", None)
@@ -224,7 +250,7 @@ def _upgrade_v1_to_v2(stage: Path) -> None:
 
 
 def _upgrade_v2_to_v3(stage: Path) -> None:
-    (stage / VERSION_FILE).write_text(f"{LATEST_VERSION}\n", encoding="ascii")
+    (stage / VERSION_FILE).write_text("3\n", encoding="ascii")
     (stage / VERSION_FILE).chmod(0o600)
 
 
@@ -242,49 +268,107 @@ def _copy_configs(source: Path, stage: Path) -> None:
         shutil.copy2(source_path, stage / name)
 
 
-def _migrate_database(
-    stage: Path,
-    *,
-    source_db: Path,
-    schema_version: int,
-    staged_db: Path | None = None,
-) -> Path | None:
+def _online_database_backup(source_db: Path, target: Path) -> None:
+    try:
+        with sqlite3.connect(source_db) as source, sqlite3.connect(target) as destination:
+            source.backup(destination)
+        with sqlite3.connect(target) as connection:
+            if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ConfigError("SQLite online backup quick_check failed")
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ConfigError("SQLite online backup foreign key check failed")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("PRAGMA journal_mode=DELETE")
+    except sqlite3.DatabaseError as exc:
+        raise ConfigError(f"cannot back up migration database: {type(exc).__name__}") from None
+
+
+def _restore_database_backup(backup: Path, target: Path) -> None:
+    try:
+        with sqlite3.connect(backup) as source, sqlite3.connect(target) as destination:
+            source.backup(destination)
+    except sqlite3.DatabaseError as exc:
+        raise ConfigError(f"cannot restore migration database: {type(exc).__name__}") from None
+
+
+def _set_database_version(db_path: Path, version: int) -> None:
     from ... import db
 
-    app = _read_toml(stage / "app.toml")
-    target_db = Path(str(app.get("database", {}).get("path", "")))
-    if not source_db.is_absolute() or not target_db.is_absolute():
-        raise ConfigError("migration database path must be absolute")
-    if not source_db.exists():
-        return None
-    target = staged_db or stage / target_db.name
-    with sqlite3.connect(source_db) as source, sqlite3.connect(target) as destination:
-        source.backup(destination)
-    db.migrate(target)
-    with db.transaction(target) as conn:
+    db.migrate(db_path, initialize_version=False)
+    with db.transaction(db_path) as conn:
         rows = tuple(row[0] for row in conn.execute("SELECT version FROM schema_version"))
-        if any(version > schema_version for version in rows):
+        if any(current > version for current in rows):
             raise ConfigError("SQLite belongs to a future migration version")
         conn.execute("DELETE FROM schema_version")
-        conn.execute("INSERT INTO schema_version(version) VALUES(?)", (schema_version,))
+        conn.execute("INSERT INTO schema_version(version) VALUES(?)", (version,))
         if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ConfigError("migrated SQLite quick_check failed")
         if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise ConfigError("migrated SQLite foreign key check failed")
-    with sqlite3.connect(target) as conn:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.execute("PRAGMA journal_mode=DELETE")
-    return target
+
+
+def _validate_staged_database(stage: Path, source_db: Path, version: int) -> None:
+    _validate_database_path(source_db)
+    if not source_db.exists():
+        return
+    target = stage / source_db.name
+    _online_database_backup(source_db, target)
+    _set_database_version(target, version)
+
+
+def _write_manifest(backup_root: Path) -> None:
+    manifest_files = sorted(
+        path for path in backup_root.iterdir()
+        if path.is_file() and not path.name.endswith(("-wal", "-shm"))
+    )
+    manifest = backup_root / "SHA256SUMS"
+    manifest.write_text("".join(
+        f"{_sha256_file(path)}  {path.name}\n"
+        for path in manifest_files
+    ), encoding="ascii")
+    manifest.chmod(0o600)
+    checksums = {
+        name: digest
+        for digest, name in (
+            line.split("  ", 1)
+            for line in manifest.read_text(encoding="ascii").splitlines()
+        )
+    }
+    for path in manifest_files:
+        if checksums.get(path.name) != _sha256_file(path):
+            raise ConfigError(f"migration backup checksum verification failed: {path.name}")
+        _fsync_file(path)
+    _fsync_file(manifest)
+    _fsync_dir(backup_root)
 
 
 @contextmanager
 def _migration_lock(root: Path):
-    path = root / ".migration.lock"
+    path = root / MIGRATION_LOCK_NAME
+    if path.is_symlink():
+        raise UnsafeConfigError(f"unsafe migration lock {path}: symlink")
     with path.open("a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ConfigError(f"another installation migration holds {path}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _application_lock(path: Path):
+    """Exclude active sync/admin writers while mutating the live database."""
+    if path.is_symlink():
+        raise UnsafeConfigError(f"unsafe application lock {path}: symlink")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ConfigError(f"another application process holds {path}") from None
         try:
             yield
         finally:
@@ -302,97 +386,96 @@ def upgrade_installation(
     apply: bool = False,
     target_version: int = LATEST_VERSION,
 ) -> VersionMigrationResult:
-    plan = plan_upgrade(root, target_version=target_version)
-    if not plan.steps:
-        return VersionMigrationResult(plan, apply, None)
-    root_path = plan.root
-    source_app = _read_toml(root_path / "app.toml")
-    source_db = Path(str(source_app.get("database", {}).get("path", "")))
-    stage = Path(tempfile.mkdtemp(prefix="bilibili-podcast-version-migrate-"))
-    backup_root: Path | None = None
-    staged_db: Path | None = None
-    live_db: Path | None = None
-    replaced: list[tuple[Path, Path | None]] = []
-    try:
-        _copy_configs(root_path, stage)
-        _apply_steps(stage, plan)
-        ConfigManager(stage, environ={}).load()
-        if not apply:
-            _migrate_database(stage, source_db=source_db, schema_version=plan.target_version)
-            return VersionMigrationResult(plan, False, None)
+    initial_plan = plan_upgrade(root, target_version=target_version)
+    if not initial_plan.steps:
+        return VersionMigrationResult(initial_plan, apply, None)
+    root_path = initial_plan.root
 
-        with _migration_lock(root_path):
-            if detect_version(root_path) != plan.source_version:
-                raise ConfigError("migration source changed after planning")
-            app = _read_toml(stage / "app.toml")
-            live_db = Path(str(app.get("database", {}).get("path", "")))
-            if source_db.exists():
-                if live_db != source_db and live_db.exists():
-                    raise ConfigError(f"migration database target already exists: {live_db}")
-                live_db.parent.mkdir(parents=True, exist_ok=True)
-                fd, name = tempfile.mkstemp(prefix=f".{live_db.name}.migration-", dir=live_db.parent)
-                os.close(fd)
-                staged_db = Path(name)
-                _migrate_database(
-                    stage,
-                    source_db=source_db,
-                    schema_version=plan.target_version,
-                    staged_db=staged_db,
-                )
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            backup_root = root_path / ".backups" / f"version-{plan.source_version}-to-{plan.target_version}-{stamp}-{uuid.uuid4().hex[:8]}"
-            backup_root.mkdir(mode=0o700, parents=True)
-            config_replacements: list[tuple[Path, Path, Path | None]] = []
-            for name in (*CONFIG_FILES, VERSION_FILE):
-                target = root_path / name
-                source = stage / name
-                if not source.exists():
-                    continue
-                backup = None
-                if target.exists():
-                    backup = backup_root / name
-                    shutil.copy2(target, backup)
-                config_replacements.append((target, source, backup))
-            db_backup: Path | None = None
-            if staged_db is not None and live_db is not None:
-                backup_source = live_db if live_db.exists() else source_db
-                db_backup = backup_root / backup_source.name
-                if db_backup.exists():
-                    raise ConfigError(f"migration backup name collision: {db_backup.name}")
-                shutil.copy2(backup_source, db_backup)
-            manifest_files = sorted(path for path in backup_root.iterdir() if path.is_file())
-            manifest = backup_root / "SHA256SUMS"
-            manifest.write_text("".join(
-                f"{_sha256_file(path)}  {path.name}\n"
-                for path in manifest_files
-            ), encoding="ascii")
-            manifest.chmod(0o600)
-            checksums = {
-                name: digest
-                for digest, name in (
-                    line.split("  ", 1)
-                    for line in manifest.read_text(encoding="ascii").splitlines()
-                )
-            }
-            for path in manifest_files:
-                if checksums.get(path.name) != _sha256_file(path):
-                    raise ConfigError(f"migration backup checksum verification failed: {path.name}")
-            for target, source, backup in config_replacements:
-                source.replace(target)
-                replaced.append((target, backup))
-            if staged_db is not None and live_db is not None and db_backup is not None:
-                staged_db.replace(live_db)
-                replaced.append((live_db, db_backup if live_db == source_db else None))
-                staged_db = None
-        return VersionMigrationResult(plan, True, backup_root)
-    except Exception:
-        for target, backup in reversed(replaced):
-            if backup is None:
-                target.unlink(missing_ok=True)
-            else:
-                shutil.copy2(backup, target)
-        raise
-    finally:
-        if staged_db is not None:
-            staged_db.unlink(missing_ok=True)
-        shutil.rmtree(stage, ignore_errors=True)
+    if not apply:
+        stage = Path(tempfile.mkdtemp(prefix="bilibili-podcast-version-migrate-"))
+        try:
+            _copy_configs(root_path, stage)
+            _apply_steps(stage, initial_plan)
+            ConfigManager(stage, environ={}).load()
+            source_app = _read_toml(root_path / "app.toml")
+            source_db = Path(str(source_app.get("database", {}).get("path", "")))
+            _validate_staged_database(stage, source_db, initial_plan.target_version)
+            return VersionMigrationResult(initial_plan, False, None)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    backup_root: Path | None = None
+    replaced: list[tuple[Path, Path | None]] = []
+    database_version_changed = False
+    source_db: Path | None = None
+    with _migration_lock(root_path):
+        plan = plan_upgrade(root_path, target_version=target_version)
+        if plan.source_version != initial_plan.source_version:
+            raise ConfigError("migration source changed after planning")
+        source_sync = _read_toml(root_path / "sync.toml")
+        lock_path = Path(str(source_sync.get("paths", {}).get("lock_file", "")))
+        if not lock_path.is_absolute():
+            raise ConfigError("migration application lock path must be absolute")
+        with _application_lock(lock_path):
+            stage = Path(tempfile.mkdtemp(prefix="bilibili-podcast-version-migrate-"))
+            try:
+                _copy_configs(root_path, stage)
+                _apply_steps(stage, plan)
+                ConfigManager(stage, environ={}).load()
+                for name in (*CONFIG_FILES, VERSION_FILE):
+                    staged = stage / name
+                    if staged.exists():
+                        _fsync_file(staged)
+                _fsync_dir(stage)
+                source_app = _read_toml(root_path / "app.toml")
+                source_db = Path(str(source_app.get("database", {}).get("path", "")))
+                _validate_database_path(source_db)
+
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                backup_root = root_path / ".backups" / f"version-{plan.source_version}-to-{plan.target_version}-{stamp}-{uuid.uuid4().hex[:8]}"
+                backup_root.mkdir(mode=0o700, parents=True)
+                config_replacements: list[tuple[Path, Path, Path | None]] = []
+                for name in (*CONFIG_FILES, VERSION_FILE):
+                    target = root_path / name
+                    if target.is_symlink():
+                        raise UnsafeConfigError(f"unsafe migration target {target}: symlink")
+                    staged = stage / name
+                    if not staged.exists():
+                        continue
+                    backup = None
+                    if target.exists():
+                        backup = backup_root / name
+                        shutil.copy2(target, backup)
+                    config_replacements.append((target, staged, backup))
+                if source_db.exists():
+                    db_backup = backup_root / source_db.name
+                    if db_backup.exists():
+                        raise ConfigError(f"migration backup name collision: {db_backup.name}")
+                    _online_database_backup(source_db, db_backup)
+                    previous_db_versions = _version_rows(source_db)
+                    if any(version > plan.target_version for version in previous_db_versions):
+                        raise ConfigError("SQLite belongs to a future migration version")
+                _write_manifest(backup_root)
+
+                if source_db.exists():
+                    database_version_changed = True
+                    _set_database_version(source_db, plan.target_version)
+                for target, staged, backup in config_replacements:
+                    staged.replace(target)
+                    replaced.append((target, backup))
+                _fsync_dir(root_path)
+                return VersionMigrationResult(plan, True, backup_root)
+            except Exception:
+                for target, backup in reversed(replaced):
+                    if backup is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        shutil.copy2(backup, target)
+                _fsync_dir(root_path)
+                if database_version_changed and source_db is not None and source_db.exists():
+                    db_backup = backup_root / source_db.name if backup_root is not None else None
+                    if db_backup is not None and db_backup.exists():
+                        _restore_database_backup(db_backup, source_db)
+                raise
+            finally:
+                shutil.rmtree(stage, ignore_errors=True)
