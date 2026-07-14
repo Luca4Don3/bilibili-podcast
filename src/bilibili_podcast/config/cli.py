@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .manager import ConfigError, ConfigManager
-from .migration import migrate_legacy
+from .migration import migrate_legacy, upgrade_installation
 from .repositories import SQLiteSeriesRepository
 
 
@@ -76,6 +76,25 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_upgrade(args: argparse.Namespace) -> int:
+    if not args.root:
+        raise ConfigError("upgrade requires --root")
+    result = upgrade_installation(args.root, apply=args.apply)
+    action = "applied" if result.applied else "dry-run"
+    plan = result.plan
+    print(
+        f"upgrade {action}: version {plan.source_version} -> {plan.target_version}; "
+        f"{len(plan.steps)} step(s)"
+    )
+    for step in plan.steps:
+        print(f"step: {step}")
+    if result.backup_root is not None:
+        print(f"backup: {result.backup_root}")
+    if not result.applied and plan.steps:
+        print("no files were written; rerun with --apply")
+    return 0
+
+
 def _exec_environment(snapshot, scope: str) -> dict[str, str]:
     env = dict(os.environ)
     env["BILIBILI_PODCAST_CONFIG_ROOT"] = str(snapshot.root)
@@ -100,7 +119,7 @@ def cmd_exec(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate and migrate bilibili-podcast unified configuration.")
+    parser = argparse.ArgumentParser(description="Validate and migrate Bilibili Podcast unified configuration.")
     parser.add_argument("--root", help="Configuration root (normally BILIBILI_PODCAST_CONFIG_ROOT).")
     subparsers = parser.add_subparsers(dest="action", required=True)
     validate = subparsers.add_parser("validate")
@@ -118,6 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--output-root", required=True)
     migrate.add_argument("--apply", action="store_true")
     migrate.set_defaults(handler=cmd_migrate)
+    upgrade = subparsers.add_parser("upgrade")
+    upgrade.add_argument("--apply", action="store_true")
+    upgrade.set_defaults(handler=cmd_upgrade)
     execute = subparsers.add_parser("exec")
     execute.add_argument("--scope", choices=("sync", "web", "scheduler", "publish"), required=True)
     execute.add_argument("command", nargs=argparse.REMAINDER)

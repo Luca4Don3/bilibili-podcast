@@ -184,12 +184,6 @@ config/.bilibili-podcast-migrate-*/
 config/**/*.bak*
 .temp/
 
-# RSS user config (contains real tokens)
-rss-publish-users.conf
-
-# RSS distribution script (server-specific paths)
-scripts/rss-publish.sh
-
 # Deployment notes / RSS links / handoff documents (internal only, never commit)
 HANDOFF.md
 handoff*.md
@@ -209,7 +203,7 @@ show_config.py
 download.py
 COOKIE_USAGE.md
 
-# bilibili-podcast sensitive files
+# Bilibili Podcast sensitive files
 # Configuration files with credentials
 config.yaml
 config_local.yaml

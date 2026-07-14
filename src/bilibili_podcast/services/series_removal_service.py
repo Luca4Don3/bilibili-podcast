@@ -59,6 +59,8 @@ class SeriesRemovalService:
         self.cron_script_dir = Path(cron_script_dir)
         self.browser_user_data_root = Path(browser_user_data_root)
         self.users_conf = Path(users_conf)
+        if self.users_conf.name != "rss-users.toml":
+            raise ValueError("users_conf must reference rss-users.toml")
 
     def list_series_for_uid(self, uid: int) -> list[str]:
         with db.transaction(self.db_path) as conn:
@@ -87,7 +89,8 @@ class SeriesRemovalService:
         wrapper = self.cron_script_dir / f"run_{series}_sync.sh"
         browser_profile = self.browser_user_data_root / series
         published = sorted(
-            str(path) for path in self.published_rss_root.glob(f"*/{series}.xml")
+            str(path)
+            for path in self.published_rss_root.glob(f".generations/*/*/{series}.xml")
         )
         return SeriesRemovalPlan(
             series=series,
@@ -201,68 +204,30 @@ class SeriesRemovalService:
     def _users_conf_reference_count(self, series: str) -> int:
         if not self.users_conf.exists():
             return 0
-        if self.users_conf.suffix == ".toml":
-            users = self._read_toml_users()
-            return sum(1 for user in users.values() if series in user["series"])
-        count = 0
-        for raw in self.users_conf.read_text(encoding="utf-8").splitlines():
-            content = raw.split("#", 1)[0].strip()
-            if ":" not in content:
-                continue
-            _, series_list = content.split(":", 1)
-            names = {item.strip() for item in series_list.split(",")}
-            if series in names:
-                count += 1
-        return count
+        users = self._read_toml_users()
+        return sum(1 for user in users.values() if series in user["series"])
 
     def _remove_users_conf_reference(self, series: str) -> None:
         if not self.users_conf.exists():
             return
-        if self.users_conf.suffix == ".toml":
-            users = self._read_toml_users()
-            output: list[str] = []
-            changed = False
-            for name, user in users.items():
-                names = [item for item in user.get("series", []) if item != series]
-                changed = changed or len(names) != len(user.get("series", []))
-                if not names:
-                    continue
-                token = user.get("token")
-                encoded_series = ", ".join(json.dumps(item, ensure_ascii=False) for item in names)
-                output.extend((
-                    f"[users.{json.dumps(name, ensure_ascii=False)}]",
-                    f"token = {json.dumps(token, ensure_ascii=False)}",
-                    f"series = [{encoded_series}]", "",
-                ))
-            if changed:
-                self._atomic_write_users_conf(
-                    "\n".join(output).encode("utf-8"),
-                    self.users_conf.stat().st_mode & 0o777,
-                )
-            return
+        users = self._read_toml_users()
         output: list[str] = []
         changed = False
-        for raw in self.users_conf.read_text(encoding="utf-8").splitlines():
-            content, marker, comment = raw.partition("#")
-            if ":" not in content:
-                output.append(raw)
-                continue
-            token, series_list = content.split(":", 1)
-            names = [item.strip() for item in series_list.split(",") if item.strip()]
-            if series not in names:
-                output.append(raw)
-                continue
-            names = [name for name in names if name != series]
-            changed = True
+        for name, user in users.items():
+            names = [item for item in user.get("series", []) if item != series]
+            changed = changed or len(names) != len(user.get("series", []))
             if not names:
                 continue
-            rebuilt = f"{token.strip()}:{','.join(names)}"
-            if marker:
-                rebuilt += f" #{comment}"
-            output.append(rebuilt)
+            token = user.get("token")
+            encoded_series = ", ".join(json.dumps(item, ensure_ascii=False) for item in names)
+            output.extend((
+                f"[users.{json.dumps(name, ensure_ascii=False)}]",
+                f"token = {json.dumps(token, ensure_ascii=False)}",
+                f"series = [{encoded_series}]", "",
+            ))
         if changed:
             self._atomic_write_users_conf(
-                ("\n".join(output) + "\n").encode("utf-8"),
+                "\n".join(output).encode("utf-8"),
                 self.users_conf.stat().st_mode & 0o777,
             )
 

@@ -12,13 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .manager import ConfigError, ConfigManager, UnsafeConfigError
-from .models import SeriesConfig
-from .repositories import LegacyYamlRepository
-from .schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
+from ..manager import ConfigError, ConfigManager, UnsafeConfigError
+from ..models import SeriesConfig
+from ..repositories import LegacyYamlRepository
+from ..schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
 
 
 _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_OLD_ENV_PREFIX = ("BILI" + "POD") + "_"
+_CURRENT_ENV_PREFIX = "BILIBILI_PODCAST_"
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,8 @@ def read_legacy_env(path: str | Path | None) -> dict[str, str]:
         if not match:
             raise ConfigError(f"unsupported legacy env syntax {source}:{line_number}")
         key, value = match.groups()
+        if key.startswith(_OLD_ENV_PREFIX):
+            key = _CURRENT_ENV_PREFIX + key.removeprefix(_OLD_ENV_PREFIX)
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
@@ -173,8 +177,8 @@ def _normalize_legacy_series(root: Path) -> tuple[list[MigratedSeries], tuple[st
 
 
 def _write_migrated_series(path: Path, configs: list[MigratedSeries]) -> None:
-    from .. import db
-    from ..services.scheduler_service import replace_schedules_in_connection
+    from ... import db
+    from ...services.scheduler_service import replace_schedules_in_connection
 
     db.migrate(path)
     with db.transaction(path) as conn:
@@ -203,12 +207,6 @@ def migrate_legacy(
     env = read_legacy_env(legacy_env)
     web_env = read_legacy_env(legacy_web_env)
     merged = {**env, **web_env}
-    publish_a = merged.get("BILIBILI_PODCAST_RSS_PUBLISH")
-    publish_b = merged.get("BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT")
-    if publish_a and publish_b and publish_a != publish_b:
-        raise ConfigError(
-            "legacy migration conflict: BILIBILI_PODCAST_RSS_PUBLISH and BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT differ"
-        )
     app_dir = _require(merged, "BILIBILI_PODCAST_APP_DIR")
     state_root = _require(merged, "BILIBILI_PODCAST_STATE_ROOT")
     removed_rsync = sorted(set(merged) & REMOVED_LEGACY_ENV)
@@ -236,7 +234,7 @@ def migrate_legacy(
         ]),
         "web.toml": _toml([
             ("server", {"enabled": bool(merged.get("BILIBILI_PODCAST_WEB_PASSWORD")), "host": "127.0.0.1", "port": 8000}),
-            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "session_max_age_seconds": 86400}),
+            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": [], "session_max_age_seconds": 86400}),
         ]),
         "scheduler.toml": _toml([
             ("runtime", {"user": "bilibili-podcast", "group": "bilibili-podcast"}),
@@ -245,7 +243,7 @@ def migrate_legacy(
             ("timeouts", {"command_seconds": 30}),
         ]),
         "publish.toml": _toml([
-            ("publish", {"enabled": bool(publish_a or publish_b), "media_base_url": merged.get("BILIBILI_PODCAST_MEDIA_BASE_URL", ""), "script": publish_a or publish_b or "", "master_placeholder": "__MEDIA_PLACEHOLDER__"}),
+            ("publish", {"enabled": bool(merged.get("BILIBILI_PODCAST_MEDIA_BASE_URL")), "media_base_url": merged.get("BILIBILI_PODCAST_MEDIA_BASE_URL", ""), "master_placeholder": "__MEDIA_PLACEHOLDER__", "gone_series": []}),
         ]),
         "manual-media.toml": _toml([("manual_media", {"enabled": bool(merged.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")), "allowed_dirs": [item for item in merged.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", "").split(":") if item], "follow_symlinks": False})]),
         "rss-users.toml": _rss_users_toml(_parse_rss_users(legacy_rss_users)),
@@ -289,7 +287,7 @@ def migrate_legacy(
             staged.chmod(0o600)
         ConfigManager(temp_root, environ={}).load()
         if configs:
-            from .. import db
+            from ... import db
 
             db_path = Path(merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db"))
             db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +303,7 @@ def migrate_legacy(
                 staged_db = Path(staged_name)
             db.migrate(staged_db)
             with db.transaction(staged_db) as conn:
-                from ..services.scheduler_service import replace_schedules_in_connection
+                from ...services.scheduler_service import replace_schedules_in_connection
                 for migrated in configs:
                     config = migrated.config
                     db.upsert_series(conn, config)
@@ -358,4 +356,45 @@ def migrate_legacy(
         manifest.chmod(0o600)
     else:
         backup_root.rmdir()
+    from .versioning import upgrade_installation
+
+    try:
+        upgrade_installation(output, apply=True)
+    except Exception:
+        for target, backup in reversed(replaced):
+            if backup is not None and backup.exists():
+                shutil.copy2(backup, target)
+            else:
+                target.unlink(missing_ok=True)
+        raise
     return MigrationResult(output, files, len(configs), normalizations, True)
+
+
+from .versioning import (  # noqa: E402  (legacy adapter is defined before the public facade)
+    EARLIEST_UNIFIED_VERSION,
+    LATEST_VERSION,
+    PRE_VERSIONED_CURRENT,
+    VERSION_FILE,
+    VersionMigrationPlan,
+    VersionMigrationResult,
+    detect_version,
+    plan_upgrade,
+    upgrade_installation,
+)
+
+
+__all__ = (
+    "EARLIEST_UNIFIED_VERSION",
+    "LATEST_VERSION",
+    "PRE_VERSIONED_CURRENT",
+    "VERSION_FILE",
+    "MigratedSeries",
+    "MigrationResult",
+    "VersionMigrationPlan",
+    "VersionMigrationResult",
+    "detect_version",
+    "migrate_legacy",
+    "plan_upgrade",
+    "read_legacy_env",
+    "upgrade_installation",
+)

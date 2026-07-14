@@ -64,6 +64,7 @@ WEB_FIELDS = (
     FieldSpec("security.password", str, "", sensitive=True, owner="web", legacy_aliases=("BILIBILI_PODCAST_WEB_PASSWORD",)),
     FieldSpec("security.https", bool, False, owner="web", legacy_aliases=("BILIBILI_PODCAST_HTTPS",)),
     FieldSpec("security.cookie_name", str, "bilibili_podcast_session", owner="web"),
+    FieldSpec("security.previous_cookie_names", list, [], owner="web"),
     FieldSpec("security.session_max_age_seconds", int, 86400, minimum=1, owner="web"),
 )
 
@@ -81,8 +82,8 @@ SCHEDULER_FIELDS = (
 PUBLISH_FIELDS = (
     FieldSpec("publish.enabled", bool, False, owner="publish"),
     FieldSpec("publish.media_base_url", str, "", owner="publish", legacy_aliases=("BILIBILI_PODCAST_MEDIA_BASE_URL",)),
-    FieldSpec("publish.script", str, "", owner="publish", legacy_aliases=("BILIBILI_PODCAST_RSS_PUBLISH", "BILIBILI_PODCAST_RSS_PUBLISH_SCRIPT")),
     FieldSpec("publish.master_placeholder", str, "__MEDIA_PLACEHOLDER__", owner="publish"),
+    FieldSpec("publish.gone_series", list, [], owner="publish"),
 )
 
 MANUAL_MEDIA_FIELDS = (

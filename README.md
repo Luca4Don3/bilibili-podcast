@@ -8,6 +8,7 @@
 
 - [快速开始](#快速开始)
 - [统一配置](#统一配置)
+- [独立版本迁移模块](#独立版本迁移模块)
 - [CLI 参数](#cli-参数)
   - [bilibili-podcast](#bilibili-podcast)
   - [bilibili-podcast-crontab](#bilibili-podcast-crontab)
@@ -60,7 +61,7 @@ bilibili-podcast --series demo-series --token "__MEDIA_PLACEHOLDER__" --apply
 | `sync.toml` | 下载限制、Cookie、浏览器、日志和超时 |
 | `web.toml` | Web 登录、HTTPS、Cookie、session 和监听配置 |
 | `scheduler.toml` | cron/systemd 用户、目录、wrapper、unit 和超时 |
-| `publish.toml` | master/published RSS、media URL 和本机发布脚本 |
+| `publish.toml` | master/published RSS、media URL、已删除系列和内建 generation publisher |
 | `manual-media.toml` | 手动媒体白名单和 symlink 策略 |
 | `rss-users.toml` | 用户 token 与系列授权关系 |
 | SQLite | 系列、来源、过滤、同步策略、调度和 `sync_state` |
@@ -83,6 +84,30 @@ bilibili-podcast-config migrate \
 
 `migrate` 只有加 `--apply` 才写入；写入前会 staged 校验，并把被替换的配置和 SQLite 备份到 `config/.backups/`。真实生产值必须由旧配置迁移和人工核对产生，不要把模板占位符当作实际配置。
 
+## 独立版本迁移模块
+
+`bilibili_podcast.config.migration` 是唯一允许修改历史安装格式的独立模块。同步器、Web、Admin、publisher 和部署脚本只能调用该模块，不能各自维护升级分支。
+
+迁移模块的接口契约是“任意已发布版本 → 当前最新版本”，而不是只支持相邻版本：
+
+- 自动检测来源版本，并按已登记步骤连续升级到当前版本。
+- 未标记的早期安装统一识别为 `legacy-unversioned`，通过显式适配器进入版本链。
+- 配置、SQLite schema、文件布局、systemd unit、Cookie 和 RSS 发布格式均属于版本状态。
+- 默认 dry-run；`--apply` 前执行在线备份、checksum、staged 验证和回滚准备。
+- 当前版本重复执行必须幂等；未知未来版本、损坏状态或缺失步骤必须显式失败。
+- 每次发布改变持久状态时，必须同时登记迁移步骤，并加入从最老 fixture、所有中间版本和跨多个版本直升的测试。
+
+当前 legacy env/YAML/RSS-user 输入是 `legacy-unversioned` 适配器。后续版本不得通过改写这个适配器来伪装历史兼容，而应追加不可变的版本迁移步骤。
+
+已统一配置的历史安装使用独立升级入口；默认只规划和验证，不写入：
+
+```bash
+bilibili-podcast-config --root <server_path>/config upgrade
+bilibili-podcast-config --root <server_path>/config upgrade --apply
+```
+
+输出只包含来源版本、目标版本、步骤名和备份目录，不打印配置值、token 或 Cookie。`--apply` 成功后会写入版本 marker，并使 SQLite `schema_version` 与安装版本一致。后续任何改变持久状态的新功能，都必须在同一个 feature 中同步追加版本步骤和历史 fixture，不能把升级支持留到后续补做。
+
 ---
 
 ## CLI 参数
@@ -95,7 +120,7 @@ bilibili-podcast-config migrate \
 | `--config-dir` | (none) | 显式启用 legacy YAML 回滚读取；不会自动回退 |
 | `--series` | (all enabled) | 逗号分隔的系列 ID，不指定则处理所有 `enabled: true` 的系列 |
 | `--cookie-file` | (none) | Netscape 格式 cookie 文件，用于 B 站 API 鉴权 |
-| `--token` | (none) | RSS enclosure URL 中的 token 占位符，分发时替换为真实用户 token |
+| `--token` | `__MEDIA_PLACEHOLDER__` | 仅接受固定占位符；真实 token 会被拒绝，用户 RSS 由内建 publisher 生成 |
 | `--media-root` | `app.toml` | MP3 媒体文件存储根目录 |
 | `--json-root` | `app.toml` | 剧集元数据 JSON 存储根目录 |
 | `--rss-root` | `app.toml` | RSS XML 输出目录 |
@@ -113,7 +138,6 @@ bilibili-podcast-config migrate \
 | `--debug` | off | `--log-level DEBUG` 的兼容快捷方式，优先级高于 `--log-level` |
 | `--force` | off | 跳过更新周期和 rate-limit cooldown 门控 |
 | `--apply` | off | 实际写入文件和下载媒体，不带则为干跑 |
-| `--publish-script` | (none) | 发布脚本路径，仅在 `--apply` 且全部系列同步成功后执行 |
 
 ### bilibili-podcast-crontab
 
@@ -259,7 +283,7 @@ bilibili-podcast-admin add \
 | `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --media-root /path/to/media` | 关联人工上传的 MP3 文件 |
 | `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --replace` | 覆盖已有媒体文件 |
 | `bilibili-podcast-admin paid add-item <series> --url <bilibili-video-url> --media-path /path/to/uploaded-media` | 从用户提供的媒体文件和 B 站视频页面新增一条手动媒体 |
-| `bilibili-podcast-admin paid add-item <series> --ffmpeg-bin /path/to/ffmpeg --publish-script /path/to/publish.sh` | 指定转码命令和 RSS 重建后的发布脚本 |
+| `bilibili-podcast-admin paid add-item <series> --ffmpeg-bin /path/to/ffmpeg` | 指定转码命令；RSS 重建成功后由内建 publisher 原子发布 |
 | `bilibili-podcast-admin paid rebuild-rss <series> --json-root /path/to/json --media-root /path/to/media --rss-root /path/to/rss` | 从现有 metadata + media 重建 master RSS |
 
 `attach-media` 只接受 MP3 文件，并校验 BVID。上传源文件必须位于部署环境配置的白名单目录内。`add-item` 可接受视频或其他 ffmpeg 支持的媒体格式，会调用 `ffmpeg` 转为当前 series 的 MP3 quality，使用视频页面拉取单条 metadata，并重建 master RSS。手动媒体文件名会使用该 series 当前 `sync.quality`，即 `{BVID}_{quality}.mp3`，不要对非 64K series 固定写 `_64K`。`rebuild-rss` 生成 master RSS 时使用 `__MEDIA_PLACEHOLDER__`，由 RSS 发布流程替换为用户专属 token。
@@ -383,7 +407,7 @@ ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BI
 ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --apply' < scripts/standardize-runtime-config.sh
 ```
 
-生产切换前必须先取得服务器上未跟踪的 `scripts/rss-publish.sh` 做只读审计，并确认其改为读取 `rss-users.toml`。该文件未审计前，不得宣称发布链已经全局覆盖，也不得执行生产切换。
+生产切换前必须确认所有同步与手动媒体入口都调用内建 publisher，且服务器上不存在仍被 unit、wrapper 或 cron 引用的外部发布脚本。
 
 ---
 ## 系列配置文件
@@ -719,7 +743,7 @@ systemd 调度的安全约束：
 - cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
-- 如果使用 RSS 多用户分发，service 的同步成功后按 `publish.toml` 触发发布脚本。
+- 如果启用 RSS 多用户分发，service 的同步成功后按 `publish.toml` 触发内建 generation publisher。
 - 生成的 `.service` 只保留 `Environment=BILIBILI_PODCAST_CONFIG_ROOT=...`，不包含旧 env 文件或敏感值。
 - 验证 timer 时只启动/刷新 `.timer`，不要手动启动 `.service`。
 - 不要把启用和立即运行合并成一步；启用和启动 timer 应分开执行，并确认 timer active 后再移除旧调度。
@@ -728,7 +752,7 @@ systemd 调度的安全约束：
 
 ## RSS 多用户分发
 
-生成的 master RSS 使用占位符 token（`__MEDIA_PLACEHOLDER__`）。发布脚本会将 master RSS 分发为各用户专属 RSS，并把占位符替换为用户 token。
+生成的 master RSS 永远使用占位符 token（`__MEDIA_PLACEHOLDER__`）。内建 publisher 在文件锁内构建并校验完整 generation，按 token SHA-256 目录写入用户 RSS，`fsync` 后原子切换 `current`，并保留最近两代。
 
 ### 工作流程
 
@@ -769,7 +793,7 @@ series = ["series1", "series2"]
 
 ## 部署架构
 
-项目按单服务器部署：同步进程、Web 管理、SQLite、媒体文件、master RSS、用户 RSS 和对外 HTTP 服务位于同一台服务器。`scripts/rss-publish-and-sync.sh` 仅作为历史命令名保留，当前只执行本机 `rss-publish.sh`，不包含跨服务器同步。
+项目按单服务器部署：同步进程、Web 管理、SQLite、媒体文件、master RSS、用户 RSS 和对外 HTTP 服务位于同一台服务器。发布完全由应用内建实现，不依赖外部 hook 或 rsync。
 
 未来如需向其他服务器分发，应单独设计带身份认证、完整性校验、失败重试和可观测性的发布接口；本项目不保留 rsync 执行链或配置。
 

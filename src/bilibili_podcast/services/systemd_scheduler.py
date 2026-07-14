@@ -34,7 +34,7 @@ def configure(config: ConfigSnapshot) -> None:
 
 UNIFIED_SERVICE_TEMPLATE = """\
 [Unit]
-Description=bilibili-podcast Sync — {series}
+Description=Bilibili Podcast Sync — {series}
 After=network.target
 
 [Service]
@@ -52,7 +52,7 @@ TimeoutStartSec=1800
 
 TIMER_TEMPLATE = """\
 [Unit]
-Description=bilibili-podcast Sync Timer — {series}
+Description=Bilibili Podcast Sync Timer — {series}
 
 [Timer]
 {oncalendar_lines}

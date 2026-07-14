@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from ..sqlite_connection import connect as sqlite_connect
+
 @dataclass
 class SchedulerCommandResult:
     backend: str
@@ -165,7 +167,7 @@ def _find_crontab_script() -> Optional[str]:
 
 
 class SchedulerService:
-    """Manage cron and systemd timer scheduling for bilibili-podcast series."""
+    """Manage cron and systemd timer scheduling for Bilibili Podcast series."""
 
     def __init__(
         self,
@@ -687,14 +689,14 @@ class SchedulerService:
             db.set_scheduler_backend(conn, series, backend)
 
     def _scheduler_backend(self, series: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT backend FROM scheduler_backend WHERE series=?", (series,),
             ).fetchone()
         return str(row[0] if row else "cron")
 
     def _cron_retry_series(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT c.series FROM cron_schedule c "
                 "LEFT JOIN scheduler_backend b ON b.series=c.series "
@@ -723,7 +725,7 @@ class SchedulerService:
         if not wrapper.exists():
             raise RuntimeError(f"cron wrapper not found: {wrapper}")
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute("SELECT title FROM series WHERE series=?", (series,)).fetchone()
         if row is None:
             raise RuntimeError(f"series not found: {series}")
@@ -747,14 +749,14 @@ class SchedulerService:
     # ── list_schedules / replace_schedules (DB only) ──────────────────
 
     def _update_period(self, series: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT update_period FROM sync_policy WHERE series=?", (series,),
             ).fetchone()
         return str(row[0] if row else "12h")
 
     def list_schedules(self, series: str) -> list[ScheduleEntry]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, series, schedule, enabled, position, kind "
@@ -776,7 +778,7 @@ class SchedulerService:
     def list_enabled_schedules(self, series: str) -> list[ScheduleEntry]:
         """Return only enabled schedules (enabled=1) for installation
         into cron/systemd."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, series, schedule, enabled, position, kind "
@@ -802,7 +804,7 @@ class SchedulerService:
         retry_schedules: list[str] | None = None,
     ) -> int:
         retry_schedules = retry_schedules or []
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             count = replace_schedules_in_connection(conn, series, schedules, retry_schedules)
             conn.commit()
         return count
@@ -815,7 +817,7 @@ class SchedulerService:
         if backend == "systemd":
             return self._status_systemd(series)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             if series:
                 rows = conn.execute(
@@ -867,7 +869,7 @@ class SchedulerService:
         return result
 
     def _list_all_series(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             rows = conn.execute("SELECT series FROM series").fetchall()
         return [r[0] for r in rows]
 

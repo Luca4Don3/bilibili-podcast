@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy bilibili-podcast from one validated BILIBILI_PODCAST_CONFIG_ROOT.
+# Deploy Bilibili Podcast from one validated BILIBILI_PODCAST_CONFIG_ROOT.
 # Dry-run is the default; --apply performs backups, code/dependency update,
 # config validation, and scheduler regeneration. It never restarts services.
 
@@ -56,7 +56,7 @@ BACKUP_PARENT="$CONFIG_ROOT/.backups"
 BACKUP_TEMPLATE="$BACKUP_PARENT/deploy-$(date +%Y%m%d_%H%M%S)-XXXXXXXX"
 BACKUP_DIR="$BACKUP_TEMPLATE"
 
-echo "bilibili-podcast unified deployment"
+echo "Bilibili Podcast unified deployment"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
 echo "  config root: $CONFIG_ROOT"
 echo "  code dir: $CODE_DIR"

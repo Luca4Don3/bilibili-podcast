@@ -83,7 +83,7 @@ write_web_unit() {
     temp="$(mktemp "$SYSTEMD_DIR/.bilibili-podcast-web.XXXXXXXX")"
     {
         echo "[Unit]"
-        echo "Description=bilibili-podcast Web Manager"
+        echo "Description=Bilibili Podcast Web Manager"
         echo "After=network.target"
         echo
         echo "[Service]"
@@ -118,7 +118,7 @@ write_sync_unit() {
     temp="$(mktemp "$SYSTEMD_DIR/.${name}.XXXXXXXX")"
     {
         echo "[Unit]"
-        echo "Description=bilibili-podcast Sync — $series"
+        echo "Description=Bilibili Podcast Sync — $series"
         echo "After=network.target"
         echo
         echo "[Service]"

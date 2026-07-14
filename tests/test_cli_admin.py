@@ -48,8 +48,10 @@ def reset_admin_config_snapshot(tmp_path: Path):
         ),
         scheduler=SimpleNamespace(command_timeout_seconds=30),
         publish=SimpleNamespace(publish=SimpleNamespace(
-            enabled=False, media_base_url="https://media.example.invalid", script=None,
+            enabled=False, media_base_url="https://media.example.invalid",
+            master_placeholder="__MEDIA_PLACEHOLDER__", gone_series=(),
         )),
+        rss_users=SimpleNamespace(users={}),
         manual_media=ManualMedia(),
     )
     yield
@@ -331,7 +333,7 @@ def test_remove_series_preview_does_not_delete(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     with patch.object(sys, "stdout"):
         cli_admin.cmd_remove_series(ns)
@@ -367,7 +369,7 @@ def test_remove_series_schedule_failure_stops_deletion(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     failure = SchedulerCommandResult(
         backend="systemd", action="remove-series", returncode=1,
@@ -412,7 +414,7 @@ def test_remove_series_lock_contention_stops_deletion(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(lock_file),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     with sync.process_lock(str(lock_file)):
         with patch.object(sys, "stdout"), pytest.raises(SystemExit) as exc:
@@ -449,7 +451,7 @@ def test_remove_up_does_not_remove_later_schedule_before_failure(tmp_path: Path)
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     ok = SchedulerCommandResult("systemd", "remove-series", 0, "", "")
     failure = SchedulerCommandResult("systemd", "remove-series", 1, "", "failed")
@@ -661,19 +663,17 @@ def test_sync_dry_run_has_production_params(tmp_path: Path) -> None:
     assert "--min-free-gb" in cmd
 
 
-def test_sync_publish_timeout_returns_sync_failure(tmp_path: Path) -> None:
+def test_sync_builtin_publish_failure_returns_sync_failure(tmp_path: Path) -> None:
     db_path = _migrate(tmp_path)
     _create_minimal_series(db_path)
     cli_admin._CONFIG.publish.publish.enabled = True
-    cli_admin._CONFIG.publish.publish.script = Path("/tmp/publish-hook")
 
     def fake_run(cmd, **kwargs):
-        if cmd[0] == "/tmp/publish-hook":
-            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
         return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
     with patch.object(cli_admin, "_find_sync_bin", return_value="/tmp/bilibili-podcast"), \
-            patch.object(subprocess, "run", side_effect=fake_run):
+            patch.object(subprocess, "run", side_effect=fake_run), \
+            patch("bilibili_podcast.publisher.publish", side_effect=RuntimeError("publish failed")):
         args = cli_admin.build_parser().parse_args(
             ["--config-db", db_path, "--yes", "sync", "synctest", "--apply"]
         )

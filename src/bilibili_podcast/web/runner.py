@@ -18,7 +18,10 @@ def main() -> int:
     except (ConfigError, RuntimeError) as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return getattr(exc, "exit_code", 2)
-    uvicorn.run(app, host=snapshot.web.server.host, port=snapshot.web.server.port)
+    uvicorn.run(
+        app, host=snapshot.web.server.host, port=snapshot.web.server.port,
+        access_log=False,
+    )
     return 0
 
 

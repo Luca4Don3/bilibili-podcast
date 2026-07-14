@@ -223,6 +223,10 @@ class ConfigManager:
                 raise ConfigError(f"invalid configuration type {path}:{spec.path}")
             if spec.path == "manual_media.allowed_dirs" and not all(isinstance(item, str) for item in value):
                 raise ConfigError(f"invalid configuration type {path}:{spec.path}")
+            if spec.path in {"security.previous_cookie_names", "publish.gone_series"} and not all(
+                isinstance(item, str) and item for item in value
+            ):
+                raise ConfigError(f"invalid configuration type {path}:{spec.path}")
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 if isinstance(value, float) and not math.isfinite(value):
                     raise ConfigError(f"non-finite configuration value {path}:{spec.path}")
@@ -263,17 +267,28 @@ class ConfigManager:
             return
         if snapshot.web.server.enabled and not snapshot.web.security.password:
             raise ConfigError("missing enabled dependency web.toml:security.password")
+        cookie_names = (
+            snapshot.web.security.cookie_name,
+            *snapshot.web.security.previous_cookie_names,
+        )
+        if len(cookie_names) != len(set(cookie_names)):
+            raise ConfigError("duplicate web cookie name web.toml:security")
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]+", name) for name in cookie_names):
+            raise ConfigError("invalid web cookie name web.toml:security")
+        if any(
+            not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", series)
+            for series in snapshot.publish.publish.gone_series
+        ):
+            raise ConfigError("invalid gone series publish.toml:publish.gone_series")
         if snapshot.sync.logging.level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigError("invalid logging level sync.toml:logging.level")
         publish = snapshot.publish.publish
-        if publish.enabled and (not publish.media_base_url or publish.script is None):
+        if publish.enabled and not publish.media_base_url:
             raise ConfigError("missing enabled dependency publish.toml:publish")
         if publish.enabled:
             parsed = urlparse(publish.media_base_url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ConfigError("invalid enabled URL publish.toml:publish.media_base_url")
-            if not publish.script.is_absolute():
-                raise ConfigError("publish script must be absolute publish.toml:publish.script")
         if publish.master_placeholder != "__MEDIA_PLACEHOLDER__":
             raise ConfigError("invalid master RSS placeholder publish.toml:publish.master_placeholder")
         required_paths = (
@@ -363,7 +378,11 @@ class ConfigManager:
             ),
             web=WebConfig(
                 server=WebServerConfig(w["server.enabled"], w["server.host"], w["server.port"]),
-                security=WebSecurityConfig(w["security.password"], w["security.https"], w["security.cookie_name"], w["security.session_max_age_seconds"]),
+                security=WebSecurityConfig(
+                    w["security.password"], w["security.https"], w["security.cookie_name"],
+                    tuple(w["security.previous_cookie_names"]),
+                    w["security.session_max_age_seconds"],
+                ),
             ),
             scheduler=SchedulerConfig(
                 runtime=SchedulerRuntimeConfig(sch["runtime.user"], sch["runtime.group"]),
@@ -372,7 +391,10 @@ class ConfigManager:
                 command_timeout_seconds=sch["timeouts.command_seconds"],
             ),
             publish=PublishConfig(
-                publish=PublishSettings(pub["publish.enabled"], pub["publish.media_base_url"], _path(pub["publish.script"]) if pub["publish.script"] else None, pub["publish.master_placeholder"]),
+                publish=PublishSettings(
+                    pub["publish.enabled"], pub["publish.media_base_url"],
+                    pub["publish.master_placeholder"], tuple(pub["publish.gone_series"]),
+                ),
             ),
             manual_media=ManualMediaConfig(mm["manual_media.enabled"], tuple(_path(item) for item in mm["manual_media.allowed_dirs"]), mm["manual_media.follow_symlinks"]),
             rss_users=RssUsersConfig(MappingProxyType(users)),

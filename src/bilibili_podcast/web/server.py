@@ -1,4 +1,4 @@
-"""bilibili-podcast web management UI — FastAPI + Jinja2 + SQLite server."""
+"""Bilibili Podcast web management UI — FastAPI + Jinja2 + SQLite server."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, FastAPI, Request, Form, HTTPException
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
@@ -46,6 +46,7 @@ _CONFIG_MANAGER: ConfigManager | None = None
 _CONFIG_SNAPSHOT: ConfigSnapshot | None = None
 _CONFIGURED_APP: FastAPI | None = None
 _COOKIE_NAME = "bilibili_podcast_session"
+_PREVIOUS_COOKIE_NAMES: tuple[str, ...] = ()
 _SESSION_MAX_AGE = 86400  # 24 hours
 _HTTPS = False
 _cli_admin._CONFIG = None
@@ -124,12 +125,39 @@ def _session_token() -> str:
 
 def _get_session(request: Request) -> str | None:
     cookie = request.cookies.get(_COOKIE_NAME)
-    if not cookie:
-        return None
-    try:
-        return _serializer.loads(cookie, max_age=_SESSION_MAX_AGE, salt="session")
-    except (BadSignature, SignatureExpired):
-        return None
+    if cookie:
+        try:
+            return _serializer.loads(cookie, max_age=_SESSION_MAX_AGE, salt="session")
+        except (BadSignature, SignatureExpired):
+            pass
+    for name in _PREVIOUS_COOKIE_NAMES:
+        previous = request.cookies.get(name)
+        if not previous:
+            continue
+        try:
+            session = _serializer.loads(previous, max_age=_SESSION_MAX_AGE, salt="session")
+        except (BadSignature, SignatureExpired):
+            continue
+        request.state.refresh_session_cookie = True
+        return session
+    return None
+
+
+def _rss_user_for_token(token: str):
+    config = _runtime_config()
+    for user in config.rss_users.users.values():
+        if hmac.compare_digest(user.token, token):
+            return user
+    return None
+
+
+def _refresh_session_cookie(request: Request, response: Response) -> Response:
+    if getattr(request.state, "refresh_session_cookie", False):
+        response.set_cookie(
+            _COOKIE_NAME, _session_token(), max_age=_SESSION_MAX_AGE,
+            httponly=True, samesite="lax", secure=_HTTPS,
+        )
+    return response
 
 
 def _login_required(request: Request) -> RedirectResponse | None:
@@ -196,7 +224,38 @@ async def login_post(request: Request, password: str = Form(...)):
 async def logout():
     resp = RedirectResponse(url="/login", status_code=302)
     resp.delete_cookie(_COOKIE_NAME)
+    for name in _PREVIOUS_COOKIE_NAMES:
+        resp.delete_cookie(name)
     return resp
+
+
+@router.get("/auth/rss/{token}/{series}.xml", include_in_schema=False)
+async def authorize_rss(token: str, series: str):
+    config = _runtime_config()
+    if series in config.publish.publish.gone_series:
+        return Response(status_code=410)
+    user = _rss_user_for_token(token)
+    if user is None or ("all" not in user.series and series not in user.series):
+        return Response(status_code=403)
+    rss_path = config.app.paths.published_rss_root / "current" / hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest() / f"{series}.xml"
+    if not rss_path.is_file():
+        return Response(status_code=404)
+    return Response(
+        status_code=204,
+        headers={"X-RSS-Token-Hash": rss_path.parent.name},
+    )
+
+
+@router.get("/auth/media/{token}/{series}/{filename}", include_in_schema=False)
+async def authorize_media(token: str, series: str, filename: str):
+    user = _rss_user_for_token(token)
+    if user is None or ("all" not in user.series and series not in user.series):
+        return Response(status_code=403)
+    if not validation.validate_slug(series) or not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
+        return Response(status_code=404)
+    return Response(status_code=204)
 
 
 @router.get("/")
@@ -1072,18 +1131,11 @@ async def manual_media_attach(
         _restore_file(rss_path, rss_backup)
         return _manual_media_redirect(series, error=f"rss rebuild failed: {exc}")
 
-    publish_script = (
-        _CONFIG_SNAPSHOT.publish.publish.script
-        if _CONFIG_SNAPSHOT and _CONFIG_SNAPSHOT.publish.publish.enabled
-        else None
-    )
-    if publish_script is not None:
+    if _CONFIG_SNAPSHOT and _CONFIG_SNAPSHOT.publish.publish.enabled:
         try:
-            subprocess.run(
-                [str(publish_script)], check=True,
-                timeout=config.sync.timeouts.publish_seconds,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            from ..publisher import publish
+            publish(_CONFIG_SNAPSHOT)
+        except (OSError, RuntimeError) as exc:
             _restore_file(dst, media_backup)
             _restore_file(rss_path, rss_backup)
             return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
@@ -1123,7 +1175,7 @@ def create_app(
     manager: ConfigManager | None = None,
 ) -> FastAPI:
     """Configure and return the ASGI app from one immutable snapshot."""
-    global DB_PATH, PASSWORD, _COOKIE_NAME, _SESSION_MAX_AGE, _HTTPS
+    global DB_PATH, PASSWORD, _COOKIE_NAME, _PREVIOUS_COOKIE_NAMES, _SESSION_MAX_AGE, _HTTPS
     global _SECRET_KEY, _serializer, _CONFIG_MANAGER, _CONFIG_SNAPSHOT, _CONFIGURED_APP
 
     if snapshot is not None:
@@ -1143,6 +1195,7 @@ def create_app(
     DB_PATH = str(selected.app.database.path)
     PASSWORD = selected.web.security.password
     _COOKIE_NAME = selected.web.security.cookie_name
+    _PREVIOUS_COOKIE_NAMES = selected.web.security.previous_cookie_names
     _SESSION_MAX_AGE = selected.web.security.session_max_age_seconds
     _HTTPS = selected.web.security.https
     _SECRET_KEY = hashlib.sha256(PASSWORD.encode()).hexdigest()
@@ -1152,7 +1205,13 @@ def create_app(
     _cli_admin._CONFIG = selected
     from ..services import systemd_scheduler
     systemd_scheduler.configure(selected)
-    configured_app = FastAPI(title="bilibili-podcast Manager")
+    configured_app = FastAPI(title="Bilibili Podcast Manager")
+
+    @configured_app.middleware("http")
+    async def refresh_previous_session_cookie(request: Request, call_next):
+        response = await call_next(request)
+        return _refresh_session_cookie(request, response)
+
     configured_app.include_router(router)
     configured_app.state.config = selected
     _CONFIGURED_APP = configured_app

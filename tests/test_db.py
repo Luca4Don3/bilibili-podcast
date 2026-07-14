@@ -117,11 +117,57 @@ class TestMigrate:
         conn.close()
         assert journal in ("wal", "delete")
 
+    def test_existing_client_can_read_and_write_after_online_migration(self, db_path: Path):
+        legacy = sqlite3.connect(str(db_path))
+        legacy.execute("PRAGMA journal_mode=WAL")
+        db.migrate(str(db_path))
+        legacy.execute(
+            "INSERT INTO series(series,title,author) VALUES('legacy-client','L','A')"
+        )
+        legacy.commit()
+        with db.transaction(str(db_path)) as current:
+            assert current.execute(
+                "SELECT title FROM series WHERE series='legacy-client'"
+            ).fetchone()[0] == "L"
+        legacy.close()
+
+    def test_online_migration_rolls_back_partial_column_changes(self, tmp_path: Path, monkeypatch):
+        path = tmp_path / "old-schema.db"
+        with sqlite3.connect(path) as conn:
+            conn.execute(
+                "CREATE TABLE cron_schedule(id INTEGER PRIMARY KEY, series TEXT, schedule TEXT)"
+            )
+
+        original = db._ensure_column
+        calls = 0
+
+        def fail_after_first_column(conn, table, column, definition):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                original(conn, table, column, definition)
+                return
+            raise RuntimeError("injected migration failure")
+
+        monkeypatch.setattr(db, "_ensure_column", fail_after_first_column)
+        with pytest.raises(RuntimeError, match="injected migration failure"):
+            db.migrate(path)
+
+        with sqlite3.connect(path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(cron_schedule)")}
+        assert "kind" not in columns
+
 
 # ── transaction context manager ─────────────────────────────────────
 
 
 class TestTransaction:
+    def test_shared_connection_policy(self, db_path: Path):
+        with db.transaction(str(db_path)) as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
     def test_commits_on_success(self, db_path: Path):
         with db.transaction(str(db_path)) as conn:
             conn.execute(

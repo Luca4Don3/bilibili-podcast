@@ -1151,25 +1151,13 @@ def cmd_sync(args: argparse.Namespace) -> None:
         print(f"❌ 执行错误: {e}")
         sys.exit(EXIT_SYNC_FAIL)
 
-    # After successful apply: publish RSS
-    publish = (
-        str(_CONFIG.publish.publish.script)
-        if _CONFIG and _CONFIG.publish.publish.enabled and _CONFIG.publish.publish.script
-        else None
-    )
-    if args.apply and publish:
+    # After successful apply: publish RSS atomically.
+    if args.apply and _CONFIG and _CONFIG.publish.publish.enabled:
         try:
-            pub_result = subprocess.run(
-                [publish], capture_output=True, text=True,
-                timeout=_CONFIG.sync.timeouts.publish_seconds if _CONFIG else 60,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            from .publisher import publish
+            publish(_CONFIG)
+        except (OSError, RuntimeError) as exc:
             print(f"RSS 发布失败: {_sanitize(str(exc))}")
-            sys.exit(EXIT_SYNC_FAIL)
-        pub_out = (pub_result.stdout or "") + "\n" + (pub_result.stderr or "")
-        print(_sanitize(pub_out))
-        if pub_result.returncode != 0:
-            print(f"\n⚠️ RSS 发布失败（返回码 {pub_result.returncode}）")
             sys.exit(EXIT_SYNC_FAIL)
 
 
@@ -2267,16 +2255,15 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         sys.exit(EXIT_VALIDATION if isinstance(exc, ValueError) else EXIT_SYNC_FAIL)
 
     try:
-        if args.publish_script:
-            subprocess.run(
-                [args.publish_script], check=True,
-                timeout=_require_config().sync.timeouts.publish_seconds,
-            )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        config = _require_config()
+        if config.publish.publish.enabled:
+            from .publisher import publish
+            publish(config)
+    except (OSError, RuntimeError) as exc:
         _restore_file(media_dst, media_backup)
         _restore_file(json_dst, json_backup)
         _restore_file(rss_dst, rss_backup)
-        print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
+        print(f"❌ RSS 发布失败: {_sanitize(str(exc))}")
         sys.exit(EXIT_SYNC_FAIL)
 
     for backup in (media_backup, json_backup, rss_backup):
@@ -2419,7 +2406,7 @@ def cmd_paid_rebuild_rss(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bilibili-podcast-admin",
-        description="bilibili-podcast 系列管理 CLI",
+        description="Bilibili Podcast 系列管理 CLI",
     )
     parser.add_argument("--config-db", help="SQLite 数据库路径（默认读取 app.database.path）")
     parser.add_argument("--yes", action="store_true", help="跳过低风险确认")
@@ -2707,7 +2694,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_add_item.add_argument("--cookie-file", help="Netscape cookie 文件路径")
     p_add_item.add_argument("--ffmpeg-bin", help="ffmpeg 可执行文件路径")
     p_add_item.add_argument("--replace", action="store_true", help="覆盖已有 media")
-    p_add_item.add_argument("--publish-script", help="重建 RSS 后执行的发布脚本")
     p_add_item.set_defaults(handler=cmd_paid_add_item)
 
     p_rebuild = paid_sub.add_parser("rebuild-rss", help="从已有 metadata + media 重建 RSS")
@@ -2735,11 +2721,6 @@ def apply_admin_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapsh
         "cookie_file": str(snapshot.sync.paths.cookie_file),
         "media_base_url": snapshot.publish.publish.media_base_url,
         "ffmpeg_bin": snapshot.app.executables.ffmpeg,
-        "publish_script": (
-            str(snapshot.publish.publish.script)
-            if snapshot.publish.publish.enabled and snapshot.publish.publish.script
-            else None
-        ),
     }
     for name, value in defaults.items():
         if hasattr(args, name) and getattr(args, name) is None:

@@ -1,4 +1,4 @@
-"""bilibili-podcast web management UI — FastAPI + Jinja2 + SQLite."""
+"""Bilibili Podcast web management UI — FastAPI + Jinja2 + SQLite."""
 
 from .server import create_app
 

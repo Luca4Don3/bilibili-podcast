@@ -7,4 +7,5 @@ port = 8000
 password = ""
 https = false
 cookie_name = "bilibili_podcast_session"
+previous_cookie_names = []
 session_max_age_seconds = 86400

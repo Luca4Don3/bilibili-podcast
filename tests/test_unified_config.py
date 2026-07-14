@@ -14,7 +14,7 @@ from bilibili_podcast.config.manager import (
     ConfigError, ConfigManager, LegacyConfigError, UnsafeConfigError,
 )
 from bilibili_podcast.config.schema import LEGACY_ENV_MAP, LEGACY_INPUT_ONLY
-from bilibili_podcast.config.migration import migrate_legacy
+from bilibili_podcast.config.migration import LATEST_VERSION, VERSION_FILE, migrate_legacy
 from bilibili_podcast import db
 
 
@@ -206,6 +206,7 @@ def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) ->
     )
     assert applied.applied is True
     assert ConfigManager(output, environ={}).load().rss_users.users["user_1"].token == "test-token"
+    assert (output / VERSION_FILE).read_text(encoding="ascii").strip() == str(LATEST_VERSION)
 
 
 def test_migration_apply_rejects_existing_config_symlink(tmp_path: Path) -> None:
@@ -327,14 +328,20 @@ def test_migration_invalid_series_returns_cli_error_without_writes(tmp_path: Pat
     assert not output.exists()
 
 
-def test_enabled_publish_requires_valid_url_and_absolute_script(tmp_path: Path) -> None:
+def test_enabled_publish_requires_valid_url_and_rejects_script_field(tmp_path: Path) -> None:
     root = _actual_config(tmp_path)
     publish = root / "publish.toml"
     publish.write_text(
         '[publish]\nenabled = true\nmedia_base_url = "not-a-url"\n'
-        'script = "relative.sh"\nmaster_placeholder = "__MEDIA_PLACEHOLDER__"\n'
+        'master_placeholder = "__MEDIA_PLACEHOLDER__"\ngone_series = []\n'
     )
     with pytest.raises(ConfigError, match="invalid enabled URL"):
+        ConfigManager(root, environ={}).load()
+
+    root = _actual_config(tmp_path / "script")
+    publish = root / "publish.toml"
+    publish.write_text(publish.read_text() + 'script = "/tmp/publish.sh"\n')
+    with pytest.raises(ConfigError, match="unknown configuration field"):
         ConfigManager(root, environ={}).load()
 
 
@@ -361,7 +368,7 @@ def test_manual_media_config_boundaries(tmp_path: Path) -> None:
         ConfigManager(root, environ={}).load()
 
 
-def test_migration_rejects_publish_conflict_without_writes(tmp_path: Path) -> None:
+def test_migration_does_not_create_external_publish_hook(tmp_path: Path) -> None:
     env = _legacy_env(tmp_path)
     with env.open("a") as handle:
         handle.write("BILIBILI_PODCAST_RSS_PUBLISH=/tmp/one\nBILIBILI_PODCAST_RSS_PUBLISH_SCRIPT=/tmp/two\n")
@@ -372,12 +379,11 @@ def test_migration_rejects_publish_conflict_without_writes(tmp_path: Path) -> No
     users = tmp_path / "users"
     users.write_text("")
     output = tmp_path / "output"
-    with pytest.raises(ConfigError, match="conflict"):
-        migrate_legacy(
-            legacy_env=env, legacy_web_env=web_env, legacy_series_dir=series_dir,
-            legacy_rss_users=users, output_root=output, apply=True,
-        )
-    assert not output.exists()
+    migrate_legacy(
+        legacy_env=env, legacy_web_env=web_env, legacy_series_dir=series_dir,
+        legacy_rss_users=users, output_root=output, apply=True,
+    )
+    assert "script" not in (output / "publish.toml").read_text()
 
 
 def test_web_config_view_requires_login_and_redacts(monkeypatch, tmp_path: Path) -> None:

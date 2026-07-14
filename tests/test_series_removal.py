@@ -18,7 +18,7 @@ def _service(tmp_path: Path) -> tuple[SeriesRemovalService, Path]:
         published_rss_root=tmp_path / "published",
         cron_script_dir=tmp_path / "auto",
         browser_user_data_root=tmp_path / "browser-profiles",
-        users_conf=tmp_path / "rss-publish-users.conf",
+        users_conf=tmp_path / "rss-users.toml",
     )
     return service, db_path
 
@@ -54,13 +54,16 @@ def test_plan_counts_series_artifacts(tmp_path: Path) -> None:
     (tmp_path / "json" / "demo" / "a.json").write_text("{}")
     (tmp_path / "rss").mkdir()
     (tmp_path / "rss" / "demo.xml").write_text("<rss/>")
-    (tmp_path / "published" / "<user_token>").mkdir(parents=True)
-    (tmp_path / "published" / "<user_token>" / "demo.xml").write_text("<rss/>")
+    published = tmp_path / "published" / ".generations" / "one" / "token-hash"
+    published.mkdir(parents=True)
+    (published / "demo.xml").write_text("<rss/>")
     (tmp_path / "auto").mkdir()
     (tmp_path / "auto" / "run_demo_sync.sh").write_text("#!/bin/sh")
     (tmp_path / "browser-profiles" / "demo").mkdir(parents=True)
     (tmp_path / "browser-profiles" / "demo" / "Cookies").write_text("x")
-    (tmp_path / "rss-publish-users.conf").write_text("<user_token>:demo,other\n")
+    (tmp_path / "rss-users.toml").write_text(
+        '[users.example]\ntoken = "<user_token>"\nseries = ["demo", "other"]\n'
+    )
 
     plan = service.plan("demo")
 
@@ -81,24 +84,31 @@ def test_remove_deletes_database_and_local_artifacts(tmp_path: Path) -> None:
         tmp_path / "media" / "demo" / "a.mp3",
         tmp_path / "json" / "demo" / "a.json",
         tmp_path / "rss" / "demo.xml",
-        tmp_path / "published" / "<user_token>" / "demo.xml",
+        tmp_path / "published" / ".generations" / "one" / "token-hash" / "demo.xml",
         tmp_path / "auto" / "run_demo_sync.sh",
         tmp_path / "browser-profiles" / "demo" / "Default" / "Cookies",
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("x")
-    users_conf = tmp_path / "rss-publish-users.conf"
-    users_conf.write_text("<user_token>:demo,other\n<another_user_token>:demo\n<all_user_token>:all\n")
+    users_conf = tmp_path / "rss-users.toml"
+    users_conf.write_text(
+        '[users.one]\ntoken = "<user_token>"\nseries = ["demo", "other"]\n\n'
+        '[users.two]\ntoken = "<another_user_token>"\nseries = ["demo"]\n\n'
+        '[users.all]\ntoken = "<all_user_token>"\nseries = ["all"]\n'
+    )
 
     service.remove("demo")
 
     assert not (tmp_path / "media" / "demo").exists()
     assert not (tmp_path / "json" / "demo").exists()
     assert not (tmp_path / "rss" / "demo.xml").exists()
-    assert not (tmp_path / "published" / "<user_token>" / "demo.xml").exists()
+    assert not (tmp_path / "published" / ".generations" / "one" / "token-hash" / "demo.xml").exists()
     assert not (tmp_path / "auto" / "run_demo_sync.sh").exists()
     assert not (tmp_path / "browser-profiles" / "demo").exists()
-    assert users_conf.read_text() == "<user_token>:other\n<all_user_token>:all\n"
+    content = users_conf.read_text()
+    assert 'series = ["other"]' in content
+    assert 'series = ["all"]' in content
+    assert "another_user_token" not in content
     with db.transaction(db_path) as conn:
         for table in (
             "series", "series_source", "sync_policy", "filter_rule",
@@ -118,8 +128,8 @@ def test_remove_rolls_back_files_and_users_when_database_delete_fails(tmp_path: 
     rss = tmp_path / "rss" / "demo.xml"
     rss.parent.mkdir()
     rss.write_text("<rss/>")
-    users_conf = tmp_path / "rss-publish-users.conf"
-    original_users = "<user_token>:demo,other\n"
+    users_conf = tmp_path / "rss-users.toml"
+    original_users = '[users.example]\ntoken = "<user_token>"\nseries = ["demo", "other"]\n'
     users_conf.write_text(original_users)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
