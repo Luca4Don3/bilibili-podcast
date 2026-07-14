@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -20,6 +22,31 @@ from ..schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
 _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _OLD_ENV_PREFIX = ("BILI" + "POD") + "_"
 _CURRENT_ENV_PREFIX = "BILIBILI_PODCAST_"
+_LEGACY_COOKIE_NAME = _OLD_ENV_PREFIX.lower().rstrip("_") + "_session"
+LEGACY_UNVERSIONED_PROFILE = "legacy-unversioned"
+LEGACY_V0_PROFILE = "legacy-v0"
+LEGACY_PROFILES = (LEGACY_UNVERSIONED_PROFILE, LEGACY_V0_PROFILE)
+
+_LAYOUT_FIELDS = {
+    "app_dir": "BILIBILI_PODCAST_APP_DIR",
+    "venv_bin": "BILIBILI_PODCAST_VENV_BIN",
+    "sync_path": "BILIBILI_PODCAST_SYNC_PATH",
+    "database_path": "BILIBILI_PODCAST_CONFIG_DB",
+    "media_root": "BILIBILI_PODCAST_MEDIA_ROOT",
+    "json_root": "BILIBILI_PODCAST_JSON_ROOT",
+    "rss_root": "BILIBILI_PODCAST_RSS_ROOT",
+    "published_rss_root": "BILIBILI_PODCAST_PUBLISHED_RSS_ROOT",
+    "state_root": "BILIBILI_PODCAST_STATE_ROOT",
+    "log_dir": "BILIBILI_PODCAST_LOG_DIR",
+    "secrets_dir": "BILIBILI_PODCAST_SECRETS_DIR",
+    "cookie_file": "BILIBILI_PODCAST_COOKIE_FILE",
+    "lock_file": "BILIBILI_PODCAST_LOCK_FILE",
+    "browser_user_data_root": "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT",
+    "playwright_browsers_path": "PLAYWRIGHT_BROWSERS_PATH",
+    "systemd_dir": "BILIBILI_PODCAST_SYSTEMD_DIR",
+    "cron_script_dir": "BILIBILI_PODCAST_CRON_SCRIPT_DIR",
+    "wrapper_dir": "BILIBILI_PODCAST_WRAPPER_DIR",
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +92,49 @@ def read_legacy_env(path: str | Path | None) -> dict[str, str]:
         if "$" in value or "`" in value:
             raise ConfigError(f"dynamic legacy env value is not supported {source}:{line_number}")
         result[key] = value
+    return result
+
+
+def read_legacy_layout(path: str | Path) -> dict[str, str]:
+    """Read the explicit, non-secret path map for the oldest production layout."""
+    source = Path(path)
+    try:
+        metadata = source.lstat()
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect legacy layout manifest: {type(exc).__name__}") from None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise UnsafeConfigError(f"unsafe legacy layout manifest {source}: symlink")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise UnsafeConfigError(f"unsafe legacy layout manifest {source}: not a regular file")
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                raise UnsafeConfigError("unsafe legacy layout manifest changed while opening")
+            if opened.st_mode & 0o077:
+                raise UnsafeConfigError("unsafe legacy layout manifest permissions")
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"cannot read legacy layout manifest: {type(exc).__name__}") from None
+    if set(raw) != {"layout"} or not isinstance(raw["layout"], dict):
+        raise ConfigError("legacy layout manifest must contain only [layout]")
+    layout = raw["layout"]
+    unknown = sorted(set(layout) - set(_LAYOUT_FIELDS))
+    if unknown:
+        raise ConfigError(f"unknown legacy layout field: {unknown[0]}")
+    missing = sorted(set(_LAYOUT_FIELDS) - set(layout))
+    if missing:
+        raise ConfigError(f"missing legacy layout field: {missing[0]}")
+    result: dict[str, str] = {}
+    for field, environment_name in _LAYOUT_FIELDS.items():
+        value = layout[field]
+        if not isinstance(value, str) or not value or not Path(value).is_absolute():
+            raise ConfigError(f"invalid legacy layout path: {field}")
+        if any(ord(character) < 32 for character in value):
+            raise ConfigError(f"invalid legacy layout path: {field}")
+        result[environment_name] = value
     return result
 
 
@@ -202,10 +272,22 @@ def migrate_legacy(
     legacy_rss_users: str | Path | None,
     output_root: str | Path,
     apply: bool = False,
+    profile: str = LEGACY_UNVERSIONED_PROFILE,
+    layout_manifest: str | Path | None = None,
 ) -> MigrationResult:
+    if profile not in LEGACY_PROFILES:
+        raise ConfigError(f"unknown legacy migration profile: {profile}")
+    if profile == LEGACY_V0_PROFILE and layout_manifest is None:
+        raise ConfigError("legacy-v0 migration requires a layout manifest")
+    if profile != LEGACY_V0_PROFILE and layout_manifest is not None:
+        raise ConfigError("layout manifest is only valid with legacy-v0")
     env = read_legacy_env(legacy_env)
     web_env = read_legacy_env(legacy_web_env)
     merged = {**env, **web_env}
+    if layout_manifest is not None:
+        # The explicit manifest is authoritative for paths. Historical shell
+        # files were incomplete and frequently retained pre-release paths.
+        merged.update(read_legacy_layout(layout_manifest))
     app_dir = _require(merged, "BILIBILI_PODCAST_APP_DIR")
     state_root = _require(merged, "BILIBILI_PODCAST_STATE_ROOT")
     removed_rsync = sorted(set(merged) & REMOVED_LEGACY_ENV)
@@ -233,11 +315,11 @@ def migrate_legacy(
         ]),
         "web.toml": _toml([
             ("server", {"enabled": bool(merged.get("BILIBILI_PODCAST_WEB_PASSWORD")), "host": "127.0.0.1", "port": 8000}),
-            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": [], "session_max_age_seconds": 86400}),
+            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": [_LEGACY_COOKIE_NAME] if profile == LEGACY_V0_PROFILE else [], "session_max_age_seconds": 86400}),
         ]),
         "scheduler.toml": _toml([
             ("runtime", {"user": "bilibili-podcast", "group": "bilibili-podcast"}),
-            ("paths", {"systemd_dir": _require(merged, "BILIBILI_PODCAST_SYSTEMD_DIR"), "cron_script_dir": _require(merged, "BILIBILI_PODCAST_CRON_SCRIPT_DIR"), "wrapper_dir": merged.get("BILIBILI_PODCAST_CRON_SCRIPT_DIR", f"{app_dir}/auto")}),
+            ("paths", {"systemd_dir": _require(merged, "BILIBILI_PODCAST_SYSTEMD_DIR"), "cron_script_dir": _require(merged, "BILIBILI_PODCAST_CRON_SCRIPT_DIR"), "wrapper_dir": merged.get("BILIBILI_PODCAST_WRAPPER_DIR", merged.get("BILIBILI_PODCAST_CRON_SCRIPT_DIR", f"{app_dir}/auto"))}),
             ("units", {"web": Path(merged.get("BILIBILI_PODCAST_WEB_UNIT", "bilibili-podcast-web.service")).name, "sync_glob": Path(merged.get("BILIBILI_PODCAST_SYNC_UNIT_GLOB", "bilibili-podcast-sync@*.service")).name}),
             ("timeouts", {"command_seconds": 30}),
         ]),
@@ -379,6 +461,9 @@ from .versioning import (  # noqa: E402  (legacy adapter is defined before the p
 __all__ = (
     "EARLIEST_UNIFIED_VERSION",
     "LATEST_VERSION",
+    "LEGACY_PROFILES",
+    "LEGACY_UNVERSIONED_PROFILE",
+    "LEGACY_V0_PROFILE",
     "PRE_VERSIONED_CURRENT",
     "VERSION_FILE",
     "MigratedSeries",
@@ -389,5 +474,6 @@ __all__ = (
     "migrate_legacy",
     "plan_upgrade",
     "read_legacy_env",
+    "read_legacy_layout",
     "upgrade_installation",
 )

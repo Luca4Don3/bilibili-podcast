@@ -943,6 +943,36 @@ def test_crontab_excludes_systemd_backend_without_disabling_schedule(tmp_path: P
         ).fetchone()[0] == 1
 
 
+def test_crontab_database_reader_uses_shared_connection_policy(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import runpy
+
+    from bilibili_podcast import sqlite_connection
+
+    db_path = _migrate(tmp_path)
+    observed = {}
+    original_connect = sqlite_connection.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        observed["journal_mode"] = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        observed["foreign_keys"] = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        observed["busy_timeout"] = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        return connection
+
+    monkeypatch.setattr(sqlite_connection, "connect", recording_connect)
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
+    module = runpy.run_path(str(script))
+    module["_load_configs_from_db"](db_path)
+
+    assert observed == {
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout": 5000,
+    }
+
+
 def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
     """A manual comment mentioning the marker must not be treated as an auto block."""
     import runpy

@@ -126,12 +126,13 @@ def _load_configs_from_db(db_path: str) -> list[dict]:
     """Load configs from SQLite and convert to dict format with cron schedules."""
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
     from bilibili_podcast import db as _db
+    from bilibili_podcast.sqlite_connection import connect as _sqlite_connect
     import sqlite3 as _sqlite3
 
     configs = []
     cfgs = _db.load_series_configs(db_path)
 
-    conn = _sqlite3.connect(db_path)
+    conn = _sqlite_connect(db_path)
     conn.row_factory = _sqlite3.Row
     try:
         has_backend_table = conn.execute(

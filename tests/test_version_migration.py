@@ -12,6 +12,7 @@ import pytest
 from bilibili_podcast.config.manager import ConfigError, UnsafeConfigError
 from bilibili_podcast.config import cli as config_cli
 from bilibili_podcast.config.migration import (
+    EARLIEST_UNIFIED_VERSION,
     LATEST_VERSION,
     VERSION_FILE,
     detect_version,
@@ -29,6 +30,14 @@ OLD_PRODUCT = "bili" + "pod"
 def _fixture_version(name: str) -> int:
     with (FIXTURES / f"{name}.toml").open("rb") as handle:
         return int(tomllib.load(handle)["fixture"]["version"])
+
+
+def _published_fixtures() -> tuple[tuple[str, int], ...]:
+    fixtures = []
+    for path in sorted(FIXTURES.glob("v*.toml")):
+        version = _fixture_version(path.stem)
+        fixtures.append((path.stem, version))
+    return tuple(sorted(fixtures, key=lambda item: item[1]))
 
 
 def _installation(tmp_path: Path, fixture: str, *, database: bool = True) -> Path:
@@ -72,7 +81,20 @@ def _digest_tree(root: Path) -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize(("fixture", "source"), (("v1", 1), ("v2", 2), ("v3", 3)))
+def test_fixture_and_step_registry_covers_every_published_version():
+    fixtures = _published_fixtures()
+    versions = tuple(version for _, version in fixtures)
+
+    assert versions == tuple(range(EARLIEST_UNIFIED_VERSION, LATEST_VERSION + 1))
+    assert set(versioning._STEPS) == set(
+        range(EARLIEST_UNIFIED_VERSION + 1, LATEST_VERSION + 1)
+    )
+    for name, version in fixtures:
+        assert name == f"v{version}"
+        assert (FIXTURES / "snapshots" / name).is_dir()
+
+
+@pytest.mark.parametrize(("fixture", "source"), _published_fixtures())
 def test_detects_every_historical_fixture(tmp_path, fixture, source):
     assert detect_version(_installation(tmp_path, fixture)) == source
 
@@ -172,7 +194,7 @@ def test_historical_v3_step_does_not_follow_future_latest_constant(tmp_path, mon
 
 
 def test_latest_is_idempotent(tmp_path):
-    root = _installation(tmp_path, "v3")
+    root = _installation(tmp_path, f"v{LATEST_VERSION}")
     before = _digest_tree(tmp_path)
     result = upgrade_installation(root, apply=True)
     assert result.plan.steps == ()
