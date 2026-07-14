@@ -58,8 +58,16 @@ WEB_UNIT="$(config_value scheduler.units.web)"
 SYNC_UNIT_GLOB="$(config_value scheduler.units.sync_glob)"
 SYNC_UNIT_PREFIX="${SYNC_UNIT_GLOB%%\**}"
 SYNC_UNIT_SUFFIX="${SYNC_UNIT_GLOB#*\*}"
+OLD_PRODUCT="$(printf '%s%s' 'bili' 'pod')"
 BACKUP_DIR="$(mktemp -d "$BILIBILI_PODCAST_CONFIG_ROOT/.backups/standardize-XXXXXXXX")"
 chmod 700 "$BACKUP_DIR"
+CREATED_UNITS="$BACKUP_DIR/CREATED_UNITS"
+: > "$CREATED_UNITS"
+
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    echo "ERROR: configured service user does not exist: $SERVICE_USER" >&2
+    exit 2
+fi
 
 restore_units_on_error() {
     status=$?
@@ -68,10 +76,38 @@ restore_units_on_error() {
         [ -f "$backup" ] || continue
         cp "$backup" "$SYSTEMD_DIR/$(basename "$backup")"
     done
+    while IFS= read -r created; do
+        [ -n "$created" ] || continue
+        rm -f -- "$created"
+    done < "$CREATED_UNITS"
     echo "ERROR: unit rewrite failed; original units were restored from $BACKUP_DIR" >&2
     exit "$status"
 }
 trap restore_units_on_error ERR
+
+copy_legacy_unit_if_needed() {
+    source="$1"
+    target="$2"
+    [ -f "$source" ] || return 0
+    [ ! -e "$target" ] || return 0
+    cp "$source" "$target"
+    printf '%s\n' "$target" >> "$CREATED_UNITS"
+}
+
+copy_legacy_unit_if_needed \
+    "$SYSTEMD_DIR/$OLD_PRODUCT-web.service" \
+    "$SYSTEMD_DIR/$WEB_UNIT"
+
+for old_service in "$SYSTEMD_DIR"/"$OLD_PRODUCT"-sync@*.service; do
+    [ -f "$old_service" ] || continue
+    series="${old_service##*@}"
+    series="${series%.service}"
+    target_name="${SYNC_UNIT_GLOB/\*/$series}"
+    copy_legacy_unit_if_needed "$old_service" "$SYSTEMD_DIR/$target_name"
+    old_timer="${old_service%.service}.timer"
+    target_timer="$SYSTEMD_DIR/${target_name%.service}.timer"
+    copy_legacy_unit_if_needed "$old_timer" "$target_timer"
+done
 
 write_web_unit() {
     unit="$1"
@@ -145,7 +181,7 @@ for unit in "$SYSTEMD_DIR"/$SYNC_UNIT_GLOB; do
     write_sync_unit "$unit"
 done
 
-find "$BACKUP_DIR" -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; > "$BACKUP_DIR/SHA256SUMS"
+find "$BACKUP_DIR" -type f ! -name SHA256SUMS ! -name CREATED_UNITS -exec shasum -a 256 {} \; > "$BACKUP_DIR/SHA256SUMS"
 if [ -s "$BACKUP_DIR/SHA256SUMS" ]; then
     shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"
 fi

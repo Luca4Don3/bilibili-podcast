@@ -1,0 +1,20 @@
+[database]
+path = "__ROOT__/runtime/state/__OLD_PRODUCT__.db"
+
+[paths]
+media_root = "__ROOT__/runtime/media"
+json_root = "__ROOT__/runtime/json"
+rss_root = "__ROOT__/runtime/rss"
+published_rss_root = "__ROOT__/runtime/published-rss"
+state_root = "__ROOT__/runtime/state"
+log_dir = "__ROOT__/runtime/logs"
+secrets_dir = "__ROOT__/runtime/secrets"
+
+[install]
+app_dir = "__ROOT__/app"
+venv_bin = "__ROOT__/venv/bin"
+
+[executables]
+sync = "__ROOT__/venv/bin/__OLD_PRODUCT__"
+ffmpeg = "ffmpeg"
+__OLD_PRODUCT___config = "__OLD_PRODUCT__-config"

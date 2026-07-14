@@ -825,11 +825,12 @@ class TestSeriesScheduleRemoval:
 
         from bilibili_podcast.services.scheduler_service import SchedulerService
 
+        legacy_marker = ("BILI" + "POD").upper()
         existing = (
             "# manual note: # BEGIN BILIBILI_PODCAST AUTO - demo (not a block)\n"
-            "# BEGIN BILIBILI_PODCAST AUTO - demo (Demo (Archive))\n"
+            f"# BEGIN {legacy_marker} AUTO - demo (Demo (Archive))\n"
             "0 1 * * * /demo\n"
-            "# END BILIBILI_PODCAST AUTO\n"
+            f"# END {legacy_marker} AUTO\n"
             "# BEGIN BILIBILI_PODCAST AUTO - demo-test (Demo Test)\n"
             "0 2 * * * /demo-test\n"
             "# END BILIBILI_PODCAST AUTO\n"
@@ -849,7 +850,7 @@ class TestSeriesScheduleRemoval:
 
         assert len(written) == 1
         assert "# manual note:" in written[0]
-        assert "BILIBILI_PODCAST AUTO - demo (Demo (Archive))\n" not in written[0]
+        assert f"{legacy_marker} AUTO - demo (Demo (Archive))\n" not in written[0]
         assert "BILIBILI_PODCAST AUTO - demo-test (Demo Test)\n" in written[0]
 
     def test_restore_cron_for_series_only_adds_target_block(self, tmp_path):

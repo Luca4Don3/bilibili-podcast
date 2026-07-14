@@ -7,6 +7,8 @@ import os
 import re
 import stat
 import threading
+import fcntl
+from contextlib import contextmanager
 from urllib.parse import urlparse
 from dataclasses import fields, is_dataclass
 from pathlib import Path
@@ -38,6 +40,22 @@ class UnsafeConfigError(ConfigError):
 
 class LegacyConfigError(ConfigError):
     pass
+
+
+MIGRATION_LOCK_NAME = ".migration.lock"
+
+
+@contextmanager
+def _shared_migration_lock(root: Path):
+    path = root / MIGRATION_LOCK_NAME
+    if path.is_symlink():
+        raise UnsafeConfigError(f"unsafe migration lock {path}: symlink")
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _nested_get(data: Mapping[str, Any], path: str) -> Any:
@@ -134,24 +152,30 @@ class ConfigManager:
             if not templates:
                 self._reject_legacy_environment()
             root = self.root
-            raw: dict[str, dict[str, Any]] = {}
-            sources: dict[str, Path] = {}
-            for scope, specs in FILE_SCHEMAS.items():
-                suffix = ".toml.example" if templates else ".toml"
-                path = root / f"{scope}{suffix}"
-                self._check_file_safety(path, specs, templates=templates)
-                try:
-                    values = self._repository.read(path)
-                except ValueError as exc:
-                    raise ConfigError(str(exc)) from None
-                raw[scope] = self._validate_scope(path, values, specs, templates=templates)
-                for spec in specs:
-                    sources[f"{scope}.{spec.path}"] = path
-            snapshot = self._build_snapshot(root, raw, sources)
-            self._validate_dependencies(snapshot, templates=templates)
-            if not templates:
-                self._snapshot = snapshot
-            return snapshot
+            if templates:
+                return self._load_files(root, templates=True)
+            with _shared_migration_lock(root):
+                return self._load_files(root, templates=False)
+
+    def _load_files(self, root: Path, *, templates: bool) -> ConfigSnapshot:
+        raw: dict[str, dict[str, Any]] = {}
+        sources: dict[str, Path] = {}
+        for scope, specs in FILE_SCHEMAS.items():
+            suffix = ".toml.example" if templates else ".toml"
+            path = root / f"{scope}{suffix}"
+            self._check_file_safety(path, specs, templates=templates)
+            try:
+                values = self._repository.read(path)
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from None
+            raw[scope] = self._validate_scope(path, values, specs, templates=templates)
+            for spec in specs:
+                sources[f"{scope}.{spec.path}"] = path
+        snapshot = self._build_snapshot(root, raw, sources)
+        self._validate_dependencies(snapshot, templates=templates)
+        if not templates:
+            self._snapshot = snapshot
+        return snapshot
 
     def reload(self) -> ConfigSnapshot:
         with self._lock:
@@ -342,6 +366,7 @@ class ConfigManager:
         a, s, w = raw["app"], raw["sync"], raw["web"]
         sch, pub, mm, ru = raw["scheduler"], raw["publish"], raw["manual-media"], raw["rss-users"]
         users: dict[str, RssUser] = {}
+        rss_tokens: set[str] = set()
         for name, value in ru["users"].items():
             if not isinstance(name, str) or not name or not isinstance(value, Mapping):
                 raise ConfigError("invalid RSS user entry rss-users.toml:users")
@@ -353,6 +378,9 @@ class ConfigManager:
                 raise ConfigError(f"invalid RSS user entry rss-users.toml:users.{name}")
             if not token or any(ord(char) < 32 for char in token):
                 raise ConfigError(f"invalid RSS user token rss-users.toml:users.{name}")
+            if token in rss_tokens:
+                raise ConfigError(f"duplicate RSS user token rss-users.toml:users.{name}")
+            rss_tokens.add(token)
             if any(item != "all" and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", item) for item in series):
                 raise ConfigError(f"invalid RSS user series rss-users.toml:users.{name}")
             users[name] = RssUser(token=token, series=tuple(series))

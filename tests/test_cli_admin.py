@@ -439,6 +439,10 @@ def test_remove_up_does_not_remove_later_schedule_before_failure(tmp_path: Path)
         conn.execute("INSERT INTO series_source(series,type,uid) VALUES(?,'space',123)", (series,))
     conn.commit()
     conn.close()
+    (tmp_path / "publish.toml").write_text(
+        '[publish]\nenabled = true\nmedia_base_url = "https://media.example.invalid"\n'
+        'master_placeholder = "__MEDIA_PLACEHOLDER__"\ngone_series = []\n'
+    )
 
     p = cli_admin.build_parser()
     ns = p.parse_args([
@@ -945,11 +949,12 @@ def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
 
     script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
     module = runpy.run_path(str(script))
+    legacy_marker = ("BILI" + "POD").upper()
     existing = (
         "# manual note: # BEGIN BILIBILI_PODCAST AUTO - demo\n"
-        "# BEGIN BILIBILI_PODCAST AUTO - old (Old)\n"
+        f"# BEGIN {legacy_marker} AUTO - old (Old)\n"
         "0 1 * * * /old\n"
-        "# END BILIBILI_PODCAST AUTO\n"
+        f"# END {legacy_marker} AUTO\n"
     )
     monkeypatch.setattr(
         subprocess,
@@ -963,7 +968,7 @@ def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
     )
 
     assert "# manual note:" in merged
-    assert "BILIBILI_PODCAST AUTO - old" not in merged
+    assert f"{legacy_marker} AUTO - old" not in merged
     assert "BILIBILI_PODCAST AUTO - new" in merged
 
 

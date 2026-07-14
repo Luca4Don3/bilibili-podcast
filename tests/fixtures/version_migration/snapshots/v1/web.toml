@@ -1,0 +1,10 @@
+[server]
+enabled = false
+host = "127.0.0.1"
+port = 8000
+
+[security]
+password = "fixture-password-__OLD_PRODUCT__-preserved"
+https = false
+cookie_name = "__OLD_PRODUCT___session"
+session_max_age_seconds = 86400

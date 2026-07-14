@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import logging
 import os
 import shutil
 import time
@@ -13,6 +14,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .config.models import ConfigSnapshot
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PublishError(RuntimeError):
@@ -69,8 +73,16 @@ def publish(snapshot: ConfigSnapshot) -> str:
         return ""
     output_root = snapshot.app.paths.published_rss_root
     generations = output_root / ".generations"
-    masters = sorted(snapshot.app.paths.rss_root.glob("*.xml"))
+    gone_series = set(settings.gone_series)
+    masters = sorted(
+        path for path in snapshot.app.paths.rss_root.glob("*.xml")
+        if path.stem not in gone_series
+    )
+    if not masters:
+        raise PublishError("no active master RSS files were found")
     users = tuple(snapshot.rss_users.users.values())
+    if not users:
+        raise PublishError("no RSS users are configured")
     tokens = tuple(user.token for user in users)
     generation = f"{time.time_ns()}-{uuid.uuid4().hex[:12]}"
 
@@ -85,6 +97,11 @@ def publish(snapshot: ConfigSnapshot) -> str:
                 for path in masters
             }
             for user in users:
+                missing = set(user.series) - {"all"} - set(master_payloads) - gone_series
+                if missing:
+                    raise PublishError(
+                        f"RSS authorization references missing series: {sorted(missing)[0]}"
+                    )
                 allowed = set(master_payloads) if "all" in user.series else set(user.series)
                 user_root = staging / token_digest(user.token)
                 user_root.mkdir(mode=0o750)
@@ -95,6 +112,9 @@ def publish(snapshot: ConfigSnapshot) -> str:
                             settings.master_placeholder.encode(), user.token.encode()
                         )
                     )
+                    # Nginx reads published RSS through the dedicated service
+                    # group; other local users must not be able to read tokens.
+                    target.chmod(0o640)
                     ET.parse(target)
                     _fsync_file(target)
                 _fsync_dir(user_root)
@@ -107,15 +127,20 @@ def publish(snapshot: ConfigSnapshot) -> str:
             link.unlink(missing_ok=True)
             link.symlink_to(Path(".generations") / generation, target_is_directory=True)
             os.replace(link, current)
-            _fsync_dir(output_root)
-
-            retained = sorted(
-                (item for item in generations.iterdir() if item.is_dir() and not item.name.startswith(".staging-")),
-                key=lambda item: item.name,
-                reverse=True,
-            )
-            for obsolete in retained[2:]:
-                shutil.rmtree(obsolete)
+            try:
+                _fsync_dir(output_root)
+                retained = sorted(
+                    (item for item in generations.iterdir() if item.is_dir() and not item.name.startswith(".staging-")),
+                    key=lambda item: item.name,
+                    reverse=True,
+                )
+                for obsolete in retained[2:]:
+                    shutil.rmtree(obsolete)
+            except OSError as exc:
+                # ``current`` already points at a complete fsynced generation.
+                # Retention cleanup is retryable and must not make callers roll
+                # back source media after a successful activation.
+                LOGGER.warning("RSS generation activated but cleanup failed: %s", type(exc).__name__)
             return generation
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)

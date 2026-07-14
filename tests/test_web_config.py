@@ -70,7 +70,9 @@ def test_rss_authorization_matrix_and_gone_series_are_local_only(monkeypatch, tm
         for series in all_series:
             response = asyncio.run(server.authorize_rss(user.token, series))
             assert response.status_code == (204 if series in matrix[name] else 403)
-    assert asyncio.run(server.authorize_rss("test-token-user-a", "removed-series")).status_code == 410
+    gone = asyncio.run(server.authorize_rss("test-token-user-a", "removed-series"))
+    assert gone.status_code == 403
+    assert gone.headers["X-RSS-Denial-Status"] == "410"
     assert asyncio.run(server.authorize_rss("invalid-token", "series-06")).status_code == 403
 
 

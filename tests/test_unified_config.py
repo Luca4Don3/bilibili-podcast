@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -64,6 +65,17 @@ def test_rejects_control_characters_without_echoing_value(tmp_path: Path) -> Non
     with pytest.raises(ConfigError, match=r"control character.*web\.toml:server\.host") as exc:
         ConfigManager(root, environ={}).load()
     assert "bad" not in str(exc.value)
+
+
+def test_rejects_duplicate_rss_tokens(tmp_path: Path) -> None:
+    root = _actual_config(tmp_path)
+    users = root / "rss-users.toml"
+    users.write_text(
+        '[users.one]\ntoken = "duplicate-fixture"\nseries = ["one"]\n\n'
+        '[users.two]\ntoken = "duplicate-fixture"\nseries = ["two"]\n'
+    )
+    with pytest.raises(ConfigError, match="duplicate RSS user token"):
+        ConfigManager(root, environ={}).load()
 
 
 def test_rejects_non_finite_numbers_and_unsafe_unit_names(tmp_path: Path) -> None:
@@ -269,6 +281,90 @@ cron:
         ("0 12 * * *", "primary"),
         ("0 6 * * *", "retry"),
     ]
+
+
+def test_legacy_migration_keeps_existing_database_inode_and_backup(tmp_path: Path) -> None:
+    env = _legacy_env(tmp_path)
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    series_dir = tmp_path / "series"
+    series_dir.mkdir()
+    (series_dir / "demo.yaml").write_text(
+        "series: demo\ntitle: Demo\nauthor: Author\nsource:\n  uid: 123\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+    database_path = tmp_path / "runtime" / "bilibili-podcast" / "state" / "bilibili-podcast.db"
+    db.migrate(database_path)
+    inode = database_path.stat().st_ino
+    old_connection = sqlite3.connect(database_path)
+    try:
+        migrate_legacy(
+            legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
+            legacy_rss_users=empty, output_root=output, apply=True,
+        )
+
+        assert database_path.stat().st_ino == inode
+        old_connection.execute(
+            "INSERT INTO series(series,title,author) VALUES('old-client','Old','Client')"
+        )
+        old_connection.commit()
+        with sqlite3.connect(database_path) as current:
+            assert current.execute(
+                "SELECT title FROM series WHERE series='old-client'"
+            ).fetchone() == ("Old",)
+        backup_roots = list((output / ".backups").glob("migrate-*"))
+        assert len(backup_roots) == 1
+        manifest = backup_roots[0] / "SHA256SUMS"
+        for line in manifest.read_text(encoding="ascii").splitlines():
+            expected, name = line.split("  ", 1)
+            assert hashlib.sha256((backup_roots[0] / name).read_bytes()).hexdigest() == expected
+    finally:
+        old_connection.close()
+
+
+def test_legacy_migration_restores_config_and_database_when_upgrade_fails(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from bilibili_podcast.config.migration import versioning
+
+    env = _legacy_env(tmp_path)
+    empty = tmp_path / "empty"
+    empty.write_text("")
+    series_dir = tmp_path / "series"
+    series_dir.mkdir()
+    (series_dir / "demo.yaml").write_text(
+        "series: demo\ntitle: Replacement\nauthor: Author\nsource:\n  uid: 123\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "output"
+    output.mkdir()
+    original_web = "[legacy]\nvalue = true\n"
+    (output / "web.toml").write_text(original_web, encoding="utf-8")
+    database_path = tmp_path / "runtime" / "bilibili-podcast" / "state" / "bilibili-podcast.db"
+    db.migrate(database_path)
+    with db.transaction(database_path) as connection:
+        connection.execute(
+            "INSERT INTO series(series,title,author) VALUES('preserved','Preserved','Author')"
+        )
+    inode = database_path.stat().st_ino
+
+    def fail_upgrade(*args, **kwargs):
+        raise RuntimeError("injected version upgrade failure")
+
+    monkeypatch.setattr(versioning, "upgrade_installation", fail_upgrade)
+    with pytest.raises(RuntimeError, match="injected version upgrade failure"):
+        migrate_legacy(
+            legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
+            legacy_rss_users=empty, output_root=output, apply=True,
+        )
+
+    assert (output / "web.toml").read_text(encoding="utf-8") == original_web
+    assert database_path.stat().st_ino == inode
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT series, title FROM series ORDER BY series"
+        ).fetchall() == [("preserved", "Preserved")]
 
 
 def test_migration_invalid_number_is_a_config_error(tmp_path: Path) -> None:

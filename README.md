@@ -94,7 +94,7 @@ bilibili-podcast-config migrate \
 - 未标记的早期安装统一识别为 `legacy-unversioned`，通过显式适配器进入版本链。
 - 配置、SQLite schema、文件布局、systemd unit、Cookie 和 RSS 发布格式均属于版本状态。
 - 默认 dry-run；`--apply` 前执行在线备份、checksum、staged 验证和回滚准备。
-- 当前版本重复执行必须幂等；未知未来版本、损坏状态或缺失步骤必须显式失败。
+- 当前版本重复执行必须幂等；未知未来版本、损坏状态、缺失步骤或活动同步锁必须显式失败。
 - 每次发布改变持久状态时，必须同时登记迁移步骤，并加入从最老 fixture、所有中间版本和跨多个版本直升的测试。
 
 当前 legacy env/YAML/RSS-user 输入是 `legacy-unversioned` 适配器。后续版本不得通过改写这个适配器来伪装历史兼容，而应追加不可变的版本迁移步骤。
@@ -106,7 +106,9 @@ bilibili-podcast-config --root <server_path>/config upgrade
 bilibili-podcast-config --root <server_path>/config upgrade --apply
 ```
 
-输出只包含来源版本、目标版本、步骤名和备份目录，不打印配置值、token 或 Cookie。`--apply` 成功后会写入版本 marker，并使 SQLite `schema_version` 与安装版本一致。后续任何改变持久状态的新功能，都必须在同一个 feature 中同步追加版本步骤和历史 fixture，不能把升级支持留到后续补做。
+输出只包含来源版本、目标版本、步骤名和备份目录，不打印配置值、token 或 Cookie。`--apply` 成功后会写入版本 marker，并使 SQLite `schema_version` 与安装版本一致。`deploy.sh` 使用候选源码中的迁移模块预检，并在候选代码安装后重新计算计划，不能用旧 venv 中的 CLI 判断新版本是否需要升级。后续任何改变持久状态的新功能，都必须在同一个 feature 中同步追加版本步骤和历史 fixture，不能把升级支持留到后续补做。
+
+SQLite schema 在活动数据库上以向后兼容事务原位升级，升级前使用 SQLite online backup 生成校验过的回滚副本；升级 apply 会独占统一配置中的 sync lock，检测到活动同步进程就显式停止。禁止替换活动数据库 inode。systemd unit、timer 和 crontab 属于需要单独授权的系统状态：`standardize-runtime-config.sh --apply` 会保留旧 unit、生成新 unit，并在写入新 crontab 时清除旧自动 block，但不会 reload、restart、enable 或删除旧文件。
 
 ---
 
@@ -760,13 +762,15 @@ systemd 调度的安全约束：
 /path/to/master-rss/{series}.xml          (master, 占位符)
          │
          ▼  publish script
-/path/to/published-rss/{token1}/{series}.xml
-/path/to/published-rss/{token2}/{series}.xml
+/path/to/published-rss/.generations/{generation}/{token_sha256}/{series}.xml
+/path/to/published-rss/current -> .generations/{generation}
          │
          │
          ▼  本机 RSS 服务
 https://podcast.example.invalid/rss/<user_token>/{series}.xml
 ```
+
+Nginx 通过应用 `auth_request` 将 URL 中的 token 映射为 hash 目录。published RSS 权限为 `0640`，Nginx worker 必须通过专用 `bilibili-podcast` 共享组获得只读权限，不能放宽为其他用户可读。鉴权 upstream 的主备实例都必须运行带 `/auth` 接口的新版本；旧 Web 不能作为鉴权 backup。旧站点回退由外层负载均衡完成。删除系列由内部 `403 + X-RSS-Denial-Status: 410` 映射为公网 `410 Gone`，因为 Nginx `auth_request` 不能直接传播任意状态码。
 
 ### 用户配置文件
 

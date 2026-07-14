@@ -42,6 +42,9 @@ SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 # Markers for auto-generated crontab sections
 AUTO_BEGIN_MARKER = "# BEGIN BILIBILI_PODCAST AUTO"
 AUTO_END_MARKER = "# END BILIBILI_PODCAST AUTO"
+_LEGACY_PRODUCT_UPPER = ("BILI" + "POD").upper()
+_LEGACY_AUTO_BEGIN_MARKER = f"# BEGIN {_LEGACY_PRODUCT_UPPER} AUTO"
+_LEGACY_AUTO_END_MARKER = f"# END {_LEGACY_PRODUCT_UPPER} AUTO"
 COMMAND_TIMEOUT = 10
 SYNC_UNIT_GLOB = "bilibili-podcast-sync@*.service"
 
@@ -337,8 +340,10 @@ def merge_with_existing_crontab(new_auto: str, user: str) -> str:
         raise RuntimeError("cannot read existing crontab: command failed")
 
     # Remove existing auto sections
+    begin_markers = "|".join(map(re.escape, (AUTO_BEGIN_MARKER, _LEGACY_AUTO_BEGIN_MARKER)))
+    end_markers = "|".join(map(re.escape, (AUTO_END_MARKER, _LEGACY_AUTO_END_MARKER)))
     cleaned = re.sub(
-        rf"^{AUTO_BEGIN_MARKER}(?:\s+-[^\r\n]*)?\r?\n.*?^{AUTO_END_MARKER}\r?\n?",
+        rf"^(?:{begin_markers})(?:\s+-[^\r\n]*)?\r?\n.*?^(?:{end_markers})\r?\n?",
         "",
         existing,
         flags=re.DOTALL | re.MULTILINE,

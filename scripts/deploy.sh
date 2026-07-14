@@ -77,6 +77,21 @@ if [ ! -x "$PYTHON_BIN" ]; then
     exit 2
 fi
 
+candidate_config() {
+    PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" -m bilibili_podcast.config.cli \
+        --root "$CONFIG_ROOT" "$@"
+}
+
+UPGRADE_JSON="$(candidate_config upgrade --format json)"
+UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["steps"]))' "$UPGRADE_JSON")"
+if [ "$UPGRADE_STEPS" -gt 0 ]; then
+    echo "Required installation upgrade: $UPGRADE_JSON"
+    if [ "$APPLY" != true ]; then
+        echo "Dry-run complete; rerun with --apply before deployment can continue."
+        exit 0
+    fi
+fi
+
 echo "Plan:"
 echo "  1. back up TOML, SQLite, systemd units, and wrappers to $BACKUP_DIR"
 echo "  2. git pull --ff-only in $CODE_DIR"
@@ -124,6 +139,11 @@ shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"
 git -C "$CODE_DIR" pull --ff-only
 "$VENV_BIN/pip" install -c "$CODE_DIR/requirements.lock" -e "$CODE_DIR"
 
+UPGRADE_JSON="$(candidate_config upgrade --format json)"
+UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["steps"]))' "$UPGRADE_JSON")"
+if [ "$UPGRADE_STEPS" -gt 0 ]; then
+    candidate_config upgrade --apply
+fi
 bilibili-podcast-config validate
 PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" -m compileall -q "$CODE_DIR/src"
 

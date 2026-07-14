@@ -29,22 +29,44 @@ CREATE TABLE IF NOT EXISTS scheduler_backend (
 """
 
 
-def migrate(db_path: str | Path) -> None:
+def migrate(db_path: str | Path, *, initialize_version: bool = True) -> None:
     """Create or migrate the SQLite schema."""
-    conn = connect(db_path)
+    path = Path(db_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(path)
     try:
-        conn.executescript(SCHEMA_SQL)
-        conn.execute("BEGIN")
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in _schema_statements(SCHEMA_SQL):
+            conn.execute(statement)
         _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
         _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "sync_policy", "update_period_grace_seconds", "INTEGER NOT NULL DEFAULT 120")
         _ensure_column(conn, "sync_policy", "media_mode", "TEXT NOT NULL DEFAULT 'auto'")
+        if initialize_version and conn.execute("SELECT 1 FROM schema_version LIMIT 1").fetchone() is None:
+            from .config.migration.versioning import LATEST_VERSION
+
+            conn.execute("INSERT INTO schema_version(version) VALUES(?)", (LATEST_VERSION,))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def _schema_statements(script: str) -> tuple[str, ...]:
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                statements.append(statement)
+            pending = ""
+    if pending.strip():
+        raise sqlite3.OperationalError("incomplete SQLite schema statement")
+    return tuple(statements)
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

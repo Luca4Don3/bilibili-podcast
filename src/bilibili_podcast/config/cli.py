@@ -82,6 +82,15 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     result = upgrade_installation(args.root, apply=args.apply)
     action = "applied" if result.applied else "dry-run"
     plan = result.plan
+    if args.format == "json":
+        print(json.dumps({
+            "action": action,
+            "source_version": plan.source_version,
+            "target_version": plan.target_version,
+            "steps": list(plan.steps),
+            "backup_root": str(result.backup_root) if result.backup_root else None,
+        }, ensure_ascii=False))
+        return 0
     print(
         f"upgrade {action}: version {plan.source_version} -> {plan.target_version}; "
         f"{len(plan.steps)} step(s)"
@@ -139,6 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.set_defaults(handler=cmd_migrate)
     upgrade = subparsers.add_parser("upgrade")
     upgrade.add_argument("--apply", action="store_true")
+    upgrade.add_argument("--format", choices=("text", "json"), default="text")
     upgrade.set_defaults(handler=cmd_upgrade)
     execute = subparsers.add_parser("exec")
     execute.add_argument("--scope", choices=("sync", "web", "scheduler", "publish"), required=True)

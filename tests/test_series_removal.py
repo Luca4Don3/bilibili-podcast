@@ -10,6 +10,10 @@ from bilibili_podcast.services.series_removal_service import SeriesRemovalServic
 def _service(tmp_path: Path) -> tuple[SeriesRemovalService, Path]:
     db_path = tmp_path / "bilibili-podcast.db"
     db.migrate(db_path)
+    (tmp_path / "publish.toml").write_text(
+        '[publish]\nenabled = true\nmedia_base_url = "https://media.example.invalid"\n'
+        'master_placeholder = "__MEDIA_PLACEHOLDER__"\ngone_series = []\n'
+    )
     service = SeriesRemovalService(
         db_path,
         media_root=tmp_path / "media",
@@ -109,6 +113,7 @@ def test_remove_deletes_database_and_local_artifacts(tmp_path: Path) -> None:
     assert 'series = ["other"]' in content
     assert 'series = ["all"]' in content
     assert "another_user_token" not in content
+    assert 'gone_series = ["demo"]' in (tmp_path / "publish.toml").read_text()
     with db.transaction(db_path) as conn:
         for table in (
             "series", "series_source", "sync_policy", "filter_rule",
@@ -131,6 +136,7 @@ def test_remove_rolls_back_files_and_users_when_database_delete_fails(tmp_path: 
     users_conf = tmp_path / "rss-users.toml"
     original_users = '[users.example]\ntoken = "<user_token>"\nseries = ["demo", "other"]\n'
     users_conf.write_text(original_users)
+    original_publish = (tmp_path / "publish.toml").read_text()
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             "CREATE TRIGGER prevent_demo_delete BEFORE DELETE ON series "
@@ -143,6 +149,7 @@ def test_remove_rolls_back_files_and_users_when_database_delete_fails(tmp_path: 
     assert media.read_text() == "audio"
     assert rss.read_text() == "<rss/>"
     assert users_conf.read_text() == original_users
+    assert (tmp_path / "publish.toml").read_text() == original_publish
     with sqlite3.connect(db_path) as conn:
         assert conn.execute(
             "SELECT 1 FROM series WHERE series='demo'"

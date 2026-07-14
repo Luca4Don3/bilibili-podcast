@@ -1,0 +1,4 @@
+[manual_media]
+enabled = false
+allowed_dirs = []
+follow_symlinks = false
