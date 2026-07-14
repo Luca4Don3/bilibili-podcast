@@ -1,4 +1,4 @@
-"""bilipod-admin CLI — manage series, filters, sync, and cron from the terminal."""
+"""bilibili-podcast-admin CLI — manage series, filters, sync, and cron from the terminal."""
 
 from __future__ import annotations
 
@@ -488,8 +488,8 @@ def cmd_add(args: argparse.Namespace) -> None:
             )
 
     print(f"\n✅ 系列 {data['series']} 已保存！")
-    print(f"   执行 dry-run: bilipod-admin preview {data['series']}")
-    print(f"   启动同步: bilipod-admin sync {data['series']} --apply")
+    print(f"   执行 dry-run: bilibili-podcast-admin preview {data['series']}")
+    print(f"   启动同步: bilibili-podcast-admin sync {data['series']} --apply")
     print()
 
 
@@ -738,8 +738,8 @@ def _cmd_add_noninteractive(args: argparse.Namespace, db_path: str) -> None:
                 )
 
     print(f"\n✅ 系列 '{series}' 已保存！")
-    print(f"   执行 dry-run: bilipod-admin preview {series}")
-    print(f"   启动同步: bilipod-admin sync {series} --apply")
+    print(f"   执行 dry-run: bilibili-podcast-admin preview {series}")
+    print(f"   启动同步: bilibili-podcast-admin sync {series} --apply")
     print()
 
 
@@ -846,8 +846,8 @@ def cmd_edit(args: argparse.Namespace) -> None:
                 )
 
     print(f"\n✅ 系列 {args.series} 已更新")
-    print(f"   执行 dry-run: bilipod-admin preview {args.series}")
-    print(f"   如需更改过滤规则: bilipod-admin filters {args.series}")
+    print(f"   执行 dry-run: bilibili-podcast-admin preview {args.series}")
+    print(f"   如需更改过滤规则: bilibili-podcast-admin filters {args.series}")
     print()
 
 
@@ -926,7 +926,7 @@ def cmd_filters_add(args: argparse.Namespace) -> None:
         msgs.append("付费内容排除已开启")
     print(f"✅ 已更新 {args.series}：{'，'.join(msgs)}")
     if not fa_yes:
-        print(f"   查看: bilipod-admin filters {args.series}")
+        print(f"   查看: bilibili-podcast-admin filters {args.series}")
         print()
 
 
@@ -1060,9 +1060,9 @@ def cmd_preview(args: argparse.Namespace) -> None:
     print(f"🔍 执行干跑: {args.series} ...\n")
     try:
         child_env = dict(os.environ)
-        child_env.pop("BILIPOD_CONFIG_DB", None)
+        child_env.pop("BILIBILI_PODCAST_CONFIG_DB", None)
         if _CONFIG is not None:
-            child_env["BILIPOD_CONFIG_ROOT"] = str(_CONFIG.root)
+            child_env["BILIBILI_PODCAST_CONFIG_ROOT"] = str(_CONFIG.root)
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=_CONFIG.sync.timeouts.preview_seconds if _CONFIG else 120,
                                 env=child_env)
@@ -1132,9 +1132,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
     print(f"{'🔄 同步' if args.apply else '🔍 干跑'}: {args.series} ...\n")
     try:
         child_env = dict(os.environ)
-        child_env.pop("BILIPOD_CONFIG_DB", None)
+        child_env.pop("BILIBILI_PODCAST_CONFIG_DB", None)
         if _CONFIG is not None:
-            child_env["BILIPOD_CONFIG_ROOT"] = str(_CONFIG.root)
+            child_env["BILIBILI_PODCAST_CONFIG_ROOT"] = str(_CONFIG.root)
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             timeout=config.sync.timeouts.sync_seconds,
@@ -1151,25 +1151,13 @@ def cmd_sync(args: argparse.Namespace) -> None:
         print(f"❌ 执行错误: {e}")
         sys.exit(EXIT_SYNC_FAIL)
 
-    # After successful apply: publish RSS
-    publish = (
-        str(_CONFIG.publish.publish.script)
-        if _CONFIG and _CONFIG.publish.publish.enabled and _CONFIG.publish.publish.script
-        else None
-    )
-    if args.apply and publish:
+    # After successful apply: publish RSS atomically.
+    if args.apply and _CONFIG and _CONFIG.publish.publish.enabled:
         try:
-            pub_result = subprocess.run(
-                [publish], capture_output=True, text=True,
-                timeout=_CONFIG.sync.timeouts.publish_seconds if _CONFIG else 60,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            from .publisher import publish
+            publish(_CONFIG)
+        except (OSError, RuntimeError) as exc:
             print(f"RSS 发布失败: {_sanitize(str(exc))}")
-            sys.exit(EXIT_SYNC_FAIL)
-        pub_out = (pub_result.stdout or "") + "\n" + (pub_result.stderr or "")
-        print(_sanitize(pub_out))
-        if pub_result.returncode != 0:
-            print(f"\n⚠️ RSS 发布失败（返回码 {pub_result.returncode}）")
             sys.exit(EXIT_SYNC_FAIL)
 
 
@@ -1260,17 +1248,17 @@ def cmd_sync_policy_set(args: argparse.Namespace) -> None:
 
     print(f"✅ 已更新 {args.series} 的 {len(updates)} 个同步策略字段")
     if not sp_set_yes:
-        print(f"   查看: bilipod-admin sync-policy show {args.series}")
+        print(f"   查看: bilibili-podcast-admin sync-policy show {args.series}")
     print()
 
 
 # ── Cron / Scheduler handlers ─────────────────────────────────────────────
 
 def _run_crontab(args: argparse.Namespace, db_path: str, action: str) -> None:
-    """Run bilipod-crontab via SchedulerService."""
+    """Run bilibili-podcast-crontab via SchedulerService."""
     crontab_bin = _find_crontab_bin()
     if not crontab_bin:
-        print("❌ 找不到 bilipod-crontab 脚本")
+        print("❌ 找不到 bilibili-podcast-crontab 脚本")
         sys.exit(EXIT_SYNC_FAIL)
     svc = _scheduler_service(db_path, crontab_script=crontab_bin)
     if action == "apply":
@@ -1354,7 +1342,7 @@ def cmd_cron_set(args: argparse.Namespace) -> None:
 
     count = _scheduler_service(db_path).replace_schedules(args.series, args.schedule)
     print(f"✅ 已更新 {args.series} 的 {count} 条 cron 配置")
-    print(f"   注意: 修改仅保存到数据库，执行 'bilipod-admin cron apply' 才安装到系统 crontab")
+    print(f"   注意: 修改仅保存到数据库，执行 'bilibili-podcast-admin cron apply' 才安装到系统 crontab")
     print()
 
 
@@ -1364,7 +1352,7 @@ def cmd_scheduler_plan(args: argparse.Namespace) -> None:
     db_path = _get_db(args)
     crontab_bin = _find_crontab_bin()
     if not crontab_bin:
-        print("❌ 找不到 bilipod-crontab 脚本")
+        print("❌ 找不到 bilibili-podcast-crontab 脚本")
         sys.exit(EXIT_SYNC_FAIL)
     try:
         svc = _scheduler_service(db_path, crontab_script=crontab_bin,
@@ -1392,7 +1380,7 @@ def cmd_scheduler_apply(args: argparse.Namespace) -> None:
     db_path = _get_db(args)
     crontab_bin = _find_crontab_bin()
     if not crontab_bin:
-        print("❌ 找不到 bilipod-crontab 脚本")
+        print("❌ 找不到 bilibili-podcast-crontab 脚本")
         sys.exit(EXIT_SYNC_FAIL)
     yes = args.yes or getattr(args, "scheduler_yes", False)
     if not yes:
@@ -1783,15 +1771,15 @@ def _require_series(db_path: str, series: str) -> None:
 
 
 def _find_crontab_bin() -> str | None:
-    """Find bilipod-crontab script."""
+    """Find bilibili-podcast-crontab script."""
     # Look relative to project root
     here = Path(__file__).resolve().parent.parent.parent  # src/bilibili_podcast -> project root
-    candidate = here / "scripts" / "bilipod-crontab"
+    candidate = here / "scripts" / "bilibili-podcast-crontab"
     if candidate.exists():
         return str(candidate)
     # Fall back to PATH
     for p in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(p) / "bilipod-crontab"
+        candidate = Path(p) / "bilibili-podcast-crontab"
         if candidate.exists():
             return str(candidate)
     return None
@@ -2267,16 +2255,15 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
         sys.exit(EXIT_VALIDATION if isinstance(exc, ValueError) else EXIT_SYNC_FAIL)
 
     try:
-        if args.publish_script:
-            subprocess.run(
-                [args.publish_script], check=True,
-                timeout=_require_config().sync.timeouts.publish_seconds,
-            )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        config = _require_config()
+        if config.publish.publish.enabled:
+            from .publisher import publish
+            publish(config)
+    except (OSError, RuntimeError) as exc:
         _restore_file(media_dst, media_backup)
         _restore_file(json_dst, json_backup)
         _restore_file(rss_dst, rss_backup)
-        print(f"❌ 发布脚本执行失败: {_sanitize(str(exc))}")
+        print(f"❌ RSS 发布失败: {_sanitize(str(exc))}")
         sys.exit(EXIT_SYNC_FAIL)
 
     for backup in (media_backup, json_backup, rss_backup):
@@ -2418,8 +2405,8 @@ def cmd_paid_rebuild_rss(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="bilipod-admin",
-        description="Bilipod 系列管理 CLI",
+        prog="bilibili-podcast-admin",
+        description="Bilibili Podcast 系列管理 CLI",
     )
     parser.add_argument("--config-db", help="SQLite 数据库路径（默认读取 app.database.path）")
     parser.add_argument("--yes", action="store_true", help="跳过低风险确认")
@@ -2707,7 +2694,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_add_item.add_argument("--cookie-file", help="Netscape cookie 文件路径")
     p_add_item.add_argument("--ffmpeg-bin", help="ffmpeg 可执行文件路径")
     p_add_item.add_argument("--replace", action="store_true", help="覆盖已有 media")
-    p_add_item.add_argument("--publish-script", help="重建 RSS 后执行的发布脚本")
     p_add_item.set_defaults(handler=cmd_paid_add_item)
 
     p_rebuild = paid_sub.add_parser("rebuild-rss", help="从已有 metadata + media 重建 RSS")
@@ -2735,11 +2721,6 @@ def apply_admin_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapsh
         "cookie_file": str(snapshot.sync.paths.cookie_file),
         "media_base_url": snapshot.publish.publish.media_base_url,
         "ffmpeg_bin": snapshot.app.executables.ffmpeg,
-        "publish_script": (
-            str(snapshot.publish.publish.script)
-            if snapshot.publish.publish.enabled and snapshot.publish.publish.script
-            else None
-        ),
     }
     for name, value in defaults.items():
         if hasattr(args, name) and getattr(args, name) is None:

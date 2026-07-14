@@ -8,10 +8,11 @@
 
 - [快速开始](#快速开始)
 - [统一配置](#统一配置)
+- [独立版本迁移模块](#独立版本迁移模块)
 - [CLI 参数](#cli-参数)
   - [bilibili-podcast](#bilibili-podcast)
-  - [bilipod-crontab](#bilipod-crontab)
-  - [bilipod-admin — 系列管理 CLI](#bilipod-admin--系列管理-cli)
+  - [bilibili-podcast-crontab](#bilibili-podcast-crontab)
+  - [bilibili-podcast-admin — 系列管理 CLI](#bilibili-podcast-admin--系列管理-cli)
 - [配置来源](#配置来源)
 - [系列配置文件](#系列配置文件)
 - [过滤管线](#过滤管线)
@@ -43,8 +44,8 @@ pip install -e .
 ### 单次运行
 
 ```bash
-export BILIPOD_CONFIG_ROOT=<server_path>/config
-bilipod-config validate
+export BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config
+bilibili-podcast-config validate
 bilibili-podcast --series demo-series --token "__MEDIA_PLACEHOLDER__" --apply
 ```
 
@@ -60,20 +61,20 @@ bilibili-podcast --series demo-series --token "__MEDIA_PLACEHOLDER__" --apply
 | `sync.toml` | 下载限制、Cookie、浏览器、日志和超时 |
 | `web.toml` | Web 登录、HTTPS、Cookie、session 和监听配置 |
 | `scheduler.toml` | cron/systemd 用户、目录、wrapper、unit 和超时 |
-| `publish.toml` | master/published RSS、media URL 和本机发布脚本 |
+| `publish.toml` | master/published RSS、media URL、已删除系列和内建 generation publisher |
 | `manual-media.toml` | 手动媒体白名单和 symlink 策略 |
 | `rss-users.toml` | 用户 token 与系列授权关系 |
 | SQLite | 系列、来源、过滤、同步策略、调度和 `sync_state` |
 
-配置根定位顺序是显式 `ConfigManager(root)`、`BILIPOD_CONFIG_ROOT`、可确认的仓库根 `config/`；找不到时明确失败。除 `BILIPOD_CONFIG_ROOT` 外，旧持久配置环境变量不再生效，检测到时会给出目标字段和迁移命令。
+配置根定位顺序是显式 `ConfigManager(root)`、`BILIBILI_PODCAST_CONFIG_ROOT`、可确认的仓库根 `config/`；找不到时明确失败。除 `BILIBILI_PODCAST_CONFIG_ROOT` 外，旧持久配置环境变量不再生效，检测到时会给出目标字段和迁移命令。
 
 `sync.toml` 的 `timeouts.sync_seconds`、`preview_seconds`、`publish_seconds` 分别控制手动同步、预览和本机发布钩子；`scheduler.toml` 的 `timeouts.command_seconds` 控制 cron/systemd 管理命令。手动同步使用 `downloads.max_per_run`，生成的调度任务使用 `downloads.scheduled_max_per_run`。自定义 systemd 主任务名称时，`units.sync_glob` 必须是恰好含一个 `*` 的 `.service` 文件名模式。
 
 ```bash
-bilipod-config validate
-bilipod-config validate --templates
-bilipod-config show --scope web --format json  # 永远脱敏
-bilipod-config migrate \
+bilibili-podcast-config validate
+bilibili-podcast-config validate --templates
+bilibili-podcast-config show --scope web --format json  # 永远脱敏
+bilibili-podcast-config migrate \
   --legacy-env <server_path>/legacy.env \
   --legacy-web-env <server_path>/legacy-web.env \
   --legacy-series-dir <server_path>/series.d \
@@ -82,6 +83,30 @@ bilipod-config migrate \
 ```
 
 `migrate` 只有加 `--apply` 才写入；写入前会 staged 校验，并把被替换的配置和 SQLite 备份到 `config/.backups/`。真实生产值必须由旧配置迁移和人工核对产生，不要把模板占位符当作实际配置。
+
+## 独立版本迁移模块
+
+`bilibili_podcast.config.migration` 是唯一允许修改历史安装格式的独立模块。同步器、Web、Admin、publisher 和部署脚本只能调用该模块，不能各自维护升级分支。
+
+迁移模块的接口契约是“任意已发布版本 → 当前最新版本”，而不是只支持相邻版本：
+
+- 自动检测来源版本，并按已登记步骤连续升级到当前版本。
+- 未标记的早期安装统一识别为 `legacy-unversioned`，通过显式适配器进入版本链。
+- 配置、SQLite schema、文件布局、systemd unit、Cookie 和 RSS 发布格式均属于版本状态。
+- 默认 dry-run；`--apply` 前执行在线备份、checksum、staged 验证和回滚准备。
+- 当前版本重复执行必须幂等；未知未来版本、损坏状态或缺失步骤必须显式失败。
+- 每次发布改变持久状态时，必须同时登记迁移步骤，并加入从最老 fixture、所有中间版本和跨多个版本直升的测试。
+
+当前 legacy env/YAML/RSS-user 输入是 `legacy-unversioned` 适配器。后续版本不得通过改写这个适配器来伪装历史兼容，而应追加不可变的版本迁移步骤。
+
+已统一配置的历史安装使用独立升级入口；默认只规划和验证，不写入：
+
+```bash
+bilibili-podcast-config --root <server_path>/config upgrade
+bilibili-podcast-config --root <server_path>/config upgrade --apply
+```
+
+输出只包含来源版本、目标版本、步骤名和备份目录，不打印配置值、token 或 Cookie。`--apply` 成功后会写入版本 marker，并使 SQLite `schema_version` 与安装版本一致。后续任何改变持久状态的新功能，都必须在同一个 feature 中同步追加版本步骤和历史 fixture，不能把升级支持留到后续补做。
 
 ---
 
@@ -95,7 +120,7 @@ bilipod-config migrate \
 | `--config-dir` | (none) | 显式启用 legacy YAML 回滚读取；不会自动回退 |
 | `--series` | (all enabled) | 逗号分隔的系列 ID，不指定则处理所有 `enabled: true` 的系列 |
 | `--cookie-file` | (none) | Netscape 格式 cookie 文件，用于 B 站 API 鉴权 |
-| `--token` | (none) | RSS enclosure URL 中的 token 占位符，分发时替换为真实用户 token |
+| `--token` | `__MEDIA_PLACEHOLDER__` | 仅接受固定占位符；真实 token 会被拒绝，用户 RSS 由内建 publisher 生成 |
 | `--media-root` | `app.toml` | MP3 媒体文件存储根目录 |
 | `--json-root` | `app.toml` | 剧集元数据 JSON 存储根目录 |
 | `--rss-root` | `app.toml` | RSS XML 输出目录 |
@@ -113,9 +138,8 @@ bilipod-config migrate \
 | `--debug` | off | `--log-level DEBUG` 的兼容快捷方式，优先级高于 `--log-level` |
 | `--force` | off | 跳过更新周期和 rate-limit cooldown 门控 |
 | `--apply` | off | 实际写入文件和下载媒体，不带则为干跑 |
-| `--publish-script` | (none) | 发布脚本路径，仅在 `--apply` 且全部系列同步成功后执行 |
 
-### bilipod-crontab
+### bilibili-podcast-crontab
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -124,10 +148,10 @@ bilipod-config migrate \
 | `--apply` | off | 写入 crontab 和生成 wrapper 脚本 |
 | `--print` | on | 打印生成的 cron 条目（无 `--apply` 时默认） |
 | `--script-dir` | `auto` | wrapper 脚本输出目录 |
-| `--cron-user` | `bilipod` | crontab 用户名 |
+| `--cron-user` | `bilibili-podcast` | crontab 用户名 |
 | `--force` | off | 覆盖已存在的 wrapper 脚本 |
 
-### bilipod-admin — 系列管理 CLI
+### bilibili-podcast-admin — 系列管理 CLI
 
 用于 SSH 下快速管理系列、过滤规则、同步策略和定时任务。复用 SQLite 配置层，与网页管理后台共享数据。
 
@@ -142,25 +166,25 @@ bilipod-config migrate \
 | `--quiet` | 预留的安静输出开关，错误仍清楚显示 |
 | `--debug` | 预留的诊断输出开关；`preview` 会固定用 `--log-level DEBUG` 调用同步命令 |
 
-全局参数放在子命令前，例如 `bilipod-admin --config-db /path/to/bilipod.db list`。部分高频确认参数也支持放在子命令后，见下方命令说明。
+全局参数放在子命令前，例如 `bilibili-podcast-admin --config-db /path/to/bilibili-podcast.db list`。部分高频确认参数也支持放在子命令后，见下方命令说明。
 
 **系列管理：**
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin list` | 列出所有系列及状态 |
-| `bilipod-admin show <series>` | 显示系列完整配置（支持 `--json`） |
-| `bilipod-admin remove-series <series>` | 预览系列移除计划，不执行删除 |
-| `bilipod-admin remove-series <series> --apply` | 永久移除系列、调度、本地 media/JSON/RSS 和数据库记录 |
-| `bilipod-admin remove-up --uid <uid>` | 预览该 UP UID 对应的全部系列移除计划 |
-| `bilipod-admin remove-up --uid <uid> --apply` | 永久移除该 UP UID 对应的全部系列 |
-| `bilipod-admin add` | 交互式新增系列（输入 B 站 URL/UID，按提示配置过滤、同步、cron） |
-| `bilipod-admin edit <series>` | 交互式编辑系列（回车保留当前值） |
+| `bilibili-podcast-admin list` | 列出所有系列及状态 |
+| `bilibili-podcast-admin show <series>` | 显示系列完整配置（支持 `--json`） |
+| `bilibili-podcast-admin remove-series <series>` | 预览系列移除计划，不执行删除 |
+| `bilibili-podcast-admin remove-series <series> --apply` | 永久移除系列、调度、本地 media/JSON/RSS 和数据库记录 |
+| `bilibili-podcast-admin remove-up --uid <uid>` | 预览该 UP UID 对应的全部系列移除计划 |
+| `bilibili-podcast-admin remove-up --uid <uid> --apply` | 永久移除该 UP UID 对应的全部系列 |
+| `bilibili-podcast-admin add` | 交互式新增系列（输入 B 站 URL/UID，按提示配置过滤、同步、cron） |
+| `bilibili-podcast-admin edit <series>` | 交互式编辑系列（回车保留当前值） |
 
 **非交互式新增系列：（参数足够时跳过交互）**
 
 ```bash
-bilipod-admin add \
+bilibili-podcast-admin add \
   --url "https://space.bilibili.com/123456" \
   --series demo-series \
   --title "Demo Series" \
@@ -189,18 +213,18 @@ bilipod-admin add \
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin filters <series>` | 列出过滤规则（别名: `filters-show`, `fs`） |
-| `bilipod-admin filters-add <series> --exclude-keyword "访谈"` | 追加黑名单关键词（别名: `fa`） |
-| `bilipod-admin filters-add <series> --include-keyword "商业史"` | 追加白名单关键词 |
-| `bilipod-admin filters-add <series> --ad-keyword "恰饭"` | 追加广告关键词 |
-| `bilipod-admin filters-add <series> --exclude-bvid BVxxxx` | 追加排除 BVID |
-| `bilipod-admin filters-add <series> --ad-bvid BVxxxx` | 追加广告 BVID |
-| `bilipod-admin filters-add <series> --exclude-season-id 123456` | 追加排除合集 ID |
-| `bilipod-admin filters-add <series> --exclude-paid` | 启用付费内容排除 |
-| `bilipod-admin filters-remove <series> --exclude-keyword "访谈" [--delete]` | 禁用/删除匹配规则（默认禁用，加 `--delete` 物理删除；别名: `fdel`） |
-| `bilipod-admin filters-disable <series> --rule-id 123` | 按 ID 禁用规则（别名: `fd`） |
-| `bilipod-admin filters-enable <series> --rule-id 123` | 按 ID 启用规则（别名: `fe`） |
-| `bilipod-admin filters-import <series> --type exclude_keyword --file keywords.txt` | 从文件批量导入。`--type` 可选: `exclude_keyword`, `include_keyword`, `ad_keyword`, `exclude_bvid`, `ad_bvid`, `exclude_season_id`（别名: `fi`） |
+| `bilibili-podcast-admin filters <series>` | 列出过滤规则（别名: `filters-show`, `fs`） |
+| `bilibili-podcast-admin filters-add <series> --exclude-keyword "访谈"` | 追加黑名单关键词（别名: `fa`） |
+| `bilibili-podcast-admin filters-add <series> --include-keyword "商业史"` | 追加白名单关键词 |
+| `bilibili-podcast-admin filters-add <series> --ad-keyword "恰饭"` | 追加广告关键词 |
+| `bilibili-podcast-admin filters-add <series> --exclude-bvid BVxxxx` | 追加排除 BVID |
+| `bilibili-podcast-admin filters-add <series> --ad-bvid BVxxxx` | 追加广告 BVID |
+| `bilibili-podcast-admin filters-add <series> --exclude-season-id 123456` | 追加排除合集 ID |
+| `bilibili-podcast-admin filters-add <series> --exclude-paid` | 启用付费内容排除 |
+| `bilibili-podcast-admin filters-remove <series> --exclude-keyword "访谈" [--delete]` | 禁用/删除匹配规则（默认禁用，加 `--delete` 物理删除；别名: `fdel`） |
+| `bilibili-podcast-admin filters-disable <series> --rule-id 123` | 按 ID 禁用规则（别名: `fd`） |
+| `bilibili-podcast-admin filters-enable <series> --rule-id 123` | 按 ID 启用规则（别名: `fe`） |
+| `bilibili-podcast-admin filters-import <series> --type exclude_keyword --file keywords.txt` | 从文件批量导入。`--type` 可选: `exclude_keyword`, `include_keyword`, `ad_keyword`, `exclude_bvid`, `ad_bvid`, `exclude_season_id`（别名: `fi`） |
 
 `filters-add` 额外支持子命令级 `--yes`；`filters-remove` 支持 `--delete` 物理删除，否则默认只禁用匹配规则。
 
@@ -208,8 +232,8 @@ bilipod-admin add \
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin sync-policy show <series>` | 显示当前同步策略（支持 `--json`） |
-| `bilipod-admin sync-policy set <series> --keep-last 100 --update-period 12h --quality 64K` | 修改指定字段，未传字段保持不变 |
+| `bilibili-podcast-admin sync-policy show <series>` | 显示当前同步策略（支持 `--json`） |
+| `bilibili-podcast-admin sync-policy set <series> --keep-last 100 --update-period 12h --quality 64K` | 修改指定字段，未传字段保持不变 |
 
 支持修改的字段：`--page-size`、`--incremental-page-size`、`--max-pages`、`--max-requests-per-series`、`--request-interval`、`--request-jitter`、`--rate-limit-cooldown`、`--update-period`、`--format`、`--quality`、`--fetch-strategy`、`--keep-last`、`--browser-fallback`、`--browser-wait-min`、`--browser-wait-max`、`--browser-fallback-cooldown`、`--require-paid-confirmation`、`--min-duration`、`--max-duration`。
 
@@ -217,31 +241,31 @@ bilipod-admin add \
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin cron show <series>` | 显示系列 DB 中的 cron 配置（支持 `--json`） |
-| `bilipod-admin cron set <series> --schedule "15 11 * * *" --schedule "15 23 * * *"` | 修改 cron（仅写 DB，不安装系统 crontab） |
-| `bilipod-admin cron plan` | 预览 cron 计划（使用临时目录，不写系统 crontab） |
-| `bilipod-admin cron plan --cron-script-dir /path/to/auto` | 预览 cron 计划（指定目标目录后输出真实路径） |
-| `bilipod-admin cron apply --cron-script-dir /path/to/auto` | 安装 crontab，wrapper 写入指定目录（生产部署推荐显式指定绝对路径） |
-| `bilipod-admin cron apply --cron-script-dir /path/to/auto --yes` | 跳过确认，直接安装 |
+| `bilibili-podcast-admin cron show <series>` | 显示系列 DB 中的 cron 配置（支持 `--json`） |
+| `bilibili-podcast-admin cron set <series> --schedule "15 11 * * *" --schedule "15 23 * * *"` | 修改 cron（仅写 DB，不安装系统 crontab） |
+| `bilibili-podcast-admin cron plan` | 预览 cron 计划（使用临时目录，不写系统 crontab） |
+| `bilibili-podcast-admin cron plan --cron-script-dir /path/to/auto` | 预览 cron 计划（指定目标目录后输出真实路径） |
+| `bilibili-podcast-admin cron apply --cron-script-dir /path/to/auto` | 安装 crontab，wrapper 写入指定目录（生产部署推荐显式指定绝对路径） |
+| `bilibili-podcast-admin cron apply --cron-script-dir /path/to/auto --yes` | 跳过确认，直接安装 |
 
-> **注意**：`cron` 命令保留用于兼容和回滚场景。生产环境推荐使用 `scheduler --backend systemd` 管理定时器。DB 模式下，`cron plan/apply` 会跳过当前由 systemd timer 管理的系列，避免双调度。`cron apply` 的 `--cron-script-dir` 和 `--yes` 放在子命令后：`cron apply --cron-script-dir /path --yes`。全局 `--yes`（`bilipod-admin --yes cron apply`）也兼容。`cron plan` 默认使用临时目录，仅用于结构预览；传 `--cron-script-dir` 后输出真实路径，可与 `cron apply` 核对。
+> **注意**：`cron` 命令保留用于兼容和回滚场景。生产环境推荐使用 `scheduler --backend systemd` 管理定时器。DB 模式下，`cron plan/apply` 会跳过当前由 systemd timer 管理的系列，避免双调度。`cron apply` 的 `--cron-script-dir` 和 `--yes` 放在子命令后：`cron apply --cron-script-dir /path --yes`。全局 `--yes`（`bilibili-podcast-admin --yes cron apply`）也兼容。`cron plan` 默认使用临时目录，仅用于结构预览；传 `--cron-script-dir` 后输出真实路径，可与 `cron apply` 核对。
 
 **调度管理：**
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin scheduler plan` | 预览调度计划（默认 backend=cron） |
-| `bilipod-admin scheduler plan --backend cron --cron-script-dir /path/to/auto` | 指定 backend + 目录预览 |
-| `bilipod-admin scheduler apply --cron-script-dir /path/to/auto --yes` | 安装调度 |
-| `bilipod-admin scheduler plan --backend systemd --series <series> --cron-script-dir /path/to/auto` | 预览指定 series 的 systemd timer/unit |
-| `bilipod-admin scheduler apply --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 指定 series 安装或刷新 systemd timer |
-| `bilipod-admin scheduler status` | 显示所有系列调度状态 |
-| `bilipod-admin scheduler status <series>` | 显示指定系列调度状态 |
-| `bilipod-admin scheduler status --backend systemd` | 显示 systemd timer 状态（enabled/active） |
-| `bilipod-admin scheduler set <series> --schedule "15 3 * * *" --yes` | 设置系列调度（仅写 DB，不安装） |
-| `bilipod-admin scheduler set <series> --schedule "15 11 * * *" --retry-schedule "15 13 * * *" --yes` | 设置主调度和失败后的条件兜底调度 |
-| `bilipod-admin scheduler disable --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 禁用指定 series 的 systemd timer，并按需要恢复 cron 调度 |
-| `bilipod-admin scheduler disable --backend systemd --series <series> --delete-units --yes` | 禁用并删除对应 systemd unit 文件 |
+| `bilibili-podcast-admin scheduler plan` | 预览调度计划（默认 backend=cron） |
+| `bilibili-podcast-admin scheduler plan --backend cron --cron-script-dir /path/to/auto` | 指定 backend + 目录预览 |
+| `bilibili-podcast-admin scheduler apply --cron-script-dir /path/to/auto --yes` | 安装调度 |
+| `bilibili-podcast-admin scheduler plan --backend systemd --series <series> --cron-script-dir /path/to/auto` | 预览指定 series 的 systemd timer/unit |
+| `bilibili-podcast-admin scheduler apply --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 指定 series 安装或刷新 systemd timer |
+| `bilibili-podcast-admin scheduler status` | 显示所有系列调度状态 |
+| `bilibili-podcast-admin scheduler status <series>` | 显示指定系列调度状态 |
+| `bilibili-podcast-admin scheduler status --backend systemd` | 显示 systemd timer 状态（enabled/active） |
+| `bilibili-podcast-admin scheduler set <series> --schedule "15 3 * * *" --yes` | 设置系列调度（仅写 DB，不安装） |
+| `bilibili-podcast-admin scheduler set <series> --schedule "15 11 * * *" --retry-schedule "15 13 * * *" --yes` | 设置主调度和失败后的条件兜底调度 |
+| `bilibili-podcast-admin scheduler disable --backend systemd --series <series> --cron-script-dir /path/to/auto --yes` | 禁用指定 series 的 systemd timer，并按需要恢复 cron 调度 |
+| `bilibili-podcast-admin scheduler disable --backend systemd --series <series> --delete-units --yes` | 禁用并删除对应 systemd unit 文件 |
 
 > **安全约束**：systemd backend 只应管理 `.timer`，不要手动触发生成的 `.service` 作为测试手段；不要把启用和立即运行合并成一步；timer 应保持 `Persistent=false`，避免补跑错过任务并触发额外 API 请求。需要验证时使用 `scheduler plan/status`、timer 状态、只读日志和 RSS token 扫描。
 
@@ -251,21 +275,21 @@ bilipod-admin add \
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin paid refresh-metadata <series> --json-root /path/to/json` | 刷新 metadata JSON，不下载媒体 |
-| `bilipod-admin paid refresh-metadata <series> --cookie-file /path/to/cookies.txt` | 使用指定 cookie 刷新 metadata |
-| `bilipod-admin paid refresh-metadata <series> --bvid BVxxxxxxxxxx` | 仅刷新指定 BVID 的 metadata |
-| `bilipod-admin paid refresh-metadata <series> --url <bilibili-video-url>` | 仅刷新指定视频 URL 的 metadata |
-| `bilipod-admin paid list-missing <series> --json-root /path/to/json --media-root /path/to/media` | 列出已有 metadata 但缺少媒体的条目，只读 |
-| `bilipod-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --media-root /path/to/media` | 关联人工上传的 MP3 文件 |
-| `bilipod-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --replace` | 覆盖已有媒体文件 |
-| `bilipod-admin paid add-item <series> --url <bilibili-video-url> --media-path /path/to/uploaded-media` | 从用户提供的媒体文件和 B 站视频页面新增一条手动媒体 |
-| `bilipod-admin paid add-item <series> --ffmpeg-bin /path/to/ffmpeg --publish-script /path/to/publish.sh` | 指定转码命令和 RSS 重建后的发布脚本 |
-| `bilipod-admin paid rebuild-rss <series> --json-root /path/to/json --media-root /path/to/media --rss-root /path/to/rss` | 从现有 metadata + media 重建 master RSS |
+| `bilibili-podcast-admin paid refresh-metadata <series> --json-root /path/to/json` | 刷新 metadata JSON，不下载媒体 |
+| `bilibili-podcast-admin paid refresh-metadata <series> --cookie-file /path/to/cookies.txt` | 使用指定 cookie 刷新 metadata |
+| `bilibili-podcast-admin paid refresh-metadata <series> --bvid BVxxxxxxxxxx` | 仅刷新指定 BVID 的 metadata |
+| `bilibili-podcast-admin paid refresh-metadata <series> --url <bilibili-video-url>` | 仅刷新指定视频 URL 的 metadata |
+| `bilibili-podcast-admin paid list-missing <series> --json-root /path/to/json --media-root /path/to/media` | 列出已有 metadata 但缺少媒体的条目，只读 |
+| `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --media-root /path/to/media` | 关联人工上传的 MP3 文件 |
+| `bilibili-podcast-admin paid attach-media <series> --bvid BVxxxxxxxxxx --server-path /path/to/file.mp3 --replace` | 覆盖已有媒体文件 |
+| `bilibili-podcast-admin paid add-item <series> --url <bilibili-video-url> --media-path /path/to/uploaded-media` | 从用户提供的媒体文件和 B 站视频页面新增一条手动媒体 |
+| `bilibili-podcast-admin paid add-item <series> --ffmpeg-bin /path/to/ffmpeg` | 指定转码命令；RSS 重建成功后由内建 publisher 原子发布 |
+| `bilibili-podcast-admin paid rebuild-rss <series> --json-root /path/to/json --media-root /path/to/media --rss-root /path/to/rss` | 从现有 metadata + media 重建 master RSS |
 
 `attach-media` 只接受 MP3 文件，并校验 BVID。上传源文件必须位于部署环境配置的白名单目录内。`add-item` 可接受视频或其他 ffmpeg 支持的媒体格式，会调用 `ffmpeg` 转为当前 series 的 MP3 quality，使用视频页面拉取单条 metadata，并重建 master RSS。手动媒体文件名会使用该 series 当前 `sync.quality`，即 `{BVID}_{quality}.mp3`，不要对非 64K series 固定写 `_64K`。`rebuild-rss` 生成 master RSS 时使用 `__MEDIA_PLACEHOLDER__`，由 RSS 发布流程替换为用户专属 token。
 
 ```bash
-bilipod-admin paid add-item <series> \
+bilibili-podcast-admin paid add-item <series> \
   --url "https://www.bilibili.com/video/BVxxxxxxxxxx/" \
   --media-path "/path/to/manual-media/input.mp4" \
   --media-root "/path/to/media" \
@@ -278,9 +302,9 @@ bilipod-admin paid add-item <series> \
 
 | 命令 | 说明 |
 |------|------|
-| `bilipod-admin preview <series>` | 执行干跑预览（使用当前 SQLite 配置，不下载、不写 RSS） |
-| `bilipod-admin sync <series>` | 默认干跑模式 |
-| `bilipod-admin sync <series> --apply` | 真正同步（需二次确认） |
+| `bilibili-podcast-admin preview <series>` | 执行干跑预览（使用当前 SQLite 配置，不下载、不写 RSS） |
+| `bilibili-podcast-admin sync <series>` | 默认干跑模式 |
+| `bilibili-podcast-admin sync <series> --apply` | 真正同步（需二次确认） |
 
 **退出码规范：**
 
@@ -317,14 +341,14 @@ bilipod-admin paid add-item <series> \
 python3 scripts/migrate_yaml_to_sqlite \
   --config-dir configs/series.d \
   --state-root /path/to/state \
-  --db-path /path/to/bilipod.db
+  --db-path /path/to/bilibili-podcast.db
 
 # 2. 显式回滚读取（不会写回 YAML）
 bilibili-podcast --config-dir <server_path>/legacy-series.d ...
 
 # 3. 切换 cron wrapper
-python3 scripts/bilipod-crontab \
-  --config-db /path/to/bilipod.db \
+python3 scripts/bilibili-podcast-crontab \
+  --config-db /path/to/bilibili-podcast.db \
   --script-dir auto --force --apply
 ```
 
@@ -336,7 +360,7 @@ python3 scripts/bilipod-crontab \
 
 | 步骤 | 处理内容 |
 |------|----------|
-| 环境检查 | 检查 Git 仓库/remote、系统用户 `bilipod`、secrets、日志/数据目录 |
+| 环境检查 | 检查 Git 仓库/remote、系统用户 `bilibili-podcast`、secrets、日志/数据目录 |
 | Python 检测 + `_sqlite3` 编译 | 优先 Python 3.14，允许 3.13 回退；低于 3.13 时中止；缺失 `_sqlite3` 时尝试修复 |
 | 拉取最新代码 | `git pull --ff-only` |
 | 依赖安装 | `pip install -c requirements.lock -e .`；GitHub 不可达时自动回退 PyPI 安装 |
@@ -352,17 +376,17 @@ python3 scripts/bilipod-crontab \
 | 依赖 | 说明 |
 |------|------|
 | Git 仓库 | 代码需已 clone 到服务器，remote origin 已配置 |
-| 系统用户 | `bilipod` 服务用户（`useradd -r -s /sbin/nologin bilipod`） |
+| 系统用户 | `bilibili-podcast` 服务用户（`useradd -r -s /sbin/nologin bilibili-podcast`） |
 | Cookie | `www.bilibili.com_cookies.txt`（Netscape 格式，可选，无则降级浏览器模式） |
 | Web 密码 | 写入权限受限的实际 `web.toml`；真实值不写入 Git |
 | 磁盘空间 | media/json/rss/state 所在分区至少 5GB 可用 |
 
 ```bash
 # 干跑预览（不修改任何文件）
-ssh <deploy-host> 'sudo env BILIPOD_CONFIG_ROOT=<server_path>/config bash -s' < scripts/deploy.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config bash -s' < scripts/deploy.sh
 
 # 实际执行
-ssh <deploy-host> 'sudo env BILIPOD_CONFIG_ROOT=<server_path>/config bash -s -- --apply' < scripts/deploy.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config bash -s -- --apply' < scripts/deploy.sh
 ```
 
 首次部署先干跑确认步骤，再用 `--apply`。
@@ -371,19 +395,19 @@ ssh <deploy-host> 'sudo env BILIPOD_CONFIG_ROOT=<server_path>/config bash -s -- 
 
 #### 运行配置标准化
 
-标准化脚本把旧 env、Web env、系列 YAML 和 RSS 用户文件视为只读迁移输入。它先执行 dry-run/校验；`--apply` 时生成实际 TOML、备份旧配置和 unit，并把 unit 改为只含 `BILIPOD_CONFIG_ROOT`。脚本不会显示密文。
+标准化脚本把旧 env、Web env、系列 YAML 和 RSS 用户文件视为只读迁移输入。它先执行 dry-run/校验；`--apply` 时生成实际 TOML、备份旧配置和 unit，并把 unit 改为只含 `BILIBILI_PODCAST_CONFIG_ROOT`。脚本不会显示密文。
 
 可单独运行标准化脚本：
 
 ```bash
 # 干跑
-ssh <deploy-host> 'sudo env BILIPOD_CONFIG_ROOT=<server_path>/config BILIPOD_ENV_FILE=<server_path>/legacy.env BILIPOD_WEB_ENV_FILE=<server_path>/legacy-web.env BILIPOD_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s' < scripts/standardize-runtime-config.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s' < scripts/standardize-runtime-config.sh
 
 # 实际修复
-ssh <deploy-host> 'sudo env BILIPOD_CONFIG_ROOT=<server_path>/config BILIPOD_ENV_FILE=<server_path>/legacy.env BILIPOD_WEB_ENV_FILE=<server_path>/legacy-web.env BILIPOD_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --apply' < scripts/standardize-runtime-config.sh
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --apply' < scripts/standardize-runtime-config.sh
 ```
 
-生产切换前必须先取得服务器上未跟踪的 `scripts/rss-publish.sh` 做只读审计，并确认其改为读取 `rss-users.toml`。该文件未审计前，不得宣称发布链已经全局覆盖，也不得执行生产切换。
+生产切换前必须确认所有同步与手动媒体入口都调用内建 publisher，且服务器上不存在仍被 unit、wrapper 或 cron 引用的外部发布脚本。
 
 ---
 ## 系列配置文件
@@ -595,7 +619,7 @@ B 站 API 返回 `-799` / "请求过于频繁" 时：
 | 模式 | 存储位置 |
 |------|----------|
 | YAML 模式 | `{state_root}/{series}.json`，每系列独立文件 |
-| SQLite 模式 | 同一 `bilipod.db` 的 `sync_state` 表 |
+| SQLite 模式 | 同一 `bilibili-podcast.db` 的 `sync_state` 表 |
 
 状态字段：
 
@@ -659,26 +683,26 @@ cron wrapper 用户可通过环境变量 `LOG_LEVEL`（默认 `INFO`）和 `DEBU
 
 ## Cron 自动调度
 
-`bilipod-crontab` 可以从系列配置生成 cron 任务，主要用于兼容、迁移或回滚场景。新部署推荐使用下一节的 systemd 调度。
+`bilibili-podcast-crontab` 可以从系列配置生成 cron 任务，主要用于兼容、迁移或回滚场景。新部署推荐使用下一节的 systemd 调度。
 
 ```bash
 # YAML 模式
-bilipod-crontab --config-dir configs/series.d --apply
+bilibili-podcast-crontab --config-dir configs/series.d --apply
 
 # SQLite 模式（默认读取 app.database.path）
-bilipod-crontab --force --apply
+bilibili-podcast-crontab --force --apply
 
 # 仅预览
-bilipod-crontab --config-dir configs/series.d --print
+bilibili-podcast-crontab --config-dir configs/series.d --print
 ```
 
-`bilipod-crontab` 为每个启用了 cron 的系列生成独立的 wrapper 脚本：
+`bilibili-podcast-crontab` 为每个启用了 cron 的系列生成独立的 wrapper 脚本：
 
-- wrapper 脚本仅嵌入 `BILIPOD_CONFIG_ROOT`、series 和一次性控制参数
+- wrapper 脚本仅嵌入 `BILIBILI_PODCAST_CONFIG_ROOT`、series 和一次性控制参数
 - `--config-dir` 只用于显式 YAML 回滚
 - 支持 `MAX_DOWNLOADS_PER_RUN` / `FORCE` / `DEBUG` 环境变量覆盖
-- 自动合并到 `--cron-user` 用户的 crontab（默认 `bilipod`）
-- 已有 crontab 中由 `BEGIN BILIPOD AUTO` / `END BILIPOD AUTO` 标记的自动区域会被替换
+- 自动合并到 `--cron-user` 用户的 crontab（默认 `bilibili-podcast`）
+- 已有 crontab 中由 `BEGIN BILIBILI_PODCAST AUTO` / `END BILIBILI_PODCAST AUTO` 标记的自动区域会被替换
 - DB 模式会跳过标记为 systemd 后端或当前已有 enabled systemd timer 的系列
 
 ### 最佳实践
@@ -691,24 +715,24 @@ bilipod-crontab --config-dir configs/series.d --print
 
 ## Systemd 自动调度
 
-生产环境推荐使用 `bilipod-admin scheduler --backend systemd` 为每个 series 生成独立的 `.service` 和 `.timer`。
+生产环境推荐使用 `bilibili-podcast-admin scheduler --backend systemd` 为每个 series 生成独立的 `.service` 和 `.timer`。
 
 ```bash
 # 只读预览
-bilipod-admin scheduler plan \
+bilibili-podcast-admin scheduler plan \
   --backend systemd \
   --series <series> \
   --cron-script-dir /path/to/auto
 
 # 安装或刷新指定 series 的 timer
-bilipod-admin scheduler apply \
+bilibili-podcast-admin scheduler apply \
   --backend systemd \
   --series <series> \
   --cron-script-dir /path/to/auto \
   --yes
 
 # 查看状态
-bilipod-admin scheduler status --backend systemd
+bilibili-podcast-admin scheduler status --backend systemd
 ```
 
 systemd 调度的安全约束：
@@ -719,8 +743,8 @@ systemd 调度的安全约束：
 - cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
 - timer 使用 `Persistent=false`，避免开机或启用时补跑错过任务。
 - service 命令必须带 `--token __MEDIA_PLACEHOLDER__`。
-- 如果使用 RSS 多用户分发，service 的同步成功后按 `publish.toml` 触发发布脚本。
-- 生成的 `.service` 只保留 `Environment=BILIPOD_CONFIG_ROOT=...`，不包含旧 env 文件或敏感值。
+- 如果启用 RSS 多用户分发，service 的同步成功后按 `publish.toml` 触发内建 generation publisher。
+- 生成的 `.service` 只保留 `Environment=BILIBILI_PODCAST_CONFIG_ROOT=...`，不包含旧 env 文件或敏感值。
 - 验证 timer 时只启动/刷新 `.timer`，不要手动启动 `.service`。
 - 不要把启用和立即运行合并成一步；启用和启动 timer 应分开执行，并确认 timer active 后再移除旧调度。
 
@@ -728,7 +752,7 @@ systemd 调度的安全约束：
 
 ## RSS 多用户分发
 
-生成的 master RSS 使用占位符 token（`__MEDIA_PLACEHOLDER__`）。发布脚本会将 master RSS 分发为各用户专属 RSS，并把占位符替换为用户 token。
+生成的 master RSS 永远使用占位符 token（`__MEDIA_PLACEHOLDER__`）。内建 publisher 在文件锁内构建并校验完整 generation，按 token SHA-256 目录写入用户 RSS，`fsync` 后原子切换 `current`，并保留最近两代。
 
 ### 工作流程
 
@@ -769,7 +793,7 @@ series = ["series1", "series2"]
 
 ## 部署架构
 
-项目按单服务器部署：同步进程、Web 管理、SQLite、媒体文件、master RSS、用户 RSS 和对外 HTTP 服务位于同一台服务器。`scripts/rss-publish-and-sync.sh` 仅作为历史命令名保留，当前只执行本机 `rss-publish.sh`，不包含跨服务器同步。
+项目按单服务器部署：同步进程、Web 管理、SQLite、媒体文件、master RSS、用户 RSS 和对外 HTTP 服务位于同一台服务器。发布完全由应用内建实现，不依赖外部 hook 或 rsync。
 
 未来如需向其他服务器分发，应单独设计带身份认证、完整性校验、失败重试和可观测性的发布接口；本项目不保留 rsync 执行链或配置。
 
@@ -784,7 +808,7 @@ series = ["series1", "series2"]
 
 ### 文件所有权
 
-- media / json / rss / state 目录属主：`bilipod:bilipod`
+- media / json / rss / state 目录属主：`bilibili-podcast:bilibili-podcast`
 - 目录权限：`755`
 - 文件权限：`644`
 - Cookie、token 和 Web 密码所在 TOML：`600` 或服务组只读的 `640`
@@ -793,9 +817,9 @@ series = ["series1", "series2"]
 
 ## 环境变量
 
-唯一的持久配置 bootstrap 是 `BILIPOD_CONFIG_ROOT`。`FORCE`、`DEBUG`、`SMOKE_SYNC` 仍是一次性运行/部署控制；`PATH` 只参与系统命令发现。cron 的 `MAX_DOWNLOADS_PER_RUN`、`LOG_LEVEL` 会转换成显式 CLI 覆盖并输出弃用提示。
+唯一的持久配置 bootstrap 是 `BILIBILI_PODCAST_CONFIG_ROOT`。`FORCE`、`DEBUG`、`SMOKE_SYNC` 仍是一次性运行/部署控制；`PATH` 只参与系统命令发现。cron 的 `MAX_DOWNLOADS_PER_RUN`、`LOG_LEVEL` 会转换成显式 CLI 覆盖并输出弃用提示。
 
-检测到 `BILIPOD_CONFIG_DB`、`BILIPOD_WEB_PASSWORD`、`BILIPOD_MEDIA_ROOT` 等旧持久变量时，配置加载会以退出码 `2` 失败，并指出新字段和 `bilipod-config migrate`。已移除的 `BILIPOD_RSYNC_*`/`RSYNC_PASSWORD` 同样会被明确拒绝，迁移器只报告其未迁移，不生成替代配置。不允许通过旧环境静默覆盖 TOML。
+检测到 `BILIBILI_PODCAST_CONFIG_DB`、`BILIBILI_PODCAST_WEB_PASSWORD`、`BILIBILI_PODCAST_MEDIA_ROOT` 等旧持久变量时，配置加载会以退出码 `2` 失败，并指出新字段和 `bilibili-podcast-config migrate`。已移除的 `BILIBILI_PODCAST_RSYNC_*`/`RSYNC_PASSWORD` 同样会被明确拒绝，迁移器只报告其未迁移，不生成替代配置。不允许通过旧环境静默覆盖 TOML。
 
 ---
 
@@ -817,7 +841,7 @@ pip install -c requirements.lock -e ".[browser]"  # 含 Playwright 浏览器回�
 | `ffmpeg` | 手动媒体转码 | 系统包或显式传 `--ffmpeg-bin` |
 | Playwright (Chromium) | 浏览器回退抓取 | `pip install -c requirements.lock -e ".[browser]" && playwright install chromium` |
 
-`yt-dlp` 必须是项目专用的 yt-dlp 版本（与 bilipod 使用同一 Python 环境的 pip 包），不要依赖系统级 `yt-dlp` 命令。
+`yt-dlp` 必须是项目专用的 yt-dlp 版本（与 bilibili-podcast 使用同一 Python 环境的 pip 包），不要依赖系统级 `yt-dlp` 命令。
 
 ### 开发测试
 

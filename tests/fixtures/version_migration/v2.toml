@@ -1,0 +1,6 @@
+[fixture]
+version = 2
+marker = false
+legacy_product_names = false
+previous_cookie_names = true
+gone_series = true

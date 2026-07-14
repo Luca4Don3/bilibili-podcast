@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from ..sqlite_connection import connect as sqlite_connect
+
 @dataclass
 class SchedulerCommandResult:
     backend: str
@@ -152,20 +154,20 @@ def replace_schedules_in_connection(
 
 
 def _find_crontab_script() -> Optional[str]:
-    """Locate scripts/bilipod-crontab relative to this file or via PATH."""
+    """Locate scripts/bilibili-podcast-crontab relative to this file or via PATH."""
     here = Path(__file__).resolve().parent.parent.parent
-    candidate = here / "scripts" / "bilipod-crontab"
+    candidate = here / "scripts" / "bilibili-podcast-crontab"
     if candidate.exists():
         return str(candidate)
     for p in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(p) / "bilipod-crontab"
+        candidate = Path(p) / "bilibili-podcast-crontab"
         if candidate.exists():
             return str(candidate)
     return None
 
 
 class SchedulerService:
-    """Manage cron and systemd timer scheduling for Bilipod series."""
+    """Manage cron and systemd timer scheduling for Bilibili Podcast series."""
 
     def __init__(
         self,
@@ -185,8 +187,8 @@ class SchedulerService:
     def _ensure_crontab(self) -> str:
         if not self._crontab:
             raise FileNotFoundError(
-                "bilipod-crontab script not found; "
-                "ensure scripts/bilipod-crontab is present"
+                "bilibili-podcast-crontab script not found; "
+                "ensure scripts/bilibili-podcast-crontab is present"
             )
         return self._crontab
 
@@ -228,7 +230,7 @@ class SchedulerService:
             if cron_script_dir:
                 script_dir = cron_script_dir
             else:
-                tmp_dir = tempfile.mkdtemp(prefix="bilipod-scheduler-plan-")
+                tmp_dir = tempfile.mkdtemp(prefix="bilibili-podcast-scheduler-plan-")
                 script_dir = tmp_dir
 
             cmd.extend(["--script-dir", script_dir, "--print"])
@@ -641,8 +643,8 @@ class SchedulerService:
         # Remove only the target series auto block
         import re
         cleaned = re.sub(
-            rf"^# BEGIN BILIPOD AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
-            rf"^# END BILIPOD AUTO\r?\n?",
+            rf"^# BEGIN BILIBILI_PODCAST AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
+            rf"^# END BILIBILI_PODCAST AUTO\r?\n?",
             "", existing, flags=re.DOTALL | re.MULTILINE,
         ).strip()
 
@@ -658,7 +660,7 @@ class SchedulerService:
     def _crontab_command(*args: str) -> list[str]:
         import getpass
         current_user = getpass.getuser()
-        cron_user = "bilipod"
+        cron_user = "bilibili-podcast"
         if current_user == cron_user:
             return ["crontab", *args]
         return ["crontab", "-u", cron_user, *args]
@@ -687,14 +689,14 @@ class SchedulerService:
             db.set_scheduler_backend(conn, series, backend)
 
     def _scheduler_backend(self, series: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT backend FROM scheduler_backend WHERE series=?", (series,),
             ).fetchone()
         return str(row[0] if row else "cron")
 
     def _cron_retry_series(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT c.series FROM cron_schedule c "
                 "LEFT JOIN scheduler_backend b ON b.series=c.series "
@@ -723,22 +725,22 @@ class SchedulerService:
         if not wrapper.exists():
             raise RuntimeError(f"cron wrapper not found: {wrapper}")
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute("SELECT title FROM series WHERE series=?", (series,)).fetchone()
         if row is None:
             raise RuntimeError(f"series not found: {series}")
 
         title = self._cron_marker_title(row[0], series)
-        lines = [f"# BEGIN BILIPOD AUTO - {series} ({title})"]
+        lines = [f"# BEGIN BILIBILI_PODCAST AUTO - {series} ({title})"]
         lines.extend(f"{entry.schedule} {wrapper}" for entry in schedules)
-        lines.append("# END BILIPOD AUTO")
+        lines.append("# END BILIBILI_PODCAST AUTO")
         block = "\n".join(lines)
 
         existing = self._read_crontab()
         import re
         cleaned = re.sub(
-            rf"^# BEGIN BILIPOD AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
-            rf"^# END BILIPOD AUTO\r?\n?",
+            rf"^# BEGIN BILIBILI_PODCAST AUTO - {re.escape(series)}(?:\s+\([^\r\n]*\))?\r?\n.*?"
+            rf"^# END BILIBILI_PODCAST AUTO\r?\n?",
             "", existing, flags=re.DOTALL | re.MULTILINE,
         ).strip()
         content = f"{cleaned}\n\n{block}\n" if cleaned else f"{block}\n"
@@ -747,14 +749,14 @@ class SchedulerService:
     # ── list_schedules / replace_schedules (DB only) ──────────────────
 
     def _update_period(self, series: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT update_period FROM sync_policy WHERE series=?", (series,),
             ).fetchone()
         return str(row[0] if row else "12h")
 
     def list_schedules(self, series: str) -> list[ScheduleEntry]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, series, schedule, enabled, position, kind "
@@ -776,7 +778,7 @@ class SchedulerService:
     def list_enabled_schedules(self, series: str) -> list[ScheduleEntry]:
         """Return only enabled schedules (enabled=1) for installation
         into cron/systemd."""
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 "SELECT id, series, schedule, enabled, position, kind "
@@ -802,7 +804,7 @@ class SchedulerService:
         retry_schedules: list[str] | None = None,
     ) -> int:
         retry_schedules = retry_schedules or []
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             count = replace_schedules_in_connection(conn, series, schedules, retry_schedules)
             conn.commit()
         return count
@@ -815,7 +817,7 @@ class SchedulerService:
         if backend == "systemd":
             return self._status_systemd(series)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             if series:
                 rows = conn.execute(
@@ -867,7 +869,7 @@ class SchedulerService:
         return result
 
     def _list_all_series(self) -> list[str]:
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite_connect(self.db_path) as conn:
             rows = conn.execute("SELECT series FROM series").fetchall()
         return [r[0] for r in rows]
 

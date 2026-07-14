@@ -14,7 +14,7 @@ from bilibili_podcast.config.manager import (
     ConfigError, ConfigManager, LegacyConfigError, UnsafeConfigError,
 )
 from bilibili_podcast.config.schema import LEGACY_ENV_MAP, LEGACY_INPUT_ONLY
-from bilibili_podcast.config.migration import migrate_legacy
+from bilibili_podcast.config.migration import LATEST_VERSION, VERSION_FILE, migrate_legacy
 from bilibili_podcast import db
 
 
@@ -77,7 +77,7 @@ def test_rejects_non_finite_numbers_and_unsafe_unit_names(tmp_path: Path) -> Non
     scheduler = root / "scheduler.toml"
     scheduler.write_text(
         scheduler.read_text().replace(
-            'web = "bilipod-web.service"', 'web = "../bilipod-web.service"'
+            'web = "bilibili-podcast-web.service"', 'web = "../bilibili-podcast-web.service"'
         )
     )
     with pytest.raises(ConfigError, match="invalid scheduler unit name"):
@@ -87,7 +87,7 @@ def test_rejects_non_finite_numbers_and_unsafe_unit_names(tmp_path: Path) -> Non
     scheduler = root / "scheduler.toml"
     scheduler.write_text(
         scheduler.read_text().replace(
-            'sync_glob = "bilipod-sync@*.service"', 'sync_glob = "bilipod-*.service"'
+            'sync_glob = "bilibili-podcast-sync@*.service"', 'sync_glob = "bilibili-podcast-*.service"'
         )
     )
     with pytest.raises(ConfigError, match="overlaps web unit"):
@@ -104,7 +104,7 @@ def test_rejects_unsafe_sensitive_permissions(tmp_path: Path) -> None:
 def test_rejects_legacy_environment_with_target(tmp_path: Path) -> None:
     root = _actual_config(tmp_path)
     with pytest.raises(LegacyConfigError, match="app.database.path"):
-        ConfigManager(root, environ={"BILIPOD_CONFIG_DB": "/tmp/old.db"}).load()
+        ConfigManager(root, environ={"BILIBILI_PODCAST_CONFIG_DB": "/tmp/old.db"}).load()
 
 
 def test_show_json_is_redacted(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -161,24 +161,24 @@ sync:
 
 def _legacy_env(tmp_path: Path) -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
-    runtime = tmp_path / "runtime" / "bilipod"
+    runtime = tmp_path / "runtime" / "bilibili-podcast"
     values = {
-        "BILIPOD_APP_DIR": runtime / "app",
-        "BILIPOD_VENV_BIN": runtime / "venv/bin",
-        "BILIPOD_SYNC_PATH": runtime / "venv/bin/bilibili-podcast",
-        "BILIPOD_MEDIA_ROOT": runtime / "media",
-        "BILIPOD_JSON_ROOT": runtime / "json",
-        "BILIPOD_RSS_ROOT": runtime / "rss",
-        "BILIPOD_PUBLISHED_RSS_ROOT": runtime / "published-rss",
-        "BILIPOD_STATE_ROOT": runtime / "state",
-        "BILIPOD_LOG_DIR": runtime / "logs",
-        "BILIPOD_SECRETS_DIR": runtime / "secrets",
-        "BILIPOD_COOKIE_FILE": runtime / "secrets/cookie.txt",
-        "BILIPOD_LOCK_FILE": runtime / "state/lock",
-        "BILIPOD_BROWSER_USER_DATA_ROOT": runtime / "browser/profiles",
+        "BILIBILI_PODCAST_APP_DIR": runtime / "app",
+        "BILIBILI_PODCAST_VENV_BIN": runtime / "venv/bin",
+        "BILIBILI_PODCAST_SYNC_PATH": runtime / "venv/bin/bilibili-podcast",
+        "BILIBILI_PODCAST_MEDIA_ROOT": runtime / "media",
+        "BILIBILI_PODCAST_JSON_ROOT": runtime / "json",
+        "BILIBILI_PODCAST_RSS_ROOT": runtime / "rss",
+        "BILIBILI_PODCAST_PUBLISHED_RSS_ROOT": runtime / "published-rss",
+        "BILIBILI_PODCAST_STATE_ROOT": runtime / "state",
+        "BILIBILI_PODCAST_LOG_DIR": runtime / "logs",
+        "BILIBILI_PODCAST_SECRETS_DIR": runtime / "secrets",
+        "BILIBILI_PODCAST_COOKIE_FILE": runtime / "secrets/cookie.txt",
+        "BILIBILI_PODCAST_LOCK_FILE": runtime / "state/lock",
+        "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT": runtime / "browser/profiles",
         "PLAYWRIGHT_BROWSERS_PATH": runtime / "browser/bin",
-        "BILIPOD_SYSTEMD_DIR": runtime / "systemd",
-        "BILIPOD_CRON_SCRIPT_DIR": runtime / "cron/wrappers",
+        "BILIBILI_PODCAST_SYSTEMD_DIR": runtime / "systemd",
+        "BILIBILI_PODCAST_CRON_SCRIPT_DIR": runtime / "cron/wrappers",
     }
     path = tmp_path / "legacy.env"
     path.write_text("\n".join(f"export {key}={value}" for key, value in values.items()) + "\n")
@@ -188,7 +188,7 @@ def _legacy_env(tmp_path: Path) -> Path:
 def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) -> None:
     env = _legacy_env(tmp_path)
     web_env = tmp_path / "web.env"
-    web_env.write_text("BILIPOD_HTTPS=0\n")
+    web_env.write_text("BILIBILI_PODCAST_HTTPS=0\n")
     series_dir = tmp_path / "series"
     series_dir.mkdir()
     rss_users = tmp_path / "users.conf"
@@ -206,6 +206,7 @@ def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) ->
     )
     assert applied.applied is True
     assert ConfigManager(output, environ={}).load().rss_users.users["user_1"].token == "test-token"
+    assert (output / VERSION_FILE).read_text(encoding="ascii").strip() == str(LATEST_VERSION)
 
 
 def test_migration_apply_rejects_existing_config_symlink(tmp_path: Path) -> None:
@@ -258,7 +259,7 @@ cron:
     )
 
     assert result.series_count == 1
-    db_path = tmp_path / "runtime" / "bilipod" / "state" / "bilipod.db"
+    db_path = tmp_path / "runtime" / "bilibili-podcast" / "state" / "bilibili-podcast.db"
     with sqlite3.connect(db_path) as conn:
         rows = conn.execute(
             "SELECT schedule, kind FROM cron_schedule WHERE series='demo' ORDER BY kind, position"
@@ -273,13 +274,13 @@ cron:
 def test_migration_invalid_number_is_a_config_error(tmp_path: Path) -> None:
     env = _legacy_env(tmp_path)
     with env.open("a", encoding="utf-8") as handle:
-        handle.write("BILIPOD_MIN_FREE_GB=not-a-number\n")
+        handle.write("BILIBILI_PODCAST_MIN_FREE_GB=not-a-number\n")
     empty = tmp_path / "empty"
     empty.write_text("")
     series_dir = tmp_path / "series"
     series_dir.mkdir()
 
-    with pytest.raises(ConfigError, match="BILIPOD_MIN_FREE_GB"):
+    with pytest.raises(ConfigError, match="BILIBILI_PODCAST_MIN_FREE_GB"):
         migrate_legacy(
             legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
             legacy_rss_users=empty, output_root=tmp_path / "output", apply=False,
@@ -289,7 +290,7 @@ def test_migration_invalid_number_is_a_config_error(tmp_path: Path) -> None:
 def test_removed_rsync_environment_is_rejected_and_not_migrated(tmp_path: Path) -> None:
     root = _actual_config(tmp_path)
     with pytest.raises(LegacyConfigError, match="removed rsync support"):
-        ConfigManager(root, environ={"BILIPOD_RSYNC_HOST": "legacy-host"}).load()
+        ConfigManager(root, environ={"BILIBILI_PODCAST_RSYNC_HOST": "legacy-host"}).load()
 
     env = _legacy_env(tmp_path / "migration")
     with env.open("a", encoding="utf-8") as handle:
@@ -327,14 +328,20 @@ def test_migration_invalid_series_returns_cli_error_without_writes(tmp_path: Pat
     assert not output.exists()
 
 
-def test_enabled_publish_requires_valid_url_and_absolute_script(tmp_path: Path) -> None:
+def test_enabled_publish_requires_valid_url_and_rejects_script_field(tmp_path: Path) -> None:
     root = _actual_config(tmp_path)
     publish = root / "publish.toml"
     publish.write_text(
         '[publish]\nenabled = true\nmedia_base_url = "not-a-url"\n'
-        'script = "relative.sh"\nmaster_placeholder = "__MEDIA_PLACEHOLDER__"\n'
+        'master_placeholder = "__MEDIA_PLACEHOLDER__"\ngone_series = []\n'
     )
     with pytest.raises(ConfigError, match="invalid enabled URL"):
+        ConfigManager(root, environ={}).load()
+
+    root = _actual_config(tmp_path / "script")
+    publish = root / "publish.toml"
+    publish.write_text(publish.read_text() + 'script = "/tmp/publish.sh"\n')
+    with pytest.raises(ConfigError, match="unknown configuration field"):
         ConfigManager(root, environ={}).load()
 
 
@@ -361,10 +368,10 @@ def test_manual_media_config_boundaries(tmp_path: Path) -> None:
         ConfigManager(root, environ={}).load()
 
 
-def test_migration_rejects_publish_conflict_without_writes(tmp_path: Path) -> None:
+def test_migration_does_not_create_external_publish_hook(tmp_path: Path) -> None:
     env = _legacy_env(tmp_path)
     with env.open("a") as handle:
-        handle.write("BILIPOD_RSS_PUBLISH=/tmp/one\nBILIPOD_RSS_PUBLISH_SCRIPT=/tmp/two\n")
+        handle.write("BILIBILI_PODCAST_RSS_PUBLISH=/tmp/one\nBILIBILI_PODCAST_RSS_PUBLISH_SCRIPT=/tmp/two\n")
     web_env = tmp_path / "web.env"
     web_env.write_text("")
     series_dir = tmp_path / "series"
@@ -372,12 +379,11 @@ def test_migration_rejects_publish_conflict_without_writes(tmp_path: Path) -> No
     users = tmp_path / "users"
     users.write_text("")
     output = tmp_path / "output"
-    with pytest.raises(ConfigError, match="conflict"):
-        migrate_legacy(
-            legacy_env=env, legacy_web_env=web_env, legacy_series_dir=series_dir,
-            legacy_rss_users=users, output_root=output, apply=True,
-        )
-    assert not output.exists()
+    migrate_legacy(
+        legacy_env=env, legacy_web_env=web_env, legacy_series_dir=series_dir,
+        legacy_rss_users=users, output_root=output, apply=True,
+    )
+    assert "script" not in (output / "publish.toml").read_text()
 
 
 def test_web_config_view_requires_login_and_redacts(monkeypatch, tmp_path: Path) -> None:
@@ -419,24 +425,24 @@ from bilibili_podcast.services import systemd_scheduler
 systemd_scheduler.configure(ConfigManager().load())
 generate_service = systemd_scheduler.generate_service
 print(generate_service('demo'))
-module = runpy.run_path('scripts/bilipod-crontab')
+module = runpy.run_path('scripts/bilibili-podcast-crontab')
 path = module['generate_wrapper_script']('demo', None, None, {str(wrapper_dir)!r}, True)
 print(path.read_text())
 """
     env = {
         "PATH": os.environ.get("PATH", ""),
         "PYTHONPATH": "src",
-        "BILIPOD_CONFIG_ROOT": str(root),
+        "BILIBILI_PODCAST_CONFIG_ROOT": str(root),
     }
     result = subprocess.run(
         [sys.executable, "-c", code], cwd=Path(__file__).parents[1], env=env,
         capture_output=True, text=True, check=True,
     )
     output = result.stdout
-    assert f"Environment=BILIPOD_CONFIG_ROOT={root.resolve()}" in output
+    assert f"Environment=BILIBILI_PODCAST_CONFIG_ROOT={root.resolve()}" in output
     assert "--config-db" not in output
     assert "--cookie-file" not in output
-    assert "BILIPOD_RSYNC_" not in output
+    assert "BILIBILI_PODCAST_RSYNC_" not in output
     assert "__MEDIA_PLACEHOLDER__" in output
 
 
@@ -448,13 +454,13 @@ def test_crontab_explicit_paths_override_unified_scheduler_config(tmp_path: Path
     override = tmp_path / "one-run-wrappers"
     result = subprocess.run(
         [
-            sys.executable, "scripts/bilipod-crontab", "--print",
+            sys.executable, "scripts/bilibili-podcast-crontab", "--print",
             "--script-dir", str(override), "--cron-user", "one-run-user",
         ],
         cwd=Path(__file__).parents[1],
         env={
             "PATH": os.environ.get("PATH", ""), "PYTHONPATH": "src",
-            "BILIPOD_CONFIG_ROOT": str(root),
+            "BILIBILI_PODCAST_CONFIG_ROOT": str(root),
         },
         capture_output=True,
         text=True,

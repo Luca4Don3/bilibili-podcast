@@ -36,7 +36,7 @@ class InstallConfig:
 class ExecutablesConfig:
     sync: Path
     ffmpeg: str
-    bilipod_config: str
+    bilibili_podcast_config: str
 
 
 @dataclass(frozen=True)
@@ -103,6 +103,7 @@ class WebSecurityConfig:
     password: str
     https: bool
     cookie_name: str
+    previous_cookie_names: tuple[str, ...]
     session_max_age_seconds: int
 
 
@@ -143,8 +144,8 @@ class SchedulerConfig:
 class PublishSettings:
     enabled: bool
     media_base_url: str
-    script: Path | None
     master_placeholder: str
+    gone_series: tuple[str, ...]
 
 
 @dataclass(frozen=True)

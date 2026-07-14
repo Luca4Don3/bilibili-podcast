@@ -1,0 +1,44 @@
+# Token-safe Nginx fragment. Replace placeholders on the server; do not commit
+# production addresses or paths. The access log intentionally omits URI,
+# arguments, Authorization, and Cookie values.
+log_format bilibili_podcast_safe '$remote_addr $status $body_bytes_sent '
+                                 '$request_time $upstream_response_time';
+
+upstream bilibili_podcast_web {
+    server 127.0.0.1:<new_web_port> max_fails=1 fail_timeout=2s;
+    server 127.0.0.1:<old_web_port> backup;
+    keepalive 16;
+}
+
+server {
+    listen <rss_port>;
+    access_log <server_path>/logs/nginx-access.log bilibili_podcast_safe;
+    error_log /dev/null crit;
+
+    location ~ ^/rss/(?<rss_token>[^/]+)/(?<rss_series>[a-z0-9][a-z0-9_-]*)\.xml$ {
+        auth_request /_auth_rss;
+        auth_request_set $rss_token_hash $upstream_http_x_rss_token_hash;
+        root <server_path>/published-rss;
+        try_files /current/$rss_token_hash/$rss_series.xml =404;
+    }
+
+    location = /_auth_rss {
+        internal;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_pass http://bilibili_podcast_web/auth/rss/$rss_token/$rss_series.xml;
+    }
+
+    location ~ ^/media/(?<media_series>[a-z0-9][a-z0-9_-]*)/(?<media_file>[A-Za-z0-9_.-]+)$ {
+        auth_request /_auth_media;
+        alias <server_path>/media/$media_series/$media_file;
+    }
+
+    location = /_auth_media {
+        internal;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        proxy_pass http://bilibili_podcast_web/auth/media/$arg_token/$media_series/$media_file;
+    }
+
+}

@@ -29,7 +29,7 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
     (config_root / "rss-users.toml").write_text("")
     for name in (
         "podcast-web.service", "podcast-sync-demo.service", "podcast-sync-demo.timer",
-        "bilipod-retry@demo.service", "bilipod-retry@demo.timer",
+        "bilibili-podcast-retry@demo.service", "bilibili-podcast-retry@demo.timer",
     ):
         (systemd_dir / name).write_text(f"# {name}\n")
     (wrapper_dir / "run_demo_sync.sh").write_text("#!/bin/sh\n")
@@ -50,7 +50,7 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
         },
     }
     _executable(
-        fake_bin / "bilipod-config",
+        fake_bin / "bilibili-podcast-config",
         "#!/bin/sh\n"
         "if [ \"${1:-}\" = show ]; then\n"
         f"  echo '{json.dumps(config)}'\n"
@@ -67,7 +67,7 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
         env={
             **os.environ,
             "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
-            "BILIPOD_CONFIG_ROOT": str(config_root),
+            "BILIBILI_PODCAST_CONFIG_ROOT": str(config_root),
         },
         capture_output=True,
         text=True,
@@ -78,7 +78,7 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
     assert len(backups) == 1
     assert {path.name for path in backups[0].iterdir()} == {
         "podcast-web.service", "podcast-sync-demo.service", "podcast-sync-demo.timer",
-        "bilipod-retry@demo.service", "bilipod-retry@demo.timer",
+        "bilibili-podcast-retry@demo.service", "bilibili-podcast-retry@demo.timer",
     }
     assert (backups[0].parent / "config" / "rss-users.toml").read_bytes() == b""
     assert "without service restart" in result.stdout

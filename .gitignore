@@ -180,15 +180,9 @@ config/series.d/*.yaml
 config/.temp/
 config/**/*.tmp
 config/.backups/
-config/.bilipod-migrate-*/
+config/.bilibili-podcast-migrate-*/
 config/**/*.bak*
 .temp/
-
-# RSS user config (contains real tokens)
-rss-publish-users.conf
-
-# RSS distribution script (server-specific paths)
-scripts/rss-publish.sh
 
 # Deployment notes / RSS links / handoff documents (internal only, never commit)
 HANDOFF.md
@@ -209,7 +203,7 @@ show_config.py
 download.py
 COOKIE_USAGE.md
 
-# Bilipod sensitive files
+# Bilibili Podcast sensitive files
 # Configuration files with credentials
 config.yaml
 config_local.yaml

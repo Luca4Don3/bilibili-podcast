@@ -41,9 +41,11 @@ dev = [
 
 [project.scripts]
 bilibili-podcast = "bilibili_podcast.sync:main"
-bilipod-admin = "bilibili_podcast.cli_admin:main"
-bilipod-config = "bilibili_podcast.config.cli:main"
-bilipod-web = "bilibili_podcast.web.runner:main"
+bilibili-podcast-admin = "bilibili_podcast.cli_admin:main"
+bilibili-podcast-config = "bilibili_podcast.config.cli:main"
+bilibili-podcast-web = "bilibili_podcast.web.runner:main"
+bilibili-podcast-publish = "bilibili_podcast.publisher:main"
+bilibili-podcast-crontab = "bilibili_podcast.crontab:main"
 
 [project.urls]
 homepage = "https://github.com/example/bilibili-podcast"
@@ -55,3 +57,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 package-dir = {"" = "src"}
 include-package-data = true
+
+[tool.setuptools.package-data]
+bilibili_podcast = ["web/templates/*.html"]

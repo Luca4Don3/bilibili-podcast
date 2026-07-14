@@ -34,7 +34,7 @@ def configure(config: ConfigSnapshot) -> None:
 
 UNIFIED_SERVICE_TEMPLATE = """\
 [Unit]
-Description=Bilipod Sync — {series}
+Description=Bilibili Podcast Sync — {series}
 After=network.target
 
 [Service]
@@ -42,7 +42,7 @@ Type=oneshot
 User={user}
 Group={group}
 WorkingDirectory={app_dir}
-Environment=BILIPOD_CONFIG_ROOT={config_root}
+Environment=BILIBILI_PODCAST_CONFIG_ROOT={config_root}
 ExecStart={sync_bin} --series {series} --max-downloads-per-run {max_downloads} --token __MEDIA_PLACEHOLDER__ --apply{retry_args}
 Restart=no
 TimeoutStartSec=1800
@@ -52,7 +52,7 @@ TimeoutStartSec=1800
 
 TIMER_TEMPLATE = """\
 [Unit]
-Description=Bilipod Sync Timer — {series}
+Description=Bilibili Podcast Sync Timer — {series}
 
 [Timer]
 {oncalendar_lines}
@@ -126,11 +126,11 @@ def generate_timer(series: str, oncalendars: list[str]) -> str:
 
 
 def unit_name(series: str, suffix: str = "service", *, scheduled_retry: bool = False) -> str:
-    """Return the systemd unit file name, e.g. ``bilipod-sync@myseries.service``."""
+    """Return the systemd unit file name, e.g. ``bilibili-podcast-sync@myseries.service``."""
     if scheduled_retry:
-        return f"bilipod-retry@{series}.{suffix}"
+        return f"bilibili-podcast-retry@{series}.{suffix}"
     units = getattr(getattr(_CONFIG, "scheduler", None), "units", None)
-    pattern = getattr(units, "sync_glob", "bilipod-sync@*.service")
+    pattern = getattr(units, "sync_glob", "bilibili-podcast-sync@*.service")
     service_name = pattern.replace("*", series)
     if suffix == "service":
         return service_name

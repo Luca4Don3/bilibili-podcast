@@ -77,6 +77,12 @@ def parse_log_level(value: str) -> str:
     return level
 
 
+def parse_master_placeholder(value: str) -> str:
+    if value != "__MEDIA_PLACEHOLDER__":
+        raise argparse.ArgumentTypeError("--token only accepts __MEDIA_PLACEHOLDER__")
+    return value
+
+
 def cleanup_old_log_backups(
     log_root: Path,
     retention_days: int = LOG_RETENTION_DAYS,
@@ -1962,33 +1968,17 @@ async def run(args: argparse.Namespace) -> int:
     elapsed = time.time() - run_start
     LOGGER.info("run complete elapsed_seconds=%.1f", elapsed)
 
-    # After successful sync with --apply, optionally run publish script.
-    if args.apply and getattr(args, "publish_script", None) and completed_sync and not had_error:
-        LOGGER.info("running publish script: %s", args.publish_script)
+    # Publish only after every requested series has completed successfully.
+    if args.apply and completed_sync and not had_error and getattr(args, "publisher_snapshot", None):
+        from .publisher import PublishError, publish
+
         try:
-            result = subprocess.run(
-                [args.publish_script], capture_output=True, text=True,
-                timeout=getattr(args, "publish_timeout_seconds", 60),
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            LOGGER.error("publish script failed: %s", exc)
+            generation = publish(args.publisher_snapshot)
+        except (OSError, PublishError) as exc:
+            LOGGER.error("RSS publish failed: %s", sanitize_external_output(str(exc)))
             return EXIT_PUBLISH_ERROR
-        if result.stdout:
-            LOGGER.info(
-                "publish script stdout bytes=%s", len(result.stdout.encode("utf-8")),
-            )
-        if result.stderr:
-            LOGGER.info(
-                "publish script stderr bytes=%s", len(result.stderr.encode("utf-8")),
-            )
-        if result.returncode != 0:
-            details = sanitize_external_output(result.stderr or result.stdout)
-            LOGGER.error(
-                "publish script failed with code %s: %s",
-                result.returncode,
-                details or "(no output)",
-            )
-            return EXIT_PUBLISH_ERROR
+        if generation:
+            LOGGER.info("RSS generation activated generation=%s", generation)
 
     return EXIT_SYNC_ERROR if had_error else 0
 
@@ -2000,7 +1990,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_source.add_argument("--config-dir", help="Explicit legacy YAML rollback directory.")
     parser.add_argument("--series", help="Comma-separated series ids to sync.")
     parser.add_argument("--cookie-file", help="Netscape cookie file for Bilibili.")
-    parser.add_argument("--token", help="Media token to append to RSS enclosure URLs.")
+    parser.add_argument(
+        "--token", type=parse_master_placeholder, default="__MEDIA_PLACEHOLDER__",
+        help="Fixed master RSS media placeholder; real tokens are rejected.",
+    )
     parser.add_argument("--media-root")
     parser.add_argument("--json-root")
     parser.add_argument("--rss-root")
@@ -2019,7 +2012,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Ignore per-series update and rate-limit cooldown gates.")
     parser.add_argument("--scheduled-retry", action="store_true", help="Run only after a primary failure; bypass update-period gate only.")
     parser.add_argument("--apply", action="store_true", help="Write files and download missing media.")
-    parser.add_argument("--publish-script", help="发布脚本路径；仅 --apply 全部成功后执行，失败返回非零。")
     return parser
 
 
@@ -2041,12 +2033,7 @@ def apply_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapshot) ->
         "browser_login_wait_seconds": snapshot.sync.browser.login_wait_seconds,
         "log_dir": str(snapshot.app.paths.log_dir),
         "log_level": snapshot.sync.logging.level,
-        "publish_script": (
-            str(snapshot.publish.publish.script)
-            if snapshot.publish.publish.enabled and snapshot.publish.publish.script
-            else None
-        ),
-        "publish_timeout_seconds": snapshot.sync.timeouts.publish_seconds,
+        "publisher_snapshot": snapshot if snapshot.publish.publish.enabled else None,
     }
     for name, value in defaults.items():
         if getattr(args, name, None) is None:

@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from ..sqlite_connection import connect as sqlite_connect
+
 
 class TomlRepository:
     def read(self, path: Path) -> dict[str, Any]:
@@ -40,7 +42,7 @@ class SQLiteSeriesRepository:
         if not self.path.exists():
             return 0
         try:
-            with sqlite3.connect(self.path) as conn:
+            with sqlite_connect(self.path) as conn:
                 row = conn.execute("SELECT COUNT(*) FROM access_rule").fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():

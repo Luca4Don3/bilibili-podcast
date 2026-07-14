@@ -22,13 +22,13 @@ def reset_admin_config_snapshot(tmp_path: Path):
 
         @property
         def allowed_dirs(self):
-            raw = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS", "")
+            raw = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", "")
             return tuple(Path(item) for item in raw.split(":") if item)
 
     cli_admin._CONFIG = SimpleNamespace(
         root=tmp_path / "config",
         app=SimpleNamespace(
-            database=SimpleNamespace(path=tmp_path / "bilipod.db"),
+            database=SimpleNamespace(path=tmp_path / "bilibili-podcast.db"),
             paths=SimpleNamespace(
                 media_root=tmp_path / "media",
                 json_root=tmp_path / "json",
@@ -48,8 +48,10 @@ def reset_admin_config_snapshot(tmp_path: Path):
         ),
         scheduler=SimpleNamespace(command_timeout_seconds=30),
         publish=SimpleNamespace(publish=SimpleNamespace(
-            enabled=False, media_base_url="https://media.example.invalid", script=None,
+            enabled=False, media_base_url="https://media.example.invalid",
+            master_placeholder="__MEDIA_PLACEHOLDER__", gone_series=(),
         )),
+        rss_users=SimpleNamespace(users={}),
         manual_media=ManualMedia(),
     )
     yield
@@ -67,7 +69,7 @@ def mock_db(tmp_path: Path) -> str:
 
 
 def test_cron_plan_uses_sys_executable(mock_db: str) -> None:
-    """cron plan/apply must invoke bilipod-crontab via sys.executable,
+    """cron plan/apply must invoke bilibili-podcast-crontab via sys.executable,
     not rely on the file's executable bit."""
     called_with: list[list[str]] = []
 
@@ -75,7 +77,7 @@ def test_cron_plan_uses_sys_executable(mock_db: str) -> None:
         called_with.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    dummy_script = "/tmp/nonexistent/bilipod-crontab"  # non-executable path
+    dummy_script = "/tmp/nonexistent/bilibili-podcast-crontab"  # non-executable path
 
     with patch.object(cli_admin, "_find_crontab_bin", return_value=dummy_script):
         with patch.object(subprocess, "run", side_effect=fake_run):
@@ -96,14 +98,14 @@ def test_cron_plan_uses_sys_executable(mock_db: str) -> None:
 
 
 def test_cron_apply_passes_apply_flag(mock_db: str) -> None:
-    """cron apply --yes must pass --apply to bilipod-crontab."""
+    """cron apply --yes must pass --apply to bilibili-podcast-crontab."""
     called_with: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         called_with.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
-    dummy_script = "/tmp/nonexistent/bilipod-crontab"
+    dummy_script = "/tmp/nonexistent/bilibili-podcast-crontab"
 
     with patch.object(cli_admin, "_find_crontab_bin", return_value=dummy_script):
         with patch.object(subprocess, "run", side_effect=fake_run):
@@ -331,7 +333,7 @@ def test_remove_series_preview_does_not_delete(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     with patch.object(sys, "stdout"):
         cli_admin.cmd_remove_series(ns)
@@ -367,7 +369,7 @@ def test_remove_series_schedule_failure_stops_deletion(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     failure = SchedulerCommandResult(
         backend="systemd", action="remove-series", returncode=1,
@@ -412,7 +414,7 @@ def test_remove_series_lock_contention_stops_deletion(tmp_path: Path) -> None:
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(lock_file),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     with sync.process_lock(str(lock_file)):
         with patch.object(sys, "stdout"), pytest.raises(SystemExit) as exc:
@@ -449,7 +451,7 @@ def test_remove_up_does_not_remove_later_schedule_before_failure(tmp_path: Path)
         "--cron-script-dir", str(tmp_path / "auto"),
         "--browser-user-data-root", str(tmp_path / "browser-profiles"),
         "--lock-file", str(tmp_path / "sync.lock"),
-        "--users-conf", str(tmp_path / "users.conf"),
+        "--users-conf", str(tmp_path / "rss-users.toml"),
     ])
     ok = SchedulerCommandResult("systemd", "remove-series", 0, "", "")
     failure = SchedulerCommandResult("systemd", "remove-series", 1, "", "failed")
@@ -661,19 +663,17 @@ def test_sync_dry_run_has_production_params(tmp_path: Path) -> None:
     assert "--min-free-gb" in cmd
 
 
-def test_sync_publish_timeout_returns_sync_failure(tmp_path: Path) -> None:
+def test_sync_builtin_publish_failure_returns_sync_failure(tmp_path: Path) -> None:
     db_path = _migrate(tmp_path)
     _create_minimal_series(db_path)
     cli_admin._CONFIG.publish.publish.enabled = True
-    cli_admin._CONFIG.publish.publish.script = Path("/tmp/publish-hook")
 
     def fake_run(cmd, **kwargs):
-        if cmd[0] == "/tmp/publish-hook":
-            raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
         return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
     with patch.object(cli_admin, "_find_sync_bin", return_value="/tmp/bilibili-podcast"), \
-            patch.object(subprocess, "run", side_effect=fake_run):
+            patch.object(subprocess, "run", side_effect=fake_run), \
+            patch("bilibili_podcast.publisher.publish", side_effect=RuntimeError("publish failed")):
         args = cli_admin.build_parser().parse_args(
             ["--config-db", db_path, "--yes", "sync", "synctest", "--apply"]
         )
@@ -700,7 +700,7 @@ def test_sync_apply_ignores_legacy_publish_environment(tmp_path: Path) -> None:
         with patch.object(subprocess, "run", side_effect=fake_run):
             p = cli_admin.build_parser()
             ns = p.parse_args(["--config-db", db_path, "--yes", "sync", "synctest", "--apply"])
-            os.environ["BILIPOD_RSS_PUBLISH"] = "/tmp/test-publish.sh"
+            os.environ["BILIBILI_PODCAST_RSS_PUBLISH"] = "/tmp/test-publish.sh"
             cli_admin.cmd_sync(ns)
 
     assert len(calls) == 1
@@ -753,7 +753,7 @@ def test_legacy_publish_environment_cannot_inject_failing_hook(tmp_path: Path) -
         with patch.object(subprocess, "run", side_effect=fake_run):
             p = cli_admin.build_parser()
             ns = p.parse_args(["--config-db", db_path, "--yes", "sync", "synctest", "--apply"])
-            os.environ["BILIPOD_RSS_PUBLISH"] = "/tmp/test-publish.sh"
+            os.environ["BILIBILI_PODCAST_RSS_PUBLISH"] = "/tmp/test-publish.sh"
             cli_admin.cmd_sync(ns)
     assert side_effects["first"] is False
 
@@ -769,7 +769,7 @@ def _create_minimal_series(db_path: str) -> None:
 
 
 def test_crontab_excludes_disabled_schedule(tmp_path: Path) -> None:
-    """bilipod-crontab must exclude enabled=0 schedules from generated crontab."""
+    """bilibili-podcast-crontab must exclude enabled=0 schedules from generated crontab."""
     import subprocess
     import sqlite3
 
@@ -783,12 +783,12 @@ def test_crontab_excludes_disabled_schedule(tmp_path: Path) -> None:
     conn.commit()
     conn.close()
 
-    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
     )
-    assert result.returncode == 0, f"bilipod-crontab failed:\nstdout:{result.stdout}\nstderr:{result.stderr}"
+    assert result.returncode == 0, f"bilibili-podcast-crontab failed:\nstdout:{result.stdout}\nstderr:{result.stderr}"
     assert "15 3" in result.stdout, \
         "enabled schedule should appear in crontab"
     assert "0 6" not in result.stdout, \
@@ -806,7 +806,7 @@ def test_crontab_rejects_retry_schedule(tmp_path: Path) -> None:
         conn.execute("INSERT INTO cron_schedule(series,schedule,kind) VALUES('retrycron','0 3 * * *','primary')")
         conn.execute("INSERT INTO cron_schedule(series,schedule,kind) VALUES('retrycron','0 5 * * *','retry')")
 
-    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path,
          "--script-dir", str(tmp_path / "auto"), "--print"],
@@ -817,19 +817,19 @@ def test_crontab_rejects_retry_schedule(tmp_path: Path) -> None:
 
 
 def test_crontab_database_failure_does_not_write_scheduler_files(tmp_path: Path) -> None:
-    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
     wrapper_dir = tmp_path / "auto"
     result = subprocess.run(
         [
             sys.executable, crontab_script,
-            "--config-db", str(tmp_path / "missing" / "bilipod.db"),
+            "--config-db", str(tmp_path / "missing" / "bilibili-podcast.db"),
             "--script-dir", str(wrapper_dir),
             "--apply",
         ],
         capture_output=True,
         text=True,
         timeout=30,
-        env={"BILIPOD_CONFIG_ROOT": str(tmp_path / "config")},
+        env={"BILIBILI_PODCAST_CONFIG_ROOT": str(tmp_path / "config")},
     )
 
     assert result.returncode == 2
@@ -840,7 +840,7 @@ def test_crontab_database_failure_does_not_write_scheduler_files(tmp_path: Path)
 def test_crontab_read_failure_never_writes_replacement(monkeypatch) -> None:
     import runpy
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
     module = runpy.run_path(str(script))
     calls = []
 
@@ -850,7 +850,7 @@ def test_crontab_read_failure_never_writes_replacement(monkeypatch) -> None:
 
     monkeypatch.setattr(subprocess, "run", failed_read)
     with pytest.raises(RuntimeError, match="cannot read existing crontab"):
-        module["merge_with_existing_crontab"]("0 1 * * * /new\n", "bilipod")
+        module["merge_with_existing_crontab"]("0 1 * * * /new\n", "bilibili-podcast")
     assert len(calls) == 1
 
     generated = MagicMock()
@@ -863,7 +863,7 @@ def test_crontab_read_failure_never_writes_replacement(monkeypatch) -> None:
         lambda *_: (_ for _ in ()).throw(RuntimeError("cannot read existing crontab")),
     )
     monkeypatch.setitem(module, "generate_wrapper_script", generated)
-    monkeypatch.delenv("BILIPOD_CONFIG_ROOT", raising=False)
+    monkeypatch.delenv("BILIBILI_PODCAST_CONFIG_ROOT", raising=False)
     monkeypatch.setattr(sys, "argv", [
         str(script), "--config-db", "/tmp/test.db", "--script-dir", "/tmp/wrappers",
         "--apply",
@@ -875,7 +875,7 @@ def test_crontab_read_failure_never_writes_replacement(monkeypatch) -> None:
 
 
 def test_crontab_derived_schedule_is_stable_across_hash_seeds() -> None:
-    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
     code = (
         "import runpy; "
         f"m=runpy.run_path({str(script)!r}); "
@@ -895,7 +895,7 @@ def test_crontab_derived_schedule_is_stable_across_hash_seeds() -> None:
 
 
 def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:
-    """bilipod-crontab must not let a title break the auto block marker."""
+    """bilibili-podcast-crontab must not let a title break the auto block marker."""
     import sqlite3
 
     db_path = _migrate(tmp_path)
@@ -903,14 +903,14 @@ def test_crontab_marker_title_is_single_line(tmp_path: Path) -> None:
         conn.execute("INSERT INTO series(series,title,author) VALUES('marker','Line One\nLine Two','T')")
         conn.execute("INSERT INTO cron_schedule(series,schedule) VALUES('marker','15 3 * * *')")
 
-    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
     )
 
     assert result.returncode == 0
-    assert "# BEGIN BILIPOD AUTO - marker (Line One Line Two)" in result.stdout
+    assert "# BEGIN BILIBILI_PODCAST AUTO - marker (Line One Line Two)" in result.stdout
 
 
 def test_crontab_excludes_systemd_backend_without_disabling_schedule(tmp_path: Path) -> None:
@@ -925,7 +925,7 @@ def test_crontab_excludes_systemd_backend_without_disabling_schedule(tmp_path: P
         conn.execute("INSERT INTO cron_schedule(series,schedule) VALUES('systemdonly','15 3 * * *')")
         db.set_scheduler_backend(conn, "systemdonly", "systemd")
 
-    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab")
+    crontab_script = str(Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab")
     result = subprocess.run(
         [sys.executable, crontab_script, "--config-db", db_path, "--print"],
         capture_output=True, text=True, timeout=30,
@@ -943,13 +943,13 @@ def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
     """A manual comment mentioning the marker must not be treated as an auto block."""
     import runpy
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
     module = runpy.run_path(str(script))
     existing = (
-        "# manual note: # BEGIN BILIPOD AUTO - demo\n"
-        "# BEGIN BILIPOD AUTO - old (Old)\n"
+        "# manual note: # BEGIN BILIBILI_PODCAST AUTO - demo\n"
+        "# BEGIN BILIBILI_PODCAST AUTO - old (Old)\n"
         "0 1 * * * /old\n"
-        "# END BILIPOD AUTO\n"
+        "# END BILIBILI_PODCAST AUTO\n"
     )
     monkeypatch.setattr(
         subprocess,
@@ -958,13 +958,13 @@ def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
     )
 
     merged = module["merge_with_existing_crontab"](
-        "# BEGIN BILIPOD AUTO - new (New)\n0 2 * * * /new\n# END BILIPOD AUTO\n",
+        "# BEGIN BILIBILI_PODCAST AUTO - new (New)\n0 2 * * * /new\n# END BILIBILI_PODCAST AUTO\n",
         "",
     )
 
     assert "# manual note:" in merged
-    assert "BILIPOD AUTO - old" not in merged
-    assert "BILIPOD AUTO - new" in merged
+    assert "BILIBILI_PODCAST AUTO - old" not in merged
+    assert "BILIBILI_PODCAST AUTO - new" in merged
 
 
 def test_crontab_systemd_timer_detection(monkeypatch, tmp_path: Path) -> None:
@@ -977,7 +977,7 @@ def test_crontab_systemd_timer_detection(monkeypatch, tmp_path: Path) -> None:
         conn.execute("INSERT INTO series(series,title,author) VALUES('demo','Demo','A')")
         conn.execute("INSERT INTO cron_schedule(series,schedule) VALUES('demo','15 3 * * *')")
 
-    script = Path(__file__).resolve().parent.parent / "scripts" / "bilipod-crontab"
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
     module = runpy.run_path(str(script))
     monkeypatch.setattr(
         subprocess,
@@ -1043,8 +1043,8 @@ def test_paid_attach_media_rejects_bad_extension(tmp_path: Path) -> None:
     bad_file = allow_dir / "bad.txt"
     bad_file.write_text("not an audio file")
 
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allow_dir)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allow_dir)
     try:
         p = cli_admin.build_parser()
         ns = p.parse_args(["--config-db", db_path, "paid", "attach-media", "synctest",
@@ -1055,9 +1055,9 @@ def test_paid_attach_media_rejects_bad_extension(tmp_path: Path) -> None:
             cli_admin.cmd_paid_attach_media(ns)
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_paid_attach_media_success(tmp_path: Path) -> None:
@@ -1076,8 +1076,8 @@ def test_paid_attach_media_success(tmp_path: Path) -> None:
     bvid = "BV0000000003"
     target = media_root / "synctest" / f"{bvid}_64K.mp3"
 
-    original_dirs = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allow_dir)
+    original_dirs = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allow_dir)
     try:
         p = cli_admin.build_parser()
         ns = p.parse_args(["--config-db", db_path, "paid", "attach-media", "synctest",
@@ -1089,9 +1089,9 @@ def test_paid_attach_media_success(tmp_path: Path) -> None:
         assert oct(target.stat().st_mode)[-3:] == "644"
     finally:
         if original_dirs is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = original_dirs
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = original_dirs
 
 
 def test_manual_media_skips_download(tmp_path: Path) -> None:
@@ -1130,8 +1130,8 @@ def test_paid_attach_media_replace_allowed(tmp_path: Path) -> None:
     target = series_dir / f"{bvid}_64K.mp3"
     target.write_text("old content")  # pre-existing
 
-    original_dirs = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allow_dir)
+    original_dirs = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allow_dir)
     try:
         p = cli_admin.build_parser()
         ns = p.parse_args(["--config-db", db_path, "paid", "attach-media", "synctest",
@@ -1142,9 +1142,9 @@ def test_paid_attach_media_replace_allowed(tmp_path: Path) -> None:
         assert target.read_text() == "new content", "should be overwritten with new content"
     finally:
         if original_dirs is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = original_dirs
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = original_dirs
 
 
 def test_paid_attach_media_rejects_overwrite_without_flag(tmp_path: Path) -> None:
@@ -1166,8 +1166,8 @@ def test_paid_attach_media_rejects_overwrite_without_flag(tmp_path: Path) -> Non
     target = series_dir / f"{bvid}_64K.mp3"
     target.write_text("old content")
 
-    original_dirs = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allow_dir)
+    original_dirs = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allow_dir)
     try:
         p = cli_admin.build_parser()
         ns = p.parse_args(["--config-db", db_path, "paid", "attach-media", "synctest",
@@ -1179,9 +1179,9 @@ def test_paid_attach_media_rejects_overwrite_without_flag(tmp_path: Path) -> Non
         assert target.read_text() == "old content", "must not overwrite"
     finally:
         if original_dirs is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = original_dirs
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = original_dirs
 
 
 # ── 5.1: paid/manual quality 192K tests ─────────────────────────────
@@ -1207,8 +1207,8 @@ def test_paid_attach_media_192K_quality(tmp_path: Path) -> None:
     bvid = "BV192K000001"
     media_root = tmp_path / "media"
 
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allow_dir)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allow_dir)
     try:
         p = cli_admin.build_parser()
         ns = p.parse_args(["--config-db", db_path, "paid", "attach-media", "synctest",
@@ -1221,9 +1221,9 @@ def test_paid_attach_media_192K_quality(tmp_path: Path) -> None:
         assert not target_64.exists(), "_64K.mp3 should not exist"
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_paid_list_missing_192K(tmp_path: Path) -> None:
@@ -1431,7 +1431,7 @@ def test_paid_add_item_converts_media_and_writes_single_metadata(tmp_path: Path,
     upload_dir.mkdir()
     src = upload_dir / "input.mp4"
     src.write_text("video")
-    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
     bvid = "BV1234567892"
 
     def fake_run(cmd, **kwargs):
@@ -1489,7 +1489,7 @@ def test_paid_add_item_existing_media_fails_before_network_or_transcode(tmp_path
     upload_dir.mkdir()
     src = upload_dir / "input.mp4"
     src.write_text("video")
-    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
     bvid = "BV1234567893"
     target = tmp_path / "media" / "manualexists" / f"{bvid}_64K.mp3"
     target.parent.mkdir(parents=True)
@@ -1528,7 +1528,7 @@ def test_paid_add_item_metadata_failure_cleans_new_media(tmp_path: Path, monkeyp
     upload_dir.mkdir()
     src = upload_dir / "input.mp3"
     src.write_bytes(b"new-media")
-    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
     bvid = "BV1234567894"
 
     def fake_run(cmd, **kwargs):
@@ -1576,7 +1576,7 @@ def test_paid_add_item_rebuild_failure_restores_replaced_files(tmp_path: Path, m
     upload_dir.mkdir()
     src = upload_dir / "input.mp3"
     src.write_bytes(b"new-media")
-    monkeypatch.setenv("BILIPOD_MANUAL_MEDIA_DIRS", str(upload_dir))
+    monkeypatch.setenv("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", str(upload_dir))
     bvid = "BV1234567895"
     media_file = tmp_path / "media" / "manualrestore" / f"{bvid}_64K.mp3"
     json_file = tmp_path / "json" / "manualrestore" / f"{bvid}_64K.info.json"
@@ -1629,7 +1629,7 @@ def test_paid_refresh_metadata_writes_192K_json(tmp_path: Path, monkeypatch) -> 
     from bilibili_podcast import cli_admin as ca
     from bilibili_podcast import db as _db
 
-    monkeypatch.delenv("BILIPOD_COOKIE_FILE", raising=False)
+    monkeypatch.delenv("BILIBILI_PODCAST_COOKIE_FILE", raising=False)
     db_path = _migrate(tmp_path)
     with _db.transaction(db_path) as conn:
         conn.execute("INSERT INTO series(series,title,author) VALUES('ref192','Ref192','T')")
@@ -1657,7 +1657,7 @@ def test_paid_refresh_metadata_single_item(tmp_path: Path, monkeypatch, target_f
     from bilibili_podcast import cli_admin as ca
     from bilibili_podcast import db as _db
 
-    monkeypatch.delenv("BILIPOD_COOKIE_FILE", raising=False)
+    monkeypatch.delenv("BILIBILI_PODCAST_COOKIE_FILE", raising=False)
     db_path = _migrate(tmp_path)
     with _db.transaction(db_path) as conn:
         conn.execute("INSERT INTO series(series,title,author) VALUES('singlemeta','Single','T')")
@@ -1701,53 +1701,53 @@ def test_paid_refresh_metadata_rejects_bvid_and_url_together() -> None:
 
 
 def test_get_allowed_dirs_rejects_root():
-    """BILIPOD_MANUAL_MEDIA_DIRS=/ must be rejected."""
+    """BILIBILI_PODCAST_MANUAL_MEDIA_DIRS=/ must be rejected."""
     import os
     from bilibili_podcast.cli_admin import _get_allowed_media_dirs
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = "/"
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = "/"
     try:
         dirs = _get_allowed_media_dirs()
         assert dirs == [], f"/ should be rejected, got {dirs}"
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_get_allowed_dirs_rejects_broad_root():
-    """BILIPOD_MANUAL_MEDIA_DIRS=/data must be rejected (only 2 levels)."""
+    """BILIBILI_PODCAST_MANUAL_MEDIA_DIRS=/data must be rejected (only 2 levels)."""
     import os
     from bilibili_podcast.cli_admin import _get_allowed_media_dirs
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = "/data"
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = "/data"
     try:
         dirs = _get_allowed_media_dirs()
         assert dirs == [], f"/data should be rejected, got {dirs}"
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_get_allowed_dirs_accepts_deep_path(tmp_path):
-    """BILIPOD_MANUAL_MEDIA_DIRS=/a/b/c must be accepted."""
+    """BILIBILI_PODCAST_MANUAL_MEDIA_DIRS=/a/b/c must be accepted."""
     import os
     from bilibili_podcast.cli_admin import _get_allowed_media_dirs
     test_dir = tmp_path / "a" / "b" / "c"
     test_dir.mkdir(parents=True)
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(test_dir)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(test_dir)
     try:
         dirs = _get_allowed_media_dirs()
         assert any(d == test_dir for d in dirs), f"expected {test_dir}, got {dirs}"
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_is_allowed_path_inside_allowed_dir(tmp_path):
@@ -1759,15 +1759,15 @@ def test_is_allowed_path_inside_allowed_dir(tmp_path):
     allowed.mkdir()
     f = allowed / "test.mp3"
     f.write_text("x")
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allowed)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allowed)
     try:
         assert is_allowed_manual_media_path(f) is True
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_is_allowed_path_outside_allowed_dir(tmp_path):
@@ -1781,15 +1781,15 @@ def test_is_allowed_path_outside_allowed_dir(tmp_path):
     outside.mkdir()
     f = outside / "test.mp3"
     f.write_text("x")
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allowed)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allowed)
     try:
         assert is_allowed_manual_media_path(f) is False
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_is_allowed_path_prefix_mismatch(tmp_path):
@@ -1802,15 +1802,15 @@ def test_is_allowed_path_prefix_mismatch(tmp_path):
     f = tmp_path / "allowed2" / "test.mp3"
     f.parent.mkdir(parents=True)
     f.write_text("x")
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allowed)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allowed)
     try:
         assert is_allowed_manual_media_path(f) is False
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 def test_is_allowed_path_rejects_symlink_escape(tmp_path):
@@ -1829,16 +1829,16 @@ def test_is_allowed_path_rejects_symlink_escape(tmp_path):
     symlink = allowed / "escape.mp3"
     symlink.symlink_to(real_file)
 
-    orig = os.environ.get("BILIPOD_MANUAL_MEDIA_DIRS")
-    os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = str(allowed)
+    orig = os.environ.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")
+    os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = str(allowed)
     try:
         assert is_allowed_manual_media_path(symlink) is False, \
             "symlink to outside file must be rejected"
     finally:
         if orig is None:
-            del os.environ["BILIPOD_MANUAL_MEDIA_DIRS"]
+            del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
         else:
-            os.environ["BILIPOD_MANUAL_MEDIA_DIRS"] = orig
+            os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"] = orig
 
 
 # ── add --url 非交互模式本地 UID 解析 ────────────────────────────────

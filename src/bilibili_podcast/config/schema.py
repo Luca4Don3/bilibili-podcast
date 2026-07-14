@@ -24,34 +24,34 @@ class FieldSpec:
 
 
 APP_FIELDS = (
-    FieldSpec("database.path", str, required=True, owner="app", legacy_aliases=("BILIPOD_CONFIG_DB",)),
-    FieldSpec("paths.media_root", str, required=True, owner="app", legacy_aliases=("BILIPOD_MEDIA_ROOT",)),
-    FieldSpec("paths.json_root", str, required=True, owner="app", legacy_aliases=("BILIPOD_JSON_ROOT",)),
-    FieldSpec("paths.rss_root", str, required=True, owner="app", legacy_aliases=("BILIPOD_RSS_ROOT",)),
-    FieldSpec("paths.published_rss_root", str, required=True, owner="app", legacy_aliases=("BILIPOD_PUBLISHED_RSS_ROOT",)),
-    FieldSpec("paths.state_root", str, required=True, owner="app", legacy_aliases=("BILIPOD_STATE_ROOT",)),
-    FieldSpec("paths.log_dir", str, required=True, owner="app", legacy_aliases=("BILIPOD_LOG_DIR",)),
-    FieldSpec("paths.secrets_dir", str, required=True, owner="app", legacy_aliases=("BILIPOD_SECRETS_DIR",)),
-    FieldSpec("install.app_dir", str, required=True, owner="app", legacy_aliases=("BILIPOD_APP_DIR",)),
-    FieldSpec("install.venv_bin", str, required=True, owner="app", legacy_aliases=("BILIPOD_VENV_BIN",)),
-    FieldSpec("executables.sync", str, required=True, owner="app", legacy_aliases=("BILIPOD_SYNC_PATH",)),
+    FieldSpec("database.path", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_CONFIG_DB",)),
+    FieldSpec("paths.media_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_MEDIA_ROOT",)),
+    FieldSpec("paths.json_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_JSON_ROOT",)),
+    FieldSpec("paths.rss_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_RSS_ROOT",)),
+    FieldSpec("paths.published_rss_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_PUBLISHED_RSS_ROOT",)),
+    FieldSpec("paths.state_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_STATE_ROOT",)),
+    FieldSpec("paths.log_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_LOG_DIR",)),
+    FieldSpec("paths.secrets_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_SECRETS_DIR",)),
+    FieldSpec("install.app_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_APP_DIR",)),
+    FieldSpec("install.venv_bin", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_VENV_BIN",)),
+    FieldSpec("executables.sync", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_SYNC_PATH",)),
     FieldSpec("executables.ffmpeg", str, "ffmpeg", owner="app"),
-    FieldSpec("executables.bilipod_config", str, "bilipod-config", owner="app"),
+    FieldSpec("executables.bilibili_podcast_config", str, "bilibili-podcast-config", owner="app"),
 )
 
 SYNC_FIELDS = (
     FieldSpec("downloads.max_per_run", int, 20, minimum=0, owner="sync"),
     FieldSpec("downloads.scheduled_max_per_run", int, 1, minimum=0, owner="sync"),
-    FieldSpec("downloads.min_free_gb", (int, float), 5.0, minimum=0, owner="sync", legacy_aliases=("BILIPOD_MIN_FREE_GB",)),
-    FieldSpec("paths.cookie_file", str, required=True, sensitive=True, owner="sync", legacy_aliases=("BILIPOD_COOKIE_FILE",)),
-    FieldSpec("paths.lock_file", str, required=True, owner="sync", legacy_aliases=("BILIPOD_LOCK_FILE",)),
-    FieldSpec("browser.user_data_root", str, required=True, owner="sync", legacy_aliases=("BILIPOD_BROWSER_USER_DATA_ROOT",)),
+    FieldSpec("downloads.min_free_gb", (int, float), 5.0, minimum=0, owner="sync", legacy_aliases=("BILIBILI_PODCAST_MIN_FREE_GB",)),
+    FieldSpec("paths.cookie_file", str, required=True, sensitive=True, owner="sync", legacy_aliases=("BILIBILI_PODCAST_COOKIE_FILE",)),
+    FieldSpec("paths.lock_file", str, required=True, owner="sync", legacy_aliases=("BILIBILI_PODCAST_LOCK_FILE",)),
+    FieldSpec("browser.user_data_root", str, required=True, owner="sync", legacy_aliases=("BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT",)),
     FieldSpec("browser.playwright_browsers_path", str, required=True, owner="sync", legacy_aliases=("PLAYWRIGHT_BROWSERS_PATH",)),
     FieldSpec("browser.login_wait_seconds", (int, float), 5.0, minimum=0, owner="sync"),
     FieldSpec("timeouts.sync_seconds", int, 300, minimum=1, owner="sync"),
     FieldSpec("timeouts.preview_seconds", int, 120, minimum=1, owner="sync"),
     FieldSpec("timeouts.publish_seconds", int, 60, minimum=1, owner="sync"),
-    FieldSpec("logging.level", str, "INFO", owner="sync", legacy_aliases=("BILIPOD_SYNC_LOG_LEVEL",)),
+    FieldSpec("logging.level", str, "INFO", owner="sync", legacy_aliases=("BILIBILI_PODCAST_SYNC_LOG_LEVEL",)),
     FieldSpec("logging.retention_days", int, 30, minimum=0, owner="sync"),
     FieldSpec("logging.max_bytes", int, 20971520, minimum=1, owner="sync"),
     FieldSpec("logging.backup_count", int, 10, minimum=0, owner="sync"),
@@ -61,33 +61,34 @@ WEB_FIELDS = (
     FieldSpec("server.enabled", bool, False, owner="web"),
     FieldSpec("server.host", str, "127.0.0.1", owner="web"),
     FieldSpec("server.port", int, 8000, minimum=1, maximum=65535, owner="web"),
-    FieldSpec("security.password", str, "", sensitive=True, owner="web", legacy_aliases=("BILIPOD_WEB_PASSWORD",)),
-    FieldSpec("security.https", bool, False, owner="web", legacy_aliases=("BILIPOD_HTTPS",)),
-    FieldSpec("security.cookie_name", str, "bilipod_session", owner="web"),
+    FieldSpec("security.password", str, "", sensitive=True, owner="web", legacy_aliases=("BILIBILI_PODCAST_WEB_PASSWORD",)),
+    FieldSpec("security.https", bool, False, owner="web", legacy_aliases=("BILIBILI_PODCAST_HTTPS",)),
+    FieldSpec("security.cookie_name", str, "bilibili_podcast_session", owner="web"),
+    FieldSpec("security.previous_cookie_names", list, [], owner="web"),
     FieldSpec("security.session_max_age_seconds", int, 86400, minimum=1, owner="web"),
 )
 
 SCHEDULER_FIELDS = (
-    FieldSpec("runtime.user", str, "bilipod", owner="scheduler"),
-    FieldSpec("runtime.group", str, "bilipod", owner="scheduler"),
-    FieldSpec("paths.systemd_dir", str, required=True, owner="scheduler", legacy_aliases=("BILIPOD_SYSTEMD_DIR",)),
-    FieldSpec("paths.cron_script_dir", str, required=True, owner="scheduler", legacy_aliases=("BILIPOD_CRON_SCRIPT_DIR",)),
+    FieldSpec("runtime.user", str, "bilibili-podcast", owner="scheduler"),
+    FieldSpec("runtime.group", str, "bilibili-podcast", owner="scheduler"),
+    FieldSpec("paths.systemd_dir", str, required=True, owner="scheduler", legacy_aliases=("BILIBILI_PODCAST_SYSTEMD_DIR",)),
+    FieldSpec("paths.cron_script_dir", str, required=True, owner="scheduler", legacy_aliases=("BILIBILI_PODCAST_CRON_SCRIPT_DIR",)),
     FieldSpec("paths.wrapper_dir", str, required=True, owner="scheduler"),
-    FieldSpec("units.web", str, "bilipod-web.service", owner="scheduler"),
-    FieldSpec("units.sync_glob", str, "bilipod-sync@*.service", owner="scheduler"),
+    FieldSpec("units.web", str, "bilibili-podcast-web.service", owner="scheduler"),
+    FieldSpec("units.sync_glob", str, "bilibili-podcast-sync@*.service", owner="scheduler"),
     FieldSpec("timeouts.command_seconds", int, 30, minimum=1, owner="scheduler"),
 )
 
 PUBLISH_FIELDS = (
     FieldSpec("publish.enabled", bool, False, owner="publish"),
-    FieldSpec("publish.media_base_url", str, "", owner="publish", legacy_aliases=("BILIPOD_MEDIA_BASE_URL",)),
-    FieldSpec("publish.script", str, "", owner="publish", legacy_aliases=("BILIPOD_RSS_PUBLISH", "BILIPOD_RSS_PUBLISH_SCRIPT")),
+    FieldSpec("publish.media_base_url", str, "", owner="publish", legacy_aliases=("BILIBILI_PODCAST_MEDIA_BASE_URL",)),
     FieldSpec("publish.master_placeholder", str, "__MEDIA_PLACEHOLDER__", owner="publish"),
+    FieldSpec("publish.gone_series", list, [], owner="publish"),
 )
 
 MANUAL_MEDIA_FIELDS = (
     FieldSpec("manual_media.enabled", bool, False, owner="manual-media"),
-    FieldSpec("manual_media.allowed_dirs", list, [], owner="manual-media", legacy_aliases=("BILIPOD_MANUAL_MEDIA_DIRS",)),
+    FieldSpec("manual_media.allowed_dirs", list, [], owner="manual-media", legacy_aliases=("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS",)),
     FieldSpec("manual_media.follow_symlinks", bool, False, owner="manual-media"),
 )
 
@@ -112,14 +113,14 @@ LEGACY_ENV_MAP = {
     for alias in spec.legacy_aliases
 }
 LEGACY_INPUT_ONLY = {
-    "BILIPOD_ENV_FILE", "BILIPOD_WEB_ENV_FILE", "BILIPOD_WEB_UNIT",
-    "BILIPOD_SYNC_UNIT_GLOB",
+    "BILIBILI_PODCAST_ENV_FILE", "BILIBILI_PODCAST_WEB_ENV_FILE", "BILIBILI_PODCAST_WEB_UNIT",
+    "BILIBILI_PODCAST_SYNC_UNIT_GLOB",
 }
 REMOVED_LEGACY_ENV = {
-    "BILIPOD_RSYNC_HOST", "BILIPOD_RSYNC_PORT", "BILIPOD_RSYNC_USER",
-    "BILIPOD_RSYNC_SECRET", "BILIPOD_RSYNC_RSS_SRC", "RSYNC_PASSWORD",
+    "BILIBILI_PODCAST_RSYNC_HOST", "BILIBILI_PODCAST_RSYNC_PORT", "BILIBILI_PODCAST_RSYNC_USER",
+    "BILIBILI_PODCAST_RSYNC_SECRET", "BILIBILI_PODCAST_RSYNC_RSS_SRC", "RSYNC_PASSWORD",
 }
-RUN_CONTROL_ENV = {"FORCE", "DEBUG", "SMOKE_SYNC", "PATH", "BILIPOD_CONFIG_ROOT"}
+RUN_CONTROL_ENV = {"FORCE", "DEBUG", "SMOKE_SYNC", "PATH", "BILIBILI_PODCAST_CONFIG_ROOT"}
 CRON_COMPAT_ENV = {"MAX_DOWNLOADS_PER_RUN", "LOG_LEVEL"}
 
 

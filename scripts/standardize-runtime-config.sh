@@ -11,18 +11,18 @@ elif [ -n "${1:-}" ]; then
     exit 2
 fi
 
-: "${BILIPOD_CONFIG_ROOT:?BILIPOD_CONFIG_ROOT is required}"
-: "${BILIPOD_ENV_FILE:?BILIPOD_ENV_FILE is required as legacy migration input}"
-: "${BILIPOD_WEB_ENV_FILE:?BILIPOD_WEB_ENV_FILE is required as legacy migration input}"
-: "${BILIPOD_LEGACY_SERIES_DIR:?BILIPOD_LEGACY_SERIES_DIR is required}"
+: "${BILIBILI_PODCAST_CONFIG_ROOT:?BILIBILI_PODCAST_CONFIG_ROOT is required}"
+: "${BILIBILI_PODCAST_ENV_FILE:?BILIBILI_PODCAST_ENV_FILE is required as legacy migration input}"
+: "${BILIBILI_PODCAST_WEB_ENV_FILE:?BILIBILI_PODCAST_WEB_ENV_FILE is required as legacy migration input}"
+: "${BILIBILI_PODCAST_LEGACY_SERIES_DIR:?BILIBILI_PODCAST_LEGACY_SERIES_DIR is required}"
 : "${RSS_USERS_CONF:?RSS_USERS_CONF is required as legacy migration input}"
 
-cmd=(bilipod-config migrate
-    --legacy-env "$BILIPOD_ENV_FILE"
-    --legacy-web-env "$BILIPOD_WEB_ENV_FILE"
-    --legacy-series-dir "$BILIPOD_LEGACY_SERIES_DIR"
+cmd=(bilibili-podcast-config migrate
+    --legacy-env "$BILIBILI_PODCAST_ENV_FILE"
+    --legacy-web-env "$BILIBILI_PODCAST_WEB_ENV_FILE"
+    --legacy-series-dir "$BILIBILI_PODCAST_LEGACY_SERIES_DIR"
     --legacy-rss-users "$RSS_USERS_CONF"
-    --output-root "$BILIPOD_CONFIG_ROOT")
+    --output-root "$BILIBILI_PODCAST_CONFIG_ROOT")
 
 if [ "$APPLY" != true ]; then
     "${cmd[@]}"
@@ -33,9 +33,9 @@ fi
 cmd+=(--apply)
 "${cmd[@]}"
 
-clean_env=(env -i PATH="$PATH" HOME="${HOME:-/tmp}" BILIPOD_CONFIG_ROOT="$BILIPOD_CONFIG_ROOT")
-"${clean_env[@]}" bilipod-config validate
-CONFIG_JSON="$("${clean_env[@]}" bilipod-config show --format json)"
+clean_env=(env -i PATH="$PATH" HOME="${HOME:-/tmp}" BILIBILI_PODCAST_CONFIG_ROOT="$BILIBILI_PODCAST_CONFIG_ROOT")
+"${clean_env[@]}" bilibili-podcast-config validate
+CONFIG_JSON="$("${clean_env[@]}" bilibili-podcast-config show --format json)"
 
 config_value() {
     python3 -c '
@@ -58,7 +58,7 @@ WEB_UNIT="$(config_value scheduler.units.web)"
 SYNC_UNIT_GLOB="$(config_value scheduler.units.sync_glob)"
 SYNC_UNIT_PREFIX="${SYNC_UNIT_GLOB%%\**}"
 SYNC_UNIT_SUFFIX="${SYNC_UNIT_GLOB#*\*}"
-BACKUP_DIR="$(mktemp -d "$BILIPOD_CONFIG_ROOT/.backups/standardize-XXXXXXXX")"
+BACKUP_DIR="$(mktemp -d "$BILIBILI_PODCAST_CONFIG_ROOT/.backups/standardize-XXXXXXXX")"
 chmod 700 "$BACKUP_DIR"
 
 restore_units_on_error() {
@@ -80,10 +80,10 @@ write_web_unit() {
         return 1
     fi
     cp "$unit" "$BACKUP_DIR/$(basename "$unit")"
-    temp="$(mktemp "$SYSTEMD_DIR/.bilipod-web.XXXXXXXX")"
+    temp="$(mktemp "$SYSTEMD_DIR/.bilibili-podcast-web.XXXXXXXX")"
     {
         echo "[Unit]"
-        echo "Description=Bilipod Web Manager"
+        echo "Description=Bilibili Podcast Web Manager"
         echo "After=network.target"
         echo
         echo "[Service]"
@@ -91,8 +91,8 @@ write_web_unit() {
         echo "User=$SERVICE_USER"
         echo "Group=$SERVICE_GROUP"
         echo "WorkingDirectory=$APP_DIR"
-        echo "Environment=\"BILIPOD_CONFIG_ROOT=$BILIPOD_CONFIG_ROOT\""
-        echo "ExecStart=$VENV_BIN/bilipod-web"
+        echo "Environment=\"BILIBILI_PODCAST_CONFIG_ROOT=$BILIBILI_PODCAST_CONFIG_ROOT\""
+        echo "ExecStart=$VENV_BIN/bilibili-podcast-web"
         echo "Restart=on-failure"
         echo
         echo "[Install]"
@@ -118,7 +118,7 @@ write_sync_unit() {
     temp="$(mktemp "$SYSTEMD_DIR/.${name}.XXXXXXXX")"
     {
         echo "[Unit]"
-        echo "Description=Bilipod Sync — $series"
+        echo "Description=Bilibili Podcast Sync — $series"
         echo "After=network.target"
         echo
         echo "[Service]"
@@ -126,7 +126,7 @@ write_sync_unit() {
         echo "User=$SERVICE_USER"
         echo "Group=$SERVICE_GROUP"
         echo "WorkingDirectory=$APP_DIR"
-        echo "Environment=\"BILIPOD_CONFIG_ROOT=$BILIPOD_CONFIG_ROOT\""
+        echo "Environment=\"BILIBILI_PODCAST_CONFIG_ROOT=$BILIBILI_PODCAST_CONFIG_ROOT\""
         echo "ExecStart=$SYNC_BIN --series $series --max-downloads-per-run $MAX_DOWNLOADS --token __MEDIA_PLACEHOLDER__ --apply"
         echo "Restart=no"
         echo "TimeoutStartSec=1800"
@@ -149,7 +149,7 @@ find "$BACKUP_DIR" -type f ! -name SHA256SUMS -exec shasum -a 256 {} \; > "$BACK
 if [ -s "$BACKUP_DIR/SHA256SUMS" ]; then
     shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"
 fi
-"${clean_env[@]}" bilipod-config validate
+"${clean_env[@]}" bilibili-podcast-config validate
 trap - ERR
 
 echo "Unified configuration and canonical units written."

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy Bilipod from one validated BILIPOD_CONFIG_ROOT.
+# Deploy Bilibili Podcast from one validated BILIBILI_PODCAST_CONFIG_ROOT.
 # Dry-run is the default; --apply performs backups, code/dependency update,
 # config validation, and scheduler regeneration. It never restarts services.
 
@@ -13,21 +13,21 @@ elif [ -n "${1:-}" ]; then
     exit 2
 fi
 
-if [ -z "${BILIPOD_CONFIG_ROOT:-}" ]; then
-    echo "ERROR: BILIPOD_CONFIG_ROOT is required" >&2
+if [ -z "${BILIBILI_PODCAST_CONFIG_ROOT:-}" ]; then
+    echo "ERROR: BILIBILI_PODCAST_CONFIG_ROOT is required" >&2
     exit 2
 fi
-if ! command -v bilipod-config >/dev/null 2>&1; then
-    echo "ERROR: bilipod-config is required for deployment bootstrap" >&2
+if ! command -v bilibili-podcast-config >/dev/null 2>&1; then
+    echo "ERROR: bilibili-podcast-config is required for deployment bootstrap" >&2
     exit 2
 fi
-if [ ! -d "$BILIPOD_CONFIG_ROOT" ]; then
-    echo "ERROR: BILIPOD_CONFIG_ROOT does not exist" >&2
+if [ ! -d "$BILIBILI_PODCAST_CONFIG_ROOT" ]; then
+    echo "ERROR: BILIBILI_PODCAST_CONFIG_ROOT does not exist" >&2
     exit 2
 fi
 
-CONFIG_ROOT="$(cd "$BILIPOD_CONFIG_ROOT" && pwd)"
-CONFIG_JSON="$(bilipod-config show --format json)"
+CONFIG_ROOT="$(cd "$BILIBILI_PODCAST_CONFIG_ROOT" && pwd)"
+CONFIG_JSON="$(bilibili-podcast-config show --format json)"
 
 config_value() {
     python3 -c '
@@ -56,13 +56,13 @@ BACKUP_PARENT="$CONFIG_ROOT/.backups"
 BACKUP_TEMPLATE="$BACKUP_PARENT/deploy-$(date +%Y%m%d_%H%M%S)-XXXXXXXX"
 BACKUP_DIR="$BACKUP_TEMPLATE"
 
-echo "Bilipod unified deployment"
+echo "Bilibili Podcast unified deployment"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
 echo "  config root: $CONFIG_ROOT"
 echo "  code dir: $CODE_DIR"
 echo "  database: $DB_PATH"
 
-bilipod-config validate
+bilibili-podcast-config validate
 
 if [ ! -d "$CODE_DIR/.git" ]; then
     echo "ERROR: configured app.install.app_dir is not a Git repository" >&2
@@ -82,7 +82,7 @@ echo "  1. back up TOML, SQLite, systemd units, and wrappers to $BACKUP_DIR"
 echo "  2. git pull --ff-only in $CODE_DIR"
 echo "  3. install the project using the configured virtualenv"
 echo "  4. validate config and compile Python sources"
-echo "  5. regenerate cron wrappers using only BILIPOD_CONFIG_ROOT"
+echo "  5. regenerate cron wrappers using only BILIBILI_PODCAST_CONFIG_ROOT"
 echo "  6. leave all services stopped/running exactly as they are"
 
 if [ "$APPLY" != true ]; then
@@ -106,8 +106,8 @@ for unit in \
     "$SYSTEMD_DIR/$WEB_UNIT" \
     "$SYSTEMD_DIR"/$SYNC_UNIT_GLOB \
     "$SYSTEMD_DIR"/$SYNC_TIMER_GLOB \
-    "$SYSTEMD_DIR"/bilipod-retry@*.service \
-    "$SYSTEMD_DIR"/bilipod-retry@*.timer; do
+    "$SYSTEMD_DIR"/bilibili-podcast-retry@*.service \
+    "$SYSTEMD_DIR"/bilibili-podcast-retry@*.timer; do
     [ -f "$unit" ] || continue
     cp "$unit" "$BACKUP_DIR/systemd/"
 done
@@ -124,18 +124,18 @@ shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"
 git -C "$CODE_DIR" pull --ff-only
 "$VENV_BIN/pip" install -c "$CODE_DIR/requirements.lock" -e "$CODE_DIR"
 
-bilipod-config validate
+bilibili-podcast-config validate
 PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" -m compileall -q "$CODE_DIR/src"
 
 mkdir -p "$STATE_ROOT" "$WRAPPER_DIR"
-PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" "$CODE_DIR/scripts/bilipod-crontab" \
+PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" "$CODE_DIR/scripts/bilibili-podcast-crontab" \
     --config-db "$DB_PATH" \
     --script-dir "$WRAPPER_DIR" \
     --cron-user "$CRON_USER" \
     --apply \
     --force
 
-bilipod-config validate
+bilibili-podcast-config validate
 echo "Deployment completed without service restart."
 echo "Backup: $BACKUP_DIR"
 echo "Next gate: review unit diffs and health checks before separately authorizing restart or production sync."

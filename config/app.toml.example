@@ -1,5 +1,5 @@
 [database]
-path = "<server_path>/state/bilipod.db"
+path = "<server_path>/state/bilibili-podcast.db"
 
 [paths]
 media_root = "<server_path>/media"
@@ -17,4 +17,4 @@ venv_bin = "<server_path>/venv/bin"
 [executables]
 sync = "<server_path>/venv/bin/bilibili-podcast"
 ffmpeg = "ffmpeg"
-bilipod_config = "bilipod-config"
+bilibili_podcast_config = "bilibili-podcast-config"

@@ -12,13 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .manager import ConfigError, ConfigManager, UnsafeConfigError
-from .models import SeriesConfig
-from .repositories import LegacyYamlRepository
-from .schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
+from ..manager import ConfigError, ConfigManager, UnsafeConfigError
+from ..models import SeriesConfig
+from ..repositories import LegacyYamlRepository
+from ..schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
 
 
 _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_OLD_ENV_PREFIX = ("BILI" + "POD") + "_"
+_CURRENT_ENV_PREFIX = "BILIBILI_PODCAST_"
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,8 @@ def read_legacy_env(path: str | Path | None) -> dict[str, str]:
         if not match:
             raise ConfigError(f"unsupported legacy env syntax {source}:{line_number}")
         key, value = match.groups()
+        if key.startswith(_OLD_ENV_PREFIX):
+            key = _CURRENT_ENV_PREFIX + key.removeprefix(_OLD_ENV_PREFIX)
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
@@ -173,8 +177,8 @@ def _normalize_legacy_series(root: Path) -> tuple[list[MigratedSeries], tuple[st
 
 
 def _write_migrated_series(path: Path, configs: list[MigratedSeries]) -> None:
-    from .. import db
-    from ..services.scheduler_service import replace_schedules_in_connection
+    from ... import db
+    from ...services.scheduler_service import replace_schedules_in_connection
 
     db.migrate(path)
     with db.transaction(path) as conn:
@@ -203,51 +207,45 @@ def migrate_legacy(
     env = read_legacy_env(legacy_env)
     web_env = read_legacy_env(legacy_web_env)
     merged = {**env, **web_env}
-    publish_a = merged.get("BILIPOD_RSS_PUBLISH")
-    publish_b = merged.get("BILIPOD_RSS_PUBLISH_SCRIPT")
-    if publish_a and publish_b and publish_a != publish_b:
-        raise ConfigError(
-            "legacy migration conflict: BILIPOD_RSS_PUBLISH and BILIPOD_RSS_PUBLISH_SCRIPT differ"
-        )
-    app_dir = _require(merged, "BILIPOD_APP_DIR")
-    state_root = _require(merged, "BILIPOD_STATE_ROOT")
+    app_dir = _require(merged, "BILIBILI_PODCAST_APP_DIR")
+    state_root = _require(merged, "BILIBILI_PODCAST_STATE_ROOT")
     removed_rsync = sorted(set(merged) & REMOVED_LEGACY_ENV)
     generated = {
         "app.toml": _toml([
-            ("database", {"path": merged.get("BILIPOD_CONFIG_DB", f"{state_root}/bilipod.db")}),
+            ("database", {"path": merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db")}),
             ("paths", {
-                "media_root": _require(merged, "BILIPOD_MEDIA_ROOT"),
-                "json_root": _require(merged, "BILIPOD_JSON_ROOT"),
-                "rss_root": _require(merged, "BILIPOD_RSS_ROOT"),
-                "published_rss_root": _require(merged, "BILIPOD_PUBLISHED_RSS_ROOT"),
+                "media_root": _require(merged, "BILIBILI_PODCAST_MEDIA_ROOT"),
+                "json_root": _require(merged, "BILIBILI_PODCAST_JSON_ROOT"),
+                "rss_root": _require(merged, "BILIBILI_PODCAST_RSS_ROOT"),
+                "published_rss_root": _require(merged, "BILIBILI_PODCAST_PUBLISHED_RSS_ROOT"),
                 "state_root": state_root,
-                "log_dir": _require(merged, "BILIPOD_LOG_DIR"),
-                "secrets_dir": _require(merged, "BILIPOD_SECRETS_DIR"),
+                "log_dir": _require(merged, "BILIBILI_PODCAST_LOG_DIR"),
+                "secrets_dir": _require(merged, "BILIBILI_PODCAST_SECRETS_DIR"),
             }),
-            ("install", {"app_dir": app_dir, "venv_bin": _require(merged, "BILIPOD_VENV_BIN")}),
-            ("executables", {"sync": _require(merged, "BILIPOD_SYNC_PATH"), "ffmpeg": "ffmpeg", "bilipod_config": "bilipod-config"}),
+            ("install", {"app_dir": app_dir, "venv_bin": _require(merged, "BILIBILI_PODCAST_VENV_BIN")}),
+            ("executables", {"sync": _require(merged, "BILIBILI_PODCAST_SYNC_PATH"), "ffmpeg": "ffmpeg", "bilibili_podcast_config": "bilibili-podcast-config"}),
         ]),
         "sync.toml": _toml([
-            ("downloads", {"max_per_run": 20, "scheduled_max_per_run": 1, "min_free_gb": _number(merged.get("BILIPOD_MIN_FREE_GB", "5"), "BILIPOD_MIN_FREE_GB", float)}),
-            ("paths", {"cookie_file": _require(merged, "BILIPOD_COOKIE_FILE"), "lock_file": _require(merged, "BILIPOD_LOCK_FILE")}),
-            ("browser", {"user_data_root": _require(merged, "BILIPOD_BROWSER_USER_DATA_ROOT"), "playwright_browsers_path": _require(merged, "PLAYWRIGHT_BROWSERS_PATH"), "login_wait_seconds": 5.0}),
+            ("downloads", {"max_per_run": 20, "scheduled_max_per_run": 1, "min_free_gb": _number(merged.get("BILIBILI_PODCAST_MIN_FREE_GB", "5"), "BILIBILI_PODCAST_MIN_FREE_GB", float)}),
+            ("paths", {"cookie_file": _require(merged, "BILIBILI_PODCAST_COOKIE_FILE"), "lock_file": _require(merged, "BILIBILI_PODCAST_LOCK_FILE")}),
+            ("browser", {"user_data_root": _require(merged, "BILIBILI_PODCAST_BROWSER_USER_DATA_ROOT"), "playwright_browsers_path": _require(merged, "PLAYWRIGHT_BROWSERS_PATH"), "login_wait_seconds": 5.0}),
             ("timeouts", {"sync_seconds": 300, "preview_seconds": 120, "publish_seconds": 60}),
-            ("logging", {"level": merged.get("BILIPOD_SYNC_LOG_LEVEL", "INFO"), "retention_days": 30, "max_bytes": 20971520, "backup_count": 10}),
+            ("logging", {"level": merged.get("BILIBILI_PODCAST_SYNC_LOG_LEVEL", "INFO"), "retention_days": 30, "max_bytes": 20971520, "backup_count": 10}),
         ]),
         "web.toml": _toml([
-            ("server", {"enabled": bool(merged.get("BILIPOD_WEB_PASSWORD")), "host": "127.0.0.1", "port": 8000}),
-            ("security", {"password": merged.get("BILIPOD_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIPOD_HTTPS")), "cookie_name": "bilipod_session", "session_max_age_seconds": 86400}),
+            ("server", {"enabled": bool(merged.get("BILIBILI_PODCAST_WEB_PASSWORD")), "host": "127.0.0.1", "port": 8000}),
+            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": [], "session_max_age_seconds": 86400}),
         ]),
         "scheduler.toml": _toml([
-            ("runtime", {"user": "bilipod", "group": "bilipod"}),
-            ("paths", {"systemd_dir": _require(merged, "BILIPOD_SYSTEMD_DIR"), "cron_script_dir": _require(merged, "BILIPOD_CRON_SCRIPT_DIR"), "wrapper_dir": merged.get("BILIPOD_CRON_SCRIPT_DIR", f"{app_dir}/auto")}),
-            ("units", {"web": Path(merged.get("BILIPOD_WEB_UNIT", "bilipod-web.service")).name, "sync_glob": Path(merged.get("BILIPOD_SYNC_UNIT_GLOB", "bilipod-sync@*.service")).name}),
+            ("runtime", {"user": "bilibili-podcast", "group": "bilibili-podcast"}),
+            ("paths", {"systemd_dir": _require(merged, "BILIBILI_PODCAST_SYSTEMD_DIR"), "cron_script_dir": _require(merged, "BILIBILI_PODCAST_CRON_SCRIPT_DIR"), "wrapper_dir": merged.get("BILIBILI_PODCAST_CRON_SCRIPT_DIR", f"{app_dir}/auto")}),
+            ("units", {"web": Path(merged.get("BILIBILI_PODCAST_WEB_UNIT", "bilibili-podcast-web.service")).name, "sync_glob": Path(merged.get("BILIBILI_PODCAST_SYNC_UNIT_GLOB", "bilibili-podcast-sync@*.service")).name}),
             ("timeouts", {"command_seconds": 30}),
         ]),
         "publish.toml": _toml([
-            ("publish", {"enabled": bool(publish_a or publish_b), "media_base_url": merged.get("BILIPOD_MEDIA_BASE_URL", ""), "script": publish_a or publish_b or "", "master_placeholder": "__MEDIA_PLACEHOLDER__"}),
+            ("publish", {"enabled": bool(merged.get("BILIBILI_PODCAST_MEDIA_BASE_URL")), "media_base_url": merged.get("BILIBILI_PODCAST_MEDIA_BASE_URL", ""), "master_placeholder": "__MEDIA_PLACEHOLDER__", "gone_series": []}),
         ]),
-        "manual-media.toml": _toml([("manual_media", {"enabled": bool(merged.get("BILIPOD_MANUAL_MEDIA_DIRS")), "allowed_dirs": [item for item in merged.get("BILIPOD_MANUAL_MEDIA_DIRS", "").split(":") if item], "follow_symlinks": False})]),
+        "manual-media.toml": _toml([("manual_media", {"enabled": bool(merged.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS")), "allowed_dirs": [item for item in merged.get("BILIBILI_PODCAST_MANUAL_MEDIA_DIRS", "").split(":") if item], "follow_symlinks": False})]),
         "rss-users.toml": _rss_users_toml(_parse_rss_users(legacy_rss_users)),
     }
     configs, normalizations = ([], ())
@@ -258,7 +256,7 @@ def migrate_legacy(
     output = Path(output_root).expanduser()
     files = tuple(output / name for name in generated)
     if not apply:
-        with tempfile.TemporaryDirectory(prefix="bilipod-migrate-dry-run-") as temp_name:
+        with tempfile.TemporaryDirectory(prefix="bilibili-podcast-migrate-dry-run-") as temp_name:
             validation_root = Path(temp_name)
             for name, content in generated.items():
                 staged = validation_root / name
@@ -289,9 +287,9 @@ def migrate_legacy(
             staged.chmod(0o600)
         ConfigManager(temp_root, environ={}).load()
         if configs:
-            from .. import db
+            from ... import db
 
-            db_path = Path(merged.get("BILIPOD_CONFIG_DB", f"{state_root}/bilipod.db"))
+            db_path = Path(merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db"))
             db_path.parent.mkdir(parents=True, exist_ok=True)
             if db_path.exists():
                 fd, staged_name = tempfile.mkstemp(prefix=f".{db_path.name}.", dir=db_path.parent)
@@ -305,7 +303,7 @@ def migrate_legacy(
                 staged_db = Path(staged_name)
             db.migrate(staged_db)
             with db.transaction(staged_db) as conn:
-                from ..services.scheduler_service import replace_schedules_in_connection
+                from ...services.scheduler_service import replace_schedules_in_connection
                 for migrated in configs:
                     config = migrated.config
                     db.upsert_series(conn, config)
@@ -358,4 +356,45 @@ def migrate_legacy(
         manifest.chmod(0o600)
     else:
         backup_root.rmdir()
+    from .versioning import upgrade_installation
+
+    try:
+        upgrade_installation(output, apply=True)
+    except Exception:
+        for target, backup in reversed(replaced):
+            if backup is not None and backup.exists():
+                shutil.copy2(backup, target)
+            else:
+                target.unlink(missing_ok=True)
+        raise
     return MigrationResult(output, files, len(configs), normalizations, True)
+
+
+from .versioning import (  # noqa: E402  (legacy adapter is defined before the public facade)
+    EARLIEST_UNIFIED_VERSION,
+    LATEST_VERSION,
+    PRE_VERSIONED_CURRENT,
+    VERSION_FILE,
+    VersionMigrationPlan,
+    VersionMigrationResult,
+    detect_version,
+    plan_upgrade,
+    upgrade_installation,
+)
+
+
+__all__ = (
+    "EARLIEST_UNIFIED_VERSION",
+    "LATEST_VERSION",
+    "PRE_VERSIONED_CURRENT",
+    "VERSION_FILE",
+    "MigratedSeries",
+    "MigrationResult",
+    "VersionMigrationPlan",
+    "VersionMigrationResult",
+    "detect_version",
+    "migrate_legacy",
+    "plan_upgrade",
+    "read_legacy_env",
+    "upgrade_installation",
+)

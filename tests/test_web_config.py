@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import sys
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,7 +26,7 @@ def _load_web_server(monkeypatch, db_path: Path):
         root=root / "config",
         app=SimpleNamespace(paths=SimpleNamespace(
             media_root=root / "media", json_root=root / "json", rss_root=root / "rss",
-            log_dir=root / "logs",
+            published_rss_root=root / "published-rss", log_dir=root / "logs",
         )),
         sync=SimpleNamespace(
             paths=SimpleNamespace(cookie_file=root / "cookie.txt", lock_file=root / "sync.lock"),
@@ -34,10 +35,70 @@ def _load_web_server(monkeypatch, db_path: Path):
         ),
         scheduler=SimpleNamespace(command_timeout_seconds=30),
         publish=SimpleNamespace(publish=SimpleNamespace(
-            enabled=False, media_base_url="https://media.example.invalid", script=None,
+            enabled=False, media_base_url="https://media.example.invalid",
+            master_placeholder="__MEDIA_PLACEHOLDER__", gone_series=("removed-series",),
         )),
+        rss_users=SimpleNamespace(users={}),
     )
     return server
+
+
+def test_rss_authorization_matrix_and_gone_series_are_local_only(monkeypatch, tmp_path: Path) -> None:
+    import asyncio
+
+    server = _load_web_server(monkeypatch, tmp_path / "web.db")
+    matrix = {
+        "user-a": tuple(f"series-{index:02d}" for index in range(1, 10)),
+        "user-b": ("series-01", "series-02"),
+        "user-c": ("series-01",),
+        "user-d": ("series-01", "series-08", "series-04"),
+    }
+    users = {
+        name: SimpleNamespace(token=f"test-token-{name}", series=series)
+        for name, series in matrix.items()
+    }
+    server._CONFIG_SNAPSHOT.rss_users = SimpleNamespace(users=users)
+    published = server._CONFIG_SNAPSHOT.app.paths.published_rss_root
+    for user in users.values():
+        root = published / "current" / hashlib.sha256(user.token.encode()).hexdigest()
+        root.mkdir(parents=True, exist_ok=True)
+        for series in user.series:
+            (root / f"{series}.xml").write_text("<rss/>")
+
+    all_series = set().union(*matrix.values())
+    for name, user in users.items():
+        for series in all_series:
+            response = asyncio.run(server.authorize_rss(user.token, series))
+            assert response.status_code == (204 if series in matrix[name] else 403)
+    assert asyncio.run(server.authorize_rss("test-token-user-a", "removed-series")).status_code == 410
+    assert asyncio.run(server.authorize_rss("invalid-token", "series-06")).status_code == 403
+
+
+def test_media_authorization_and_previous_cookie_refresh(monkeypatch, tmp_path: Path) -> None:
+    import asyncio
+    from starlette.requests import Request
+    from starlette.responses import Response
+
+    server = _load_web_server(monkeypatch, tmp_path / "web.db")
+    server._CONFIG_SNAPSHOT.rss_users = SimpleNamespace(users={
+        "user": SimpleNamespace(token="test-token", series=("demo",)),
+    })
+    assert asyncio.run(server.authorize_media("test-token", "demo", "item.mp3")).status_code == 204
+    assert asyncio.run(server.authorize_media("invalid", "demo", "item.mp3")).status_code == 403
+    assert asyncio.run(server.authorize_media("test-token", "demo", "../item.mp3")).status_code == 404
+
+    server._COOKIE_NAME = "bilibili_podcast_session"
+    server._PREVIOUS_COOKIE_NAMES = ("previous_session",)
+    old_token = server._session_token()
+    request = Request({
+        "type": "http", "method": "GET", "path": "/series",
+        "headers": [(b"cookie", f"previous_session={old_token}".encode())],
+    })
+    assert server._get_session(request) == "auth"
+    response = server._refresh_session_cookie(request, Response())
+    cookie = response.headers["set-cookie"]
+    assert "bilibili_podcast_session=" in cookie
+    assert "HttpOnly" in cookie
 
 
 def test_filters_form_can_disable_exclude_paid(monkeypatch, tmp_path: Path) -> None:
@@ -189,7 +250,7 @@ def test_manual_media_attach_rebuilds_without_legacy_publish_env(monkeypatch, tm
         ),
         sync=SimpleNamespace(timeouts=SimpleNamespace(publish_seconds=60)),
     )
-    monkeypatch.setenv("BILIPOD_RSS_PUBLISH", str(publish_script))
+    monkeypatch.setenv("BILIBILI_PODCAST_RSS_PUBLISH", str(publish_script))
 
     db.migrate(str(db_path))
     with db.transaction(str(db_path)) as conn:

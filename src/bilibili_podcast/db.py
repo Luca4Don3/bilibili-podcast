@@ -9,6 +9,7 @@ from .utils.series_config import SeriesConfig
 from .services.filter_service import list_filter_entries
 from .services.sync_policy_service import SyncPolicyService
 from .config.schema import QUALITY_ALIASES, SERIES_SYNC_DEFAULTS
+from .sqlite_connection import connect
 
 
 SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
@@ -30,16 +31,20 @@ CREATE TABLE IF NOT EXISTS scheduler_backend (
 
 def migrate(db_path: str | Path) -> None:
     """Create or migrate the SQLite schema."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA_SQL)
-    _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
-    _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(conn, "sync_policy", "update_period_grace_seconds", "INTEGER NOT NULL DEFAULT 120")
-    _ensure_column(conn, "sync_policy", "media_mode", "TEXT NOT NULL DEFAULT 'auto'")
-    conn.commit()
-    conn.close()
+    conn = connect(db_path)
+    try:
+        conn.executescript(SCHEMA_SQL)
+        conn.execute("BEGIN")
+        _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
+        _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "sync_policy", "update_period_grace_seconds", "INTEGER NOT NULL DEFAULT 120")
+        _ensure_column(conn, "sync_policy", "media_mode", "TEXT NOT NULL DEFAULT 'auto'")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -144,9 +149,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 @contextmanager
 def transaction(db_path: str | Path):
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         yield conn

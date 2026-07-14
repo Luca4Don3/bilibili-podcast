@@ -16,7 +16,7 @@ def _snapshot(root: Path):
         root=root / "config",
         scheduler=SimpleNamespace(
             paths=SimpleNamespace(systemd_dir=root),
-            runtime=SimpleNamespace(user="bilipod", group="bilipod"),
+            runtime=SimpleNamespace(user="bilibili-podcast", group="bilibili-podcast"),
             command_timeout_seconds=30,
         ),
         app=SimpleNamespace(
@@ -262,17 +262,17 @@ class TestUnitGeneration:
     def test_service_does_not_use_shell_env_file(self):
         content = sysd.generate_service("testseries")
         assert "EnvironmentFile=" not in content
-        assert "Environment=BILIPOD_CONFIG_ROOT=" in content
+        assert "Environment=BILIBILI_PODCAST_CONFIG_ROOT=" in content
         assert "ExecStartPost=" not in content
         assert "--publish-script" not in content
 
     def test_generate_service_no_debug_by_default(self, monkeypatch):
-        monkeypatch.delenv("BILIPOD_SYNC_LOG_LEVEL", raising=False)
+        monkeypatch.delenv("BILIBILI_PODCAST_SYNC_LOG_LEVEL", raising=False)
         content = sysd.generate_service("testseries")
         assert "--debug" not in content
 
     def test_generate_service_ignores_legacy_log_environment(self, monkeypatch):
-        monkeypatch.setenv("BILIPOD_SYNC_LOG_LEVEL", "WARNING")
+        monkeypatch.setenv("BILIBILI_PODCAST_SYNC_LOG_LEVEL", "WARNING")
         content = sysd.generate_service("testseries")
         assert "--log-level WARNING" not in content
 
@@ -291,15 +291,15 @@ class TestUnitGeneration:
         assert "OnCalendar=*-*-* 15:30:00" in content
 
     def test_unit_name(self):
-        assert sysd.unit_name("demo-series") == "bilipod-sync@demo-series.service"
-        assert sysd.unit_name("demo-series", "timer") == "bilipod-sync@demo-series.timer"
+        assert sysd.unit_name("demo-series") == "bilibili-podcast-sync@demo-series.service"
+        assert sysd.unit_name("demo-series", "timer") == "bilibili-podcast-sync@demo-series.timer"
 
     def test_unit_name_uses_configured_sync_glob(self):
         sysd._CONFIG.scheduler.units = SimpleNamespace(sync_glob="podcast-*.service")
         assert sysd.unit_name("demo-series") == "podcast-demo-series.service"
         assert sysd.unit_name("demo-series", "timer") == "podcast-demo-series.timer"
         assert sysd.unit_name("demo-series", scheduled_retry=True) == \
-            "bilipod-retry@demo-series.service"
+            "bilibili-podcast-retry@demo-series.service"
 
     def test_write_unit_reports_sudo_chmod_failure(self, tmp_path: Path):
         import subprocess
@@ -346,7 +346,7 @@ class TestUnitGeneration:
         svc = SchedulerService(str(db_path), crontab_script="/nonexistent")
         result = svc.plan(backend="systemd", series="pt")
         assert result.returncode == 0
-        assert "bilipod-sync@pt.service" in result.stdout
+        assert "bilibili-podcast-sync@pt.service" in result.stdout
         assert "OnCalendar=" in result.stdout
 
         # Plan must not write unit files
@@ -826,13 +826,13 @@ class TestSeriesScheduleRemoval:
         from bilibili_podcast.services.scheduler_service import SchedulerService
 
         existing = (
-            "# manual note: # BEGIN BILIPOD AUTO - demo (not a block)\n"
-            "# BEGIN BILIPOD AUTO - demo (Demo (Archive))\n"
+            "# manual note: # BEGIN BILIBILI_PODCAST AUTO - demo (not a block)\n"
+            "# BEGIN BILIBILI_PODCAST AUTO - demo (Demo (Archive))\n"
             "0 1 * * * /demo\n"
-            "# END BILIPOD AUTO\n"
-            "# BEGIN BILIPOD AUTO - demo-test (Demo Test)\n"
+            "# END BILIBILI_PODCAST AUTO\n"
+            "# BEGIN BILIBILI_PODCAST AUTO - demo-test (Demo Test)\n"
             "0 2 * * * /demo-test\n"
-            "# END BILIPOD AUTO\n"
+            "# END BILIBILI_PODCAST AUTO\n"
         )
         written: list[str] = []
 
@@ -843,14 +843,14 @@ class TestSeriesScheduleRemoval:
             return CompletedProcess(cmd, 0, "", "")
 
         svc = SchedulerService(str(tmp_path / "test.db"))
-        with patch("getpass.getuser", return_value="bilipod"), \
+        with patch("getpass.getuser", return_value="bilibili-podcast"), \
                 patch("subprocess.run", side_effect=fake_run):
             svc._exclude_series_from_cron("demo")
 
         assert len(written) == 1
         assert "# manual note:" in written[0]
-        assert "BILIPOD AUTO - demo (Demo (Archive))\n" not in written[0]
-        assert "BILIPOD AUTO - demo-test (Demo Test)\n" in written[0]
+        assert "BILIBILI_PODCAST AUTO - demo (Demo (Archive))\n" not in written[0]
+        assert "BILIBILI_PODCAST AUTO - demo-test (Demo Test)\n" in written[0]
 
     def test_restore_cron_for_series_only_adds_target_block(self, tmp_path):
         from subprocess import CompletedProcess
@@ -880,9 +880,9 @@ class TestSeriesScheduleRemoval:
         (auto / "run_one_sync.sh").write_text("#!/bin/sh\n")
         existing = (
             "# manual\n"
-            "# BEGIN BILIPOD AUTO - two (Two)\n"
+            "# BEGIN BILIBILI_PODCAST AUTO - two (Two)\n"
             "0 2 * * * /old/two\n"
-            "# END BILIPOD AUTO\n"
+            "# END BILIBILI_PODCAST AUTO\n"
         )
         written: list[str] = []
 
@@ -893,15 +893,15 @@ class TestSeriesScheduleRemoval:
             return CompletedProcess(cmd, 0, "", "")
 
         svc = SchedulerService(str(db_path), cron_script_dir=str(auto))
-        with patch("getpass.getuser", return_value="bilipod"), \
+        with patch("getpass.getuser", return_value="bilibili-podcast"), \
                 patch("subprocess.run", side_effect=fake_run):
             svc._restore_cron_for_series("one")
 
         assert len(written) == 1
         assert "# manual" in written[0]
-        assert "BILIPOD AUTO - one (One Archive)" in written[0]
+        assert "BILIBILI_PODCAST AUTO - one (One Archive)" in written[0]
         assert "0 1 * * *" in written[0]
-        assert "BILIPOD AUTO - two (Two)" in written[0]
+        assert "BILIBILI_PODCAST AUTO - two (Two)" in written[0]
         assert "/old/two" in written[0]
 
     def test_disable_systemd_does_not_restore_cron_when_timer_disable_fails(self, tmp_path):
@@ -1068,7 +1068,7 @@ class TestSeriesScheduleRemoval:
 
         import bilibili_podcast.services.systemd_scheduler as sysd_mod
 
-        unit = tmp_path / "bilipod-sync@demo.service"
+        unit = tmp_path / "bilibili-podcast-sync@demo.service"
         unit.write_text("x")
         with patch.object(sysd_mod, "SYSTEMD_DIR", tmp_path), \
              patch.object(type(unit), "unlink", side_effect=PermissionError("denied")), \

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-bilipod-crontab — Read series configs and generate/manage cron.
+bilibili-podcast-crontab — Read series configs and generate/manage cron.
 
 Usage:
-  bilipod-crontab [--config-dir DIR | --config-db DB] [--apply] [--print]
+  bilibili-podcast-crontab [--config-dir DIR | --config-db DB] [--apply] [--print]
 
   --config-dir    Explicit legacy YAML rollback directory
   --config-db     SQLite database path (replaces --config-dir)
   --apply         Write generated crontab and wrapper scripts
   --print         Print generated crontab entries to stdout (default)
   --script-dir    Directory for auto-generated wrapper scripts (default: auto)
-  --cron-user     Crontab user (default: bilipod)
+  --cron-user     Crontab user (default: bilibili-podcast)
   --force         Overwrite existing wrapper scripts
 """
 
@@ -33,17 +33,17 @@ if PROJECT_SRC.is_dir():
 try:
     import yaml
 except ImportError:
-    print("bilipod-crontab requires PyYAML: pip install pyyaml", file=sys.stderr)
+    print("bilibili-podcast-crontab requires PyYAML: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
 
 SERIES_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 # Markers for auto-generated crontab sections
-AUTO_BEGIN_MARKER = "# BEGIN BILIPOD AUTO"
-AUTO_END_MARKER = "# END BILIPOD AUTO"
+AUTO_BEGIN_MARKER = "# BEGIN BILIBILI_PODCAST AUTO"
+AUTO_END_MARKER = "# END BILIBILI_PODCAST AUTO"
 COMMAND_TIMEOUT = 10
-SYNC_UNIT_GLOB = "bilipod-sync@*.service"
+SYNC_UNIT_GLOB = "bilibili-podcast-sync@*.service"
 
 
 def cron_marker_title(title, series: str) -> str:
@@ -67,7 +67,7 @@ def systemd_timer_is_enabled(series: str) -> bool:
 
 UNIFIED_WRAPPER_TEMPLATE = """#!/bin/sh
 set -eu
-export BILIPOD_CONFIG_ROOT={CONFIG_ROOT}
+export BILIBILI_PODCAST_CONFIG_ROOT={CONFIG_ROOT}
 
 MAX_DOWNLOADS_PER_RUN=${{MAX_DOWNLOADS_PER_RUN:-{MAX_DOWNLOADS}}}
 FORCE=${{FORCE:-0}}
@@ -88,7 +88,7 @@ if [ "$MAX_DOWNLOADS_PER_RUN" != "{MAX_DOWNLOADS}" ]; then
   echo "warning: MAX_DOWNLOADS_PER_RUN is deprecated; applying it as a one-run CLI override" >&2
 fi
 
-exec {BILIPOD_SYNC_PATH} \
+exec {BILIBILI_PODCAST_SYNC_PATH} \
   --series {SERIES} \
   --token "__MEDIA_PLACEHOLDER__" \
   --max-downloads-per-run "$MAX_DOWNLOADS_PER_RUN" \
@@ -261,7 +261,7 @@ def generate_wrapper_script(series_name: str, config_dir: str | None, config_db:
     script_dir_path = Path(script_dir)
     script_dir_path.mkdir(parents=True, exist_ok=True)
 
-    config_root = os.environ.get("BILIPOD_CONFIG_ROOT")
+    config_root = os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT")
     if config_root:
         from bilibili_podcast.config import ConfigManager
 
@@ -269,7 +269,7 @@ def generate_wrapper_script(series_name: str, config_dir: str | None, config_db:
         content = UNIFIED_WRAPPER_TEMPLATE.format(
             CONFIG_ROOT=shlex.quote(str(snapshot.root)),
             MAX_DOWNLOADS=shlex.quote(str(snapshot.sync.downloads.scheduled_max_per_run)),
-            BILIPOD_SYNC_PATH=shlex.quote(str(snapshot.app.executables.sync)),
+            BILIBILI_PODCAST_SYNC_PATH=shlex.quote(str(snapshot.app.executables.sync)),
             SERIES=shlex.quote(series_name),
         )
         script_path.write_text(content, encoding="utf-8")
@@ -277,7 +277,7 @@ def generate_wrapper_script(series_name: str, config_dir: str | None, config_db:
         print(f"  generated: {script_path}", file=sys.stderr)
         return script_path
 
-    raise RuntimeError("BILIPOD_CONFIG_ROOT is required to generate wrapper scripts")
+    raise RuntimeError("BILIBILI_PODCAST_CONFIG_ROOT is required to generate wrapper scripts")
 
 
 def generate_crontab(configs: list[dict], config_dir: str | None, config_db: str | None, script_dir: str) -> str:
@@ -381,7 +381,7 @@ def write_crontab(content: str, user: str):
 
 def main():
     global COMMAND_TIMEOUT, SYNC_UNIT_GLOB
-    parser = argparse.ArgumentParser(description="Generate bilipod crontab from series configs")
+    parser = argparse.ArgumentParser(description="Generate bilibili-podcast crontab from series configs")
     parser.add_argument("--config-dir", help="Explicit legacy YAML rollback directory")
     parser.add_argument("--config-db", default=None, help="SQLite database path (replaces --config-dir)")
     parser.add_argument("--apply", action="store_true", help="Write crontab and wrapper scripts")
@@ -392,7 +392,7 @@ def main():
     args = parser.parse_args()
 
     snapshot = None
-    config_root = os.environ.get("BILIPOD_CONFIG_ROOT")
+    config_root = os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT")
     needs_unified_defaults = not args.config_db and not args.config_dir
     if config_root and (needs_unified_defaults or Path(config_root).is_dir()):
         from bilibili_podcast.config import ConfigError, ConfigManager
@@ -415,7 +415,7 @@ def main():
     if args.script_dir is None:
         args.script_dir = "auto"
     if args.cron_user is None:
-        args.cron_user = "bilipod"
+        args.cron_user = "bilibili-podcast"
 
     # Default: print if neither --apply nor --print
     do_print = args.print or not args.apply
@@ -451,8 +451,8 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             raise SystemExit(2) from None
 
-        if not os.environ.get("BILIPOD_CONFIG_ROOT"):
-            parser.error("BILIPOD_CONFIG_ROOT is required with --apply")
+        if not os.environ.get("BILIBILI_PODCAST_CONFIG_ROOT"):
+            parser.error("BILIBILI_PODCAST_CONFIG_ROOT is required with --apply")
         script_dir.mkdir(parents=True, exist_ok=True)
         generated_scripts = 0
         for config in configs:
@@ -472,7 +472,7 @@ def main():
         print(f"  {generated_scripts} wrapper scripts ready in {script_dir}", file=sys.stderr)
 
         if write_crontab(merged, args.cron_user):
-            print("  ok — run 'crontab -l -u bilipod' to verify", file=sys.stderr)
+            print("  ok — run 'crontab -l -u bilibili-podcast' to verify", file=sys.stderr)
         else:
             sys.exit(1)
 

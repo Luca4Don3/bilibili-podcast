@@ -5,7 +5,7 @@ Usage:
     python3 scripts/migrate_yaml_to_sqlite \
         --config-dir configs/series.d \
         --state-root /path/to/state \
-        --db-path /path/to/bilipod.db
+        --db-path /path/to/bilibili-podcast.db
 """
 
 import argparse

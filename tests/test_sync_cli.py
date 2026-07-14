@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from bilibili_podcast import sync as sync_mod
+from bilibili_podcast.publisher import PublishError
 from bilibili_podcast.sync import (
     EXIT_PUBLISH_ERROR,
     EXIT_SYNC_ERROR,
@@ -66,24 +67,20 @@ def test_cleanup_old_log_backups_only_removes_expired_recognized_files(tmp_path)
     assert link.is_symlink()
 
 
-def test_publish_script_argument_accepted() -> None:
-    """--publish-script must be accepted by sync parser."""
+def test_external_publish_script_argument_is_rejected() -> None:
     parser = build_parser()
-    ns = parser.parse_args(["--publish-script", "/tmp/pub.sh"])
-    assert ns.publish_script == "/tmp/pub.sh"
+    with __import__("pytest").raises(SystemExit):
+        parser.parse_args(["--publish-script", "/tmp/pub.sh"])
 
 
-def test_publish_script_absent_by_default() -> None:
-    """Without --publish-script, the attribute must be None."""
+def test_real_media_token_is_rejected_by_sync_parser() -> None:
     parser = build_parser()
-    ns = parser.parse_args([])
-    assert ns.publish_script is None
+    with __import__("pytest").raises(SystemExit):
+        parser.parse_args(["--token", "real-token-value"])
+    assert parser.parse_args([]).token == "__MEDIA_PLACEHOLDER__"
 
 
-def _sync_args(
-    tmp_path, *, apply=True, publish_script="/tmp/publish.sh",
-    scheduled_retry=False,
-):
+def _sync_args(tmp_path, *, apply=True, publisher_snapshot=None, scheduled_retry=False):
     return SimpleNamespace(
         config_dir="configs/series.d",
         config_db=None,
@@ -108,7 +105,7 @@ def _sync_args(
         force=False,
         scheduled_retry=scheduled_retry,
         apply=apply,
-        publish_script=publish_script,
+        publisher_snapshot=publisher_snapshot,
     )
 
 
@@ -128,28 +125,23 @@ def _sync_store() -> MagicMock:
     return store
 
 
-def test_publish_script_runs_after_apply_success(tmp_path) -> None:
+def test_builtin_publisher_runs_after_apply_success(tmp_path) -> None:
     import asyncio
 
     async def fake_sync_series(**kwargs):
         return {"series": "synctest"}
 
-    calls = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="published", stderr="")
-
+    marker = object()
     with patch.object(sync_mod, "make_store", return_value=_sync_store()), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series), \
-            patch.object(sync_mod.subprocess, "run", side_effect=fake_run):
-        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path)))
+            patch("bilibili_podcast.publisher.publish", return_value="generation") as publisher:
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publisher_snapshot=marker)))
 
     assert rc == 0
-    assert calls == [["/tmp/publish.sh"]]
+    publisher.assert_called_once_with(marker)
 
 
-def test_publish_script_skipped_after_sync_error(tmp_path) -> None:
+def test_builtin_publisher_skipped_after_sync_error(tmp_path) -> None:
     import asyncio
 
     async def fake_sync_series(**kwargs):
@@ -157,11 +149,11 @@ def test_publish_script_skipped_after_sync_error(tmp_path) -> None:
 
     with patch.object(sync_mod, "make_store", return_value=_sync_store()), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series), \
-            patch.object(sync_mod.subprocess, "run") as run:
-        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path)))
+            patch("bilibili_podcast.publisher.publish") as publisher:
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publisher_snapshot=object())))
 
     assert rc == EXIT_SYNC_ERROR
-    run.assert_not_called()
+    publisher.assert_not_called()
 
 
 def test_scheduled_retry_not_needed_skips_sync_and_publish(tmp_path) -> None:
@@ -193,7 +185,7 @@ def test_scheduled_retry_consumes_pending_before_request(tmp_path) -> None:
     with patch.object(sync_mod, "make_store", return_value=store), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
         rc = asyncio.run(sync_mod.run(_sync_args(
-            tmp_path, scheduled_retry=True, publish_script=None,
+            tmp_path, scheduled_retry=True, publisher_snapshot=None,
         )))
 
     assert rc == 0
@@ -212,7 +204,7 @@ def test_rate_limit_does_not_consume_scheduled_retry(tmp_path) -> None:
     with patch.object(sync_mod, "make_store", return_value=store), \
             patch.object(sync_mod, "sync_series") as sync_series:
         rc = asyncio.run(sync_mod.run(_sync_args(
-            tmp_path, scheduled_retry=True, publish_script=None,
+            tmp_path, scheduled_retry=True, publisher_snapshot=None,
         )))
 
     assert rc == 0
@@ -231,7 +223,7 @@ def test_failed_scheduled_retry_remains_consumed(tmp_path) -> None:
     with patch.object(sync_mod, "make_store", return_value=store), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
         rc = asyncio.run(sync_mod.run(_sync_args(
-            tmp_path, scheduled_retry=True, publish_script=None,
+            tmp_path, scheduled_retry=True, publisher_snapshot=None,
         )))
 
     assert rc == EXIT_SYNC_ERROR
@@ -250,28 +242,23 @@ def test_primary_failure_sets_retry_pending(tmp_path) -> None:
     store = _sync_store()
     with patch.object(sync_mod, "make_store", return_value=store), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series):
-        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publish_script=None)))
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publisher_snapshot=None)))
 
     assert rc == EXIT_SYNC_ERROR
     assert store.write_state.call_args.args[1]["retry_pending"] is True
 
 
-def test_publish_script_failure_returns_nonzero(tmp_path) -> None:
+def test_builtin_publisher_failure_returns_nonzero(tmp_path) -> None:
     import asyncio
 
     async def fake_sync_series(**kwargs):
         return {"series": "synctest"}
 
-    def fake_run(cmd, **kwargs):
-        return subprocess.CompletedProcess(
-            cmd, 1, stdout="", stderr="publish error token=real-value",
-        )
-
     with patch.object(sync_mod, "make_store", return_value=_sync_store()), \
             patch.object(sync_mod, "sync_series", side_effect=fake_sync_series), \
-            patch.object(sync_mod.subprocess, "run", side_effect=fake_run), \
+            patch("bilibili_podcast.publisher.publish", side_effect=PublishError("publish error token=real-value")), \
             patch.object(sync_mod.LOGGER, "error") as log_error:
-        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path)))
+        rc = asyncio.run(sync_mod.run(_sync_args(tmp_path, publisher_snapshot=object())))
 
     assert rc == EXIT_PUBLISH_ERROR
     logged = " ".join(str(arg) for arg in log_error.call_args.args)

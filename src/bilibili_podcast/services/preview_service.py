@@ -98,7 +98,7 @@ class PreviewService:
         timeout = self.config.sync.timeouts.preview_seconds if self.config else 120
         env_overrides = (
             {
-                "BILIPOD_CONFIG_ROOT": str(self.config.root),
+                "BILIBILI_PODCAST_CONFIG_ROOT": str(self.config.root),
                 "PLAYWRIGHT_BROWSERS_PATH": str(self.config.sync.browser.playwright_browsers_path),
             }
             if self.config else None
