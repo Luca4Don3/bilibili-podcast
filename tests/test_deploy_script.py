@@ -93,3 +93,16 @@ def test_deploy_backs_up_configured_systemd_unit_names(tmp_path: Path) -> None:
     assert (backups[0].parent / "config" / "rss-users.toml").read_bytes() == b""
     assert "without service restart" in result.stdout
     assert any("upgrade --apply" in line for line in python_calls.read_text().splitlines())
+    assert not any(
+        "permissions --apply" in line for line in python_calls.read_text().splitlines()
+    )
+
+
+def test_deploy_requires_separate_system_permissions_authorization() -> None:
+    script = Path(__file__).resolve().parent.parent / "scripts" / "deploy.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--system-permissions"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires --apply" in result.stderr

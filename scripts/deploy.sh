@@ -6,10 +6,17 @@
 set -euo pipefail
 
 APPLY=false
-if [ "${1:-}" = "--apply" ]; then
-    APPLY=true
-elif [ -n "${1:-}" ]; then
-    echo "ERROR: usage: scripts/deploy.sh [--apply]" >&2
+SYSTEM_PERMISSIONS=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --apply) APPLY=true ;;
+        --system-permissions) SYSTEM_PERMISSIONS=true ;;
+        *) echo "ERROR: usage: scripts/deploy.sh [--apply] [--system-permissions]" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ "$SYSTEM_PERMISSIONS" = true ] && [ "$APPLY" != true ]; then
+    echo "ERROR: --system-permissions requires --apply" >&2
     exit 2
 fi
 
@@ -84,6 +91,7 @@ candidate_config() {
 
 UPGRADE_JSON="$(candidate_config upgrade --format json)"
 UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["steps"]))' "$UPGRADE_JSON")"
+candidate_config permissions --format json
 if [ "$UPGRADE_STEPS" -gt 0 ]; then
     echo "Required installation upgrade: $UPGRADE_JSON"
     if [ "$APPLY" != true ]; then
@@ -143,6 +151,10 @@ UPGRADE_JSON="$(candidate_config upgrade --format json)"
 UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["steps"]))' "$UPGRADE_JSON")"
 if [ "$UPGRADE_STEPS" -gt 0 ]; then
     candidate_config upgrade --apply
+fi
+candidate_config permissions --format json
+if [ "$SYSTEM_PERMISSIONS" = true ]; then
+    candidate_config permissions --apply
 fi
 bilibili-podcast-config validate
 PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" -m compileall -q "$CODE_DIR/src"
