@@ -1229,8 +1229,22 @@ def generate_rss(
             entry.podcast.itunes_image(episode["image"])
 
     item_count = len(episodes)
-    fg.rss_file(str(rss_path), pretty=True)
-    rss_path.chmod(0o644)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=rss_path.parent,
+            prefix=f".{rss_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+        fg.rss_file(str(temporary), pretty=True)
+        temporary.chmod(0o644)
+        os.replace(temporary, rss_path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     LOGGER.info(
         "rss written series=%s path=%s input_items=%s output_items=%s",
         config.series, rss_path, item_count, output_items,

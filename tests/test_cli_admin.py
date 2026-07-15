@@ -1944,3 +1944,65 @@ def test_generate_rss_has_channel_itunes_image(tmp_path: Path) -> None:
     content = rss_path.read_text(encoding="utf-8")
     assert "itunes:image" in content
     assert "https://example.invalid/cover.jpg" in content
+
+
+def test_generate_rss_atomically_replaces_existing_file(tmp_path: Path, monkeypatch) -> None:
+    from bilibili_podcast.sync import SyncPaths, generate_rss
+    from bilibili_podcast.utils.series_config import SeriesConfig
+
+    cfg = SeriesConfig(
+        series="atomic", enabled=True, title="Atomic", description="desc", author="A",
+        cover_art="", category="", subcategories=[], explicit=False, lang="zh-CN",
+        source={"uid": 1}, sync={"quality": "64K"}, filters={}, paid_preview={}, keep_last=0,
+    )
+    paths = SyncPaths(
+        media_root=tmp_path / "media", json_root=tmp_path / "json",
+        rss_root=tmp_path / "rss", media_base_url="http://test:8080",
+    )
+    target = paths.rss_root / "atomic.xml"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+    original_chmod = Path.chmod
+
+    def reject_target_chmod(path, mode, *, follow_symlinks=True):
+        assert path != target
+        return original_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "chmod", reject_target_chmod)
+
+    generate_rss(cfg, paths, {"name": "A"}, [], "__MEDIA_PLACEHOLDER__", dry_run=False)
+
+    assert target.read_text(encoding="utf-8").startswith("<?xml")
+    assert target.stat().st_mode & 0o777 == 0o644
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+
+
+def test_generate_rss_failure_preserves_existing_file(tmp_path: Path, monkeypatch) -> None:
+    from feedgen.feed import FeedGenerator
+    from bilibili_podcast.sync import SyncPaths, generate_rss
+    from bilibili_podcast.utils.series_config import SeriesConfig
+
+    cfg = SeriesConfig(
+        series="atomic", enabled=True, title="Atomic", description="desc", author="A",
+        cover_art="", category="", subcategories=[], explicit=False, lang="zh-CN",
+        source={"uid": 1}, sync={"quality": "64K"}, filters={}, paid_preview={}, keep_last=0,
+    )
+    paths = SyncPaths(
+        media_root=tmp_path / "media", json_root=tmp_path / "json",
+        rss_root=tmp_path / "rss", media_base_url="http://test:8080",
+    )
+    target = paths.rss_root / "atomic.xml"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+
+    def fail_write(self, filename, **kwargs):
+        Path(filename).write_text("partial", encoding="utf-8")
+        raise OSError("rss write failed")
+
+    monkeypatch.setattr(FeedGenerator, "rss_file", fail_write)
+
+    with pytest.raises(OSError, match="rss write failed"):
+        generate_rss(cfg, paths, {"name": "A"}, [], "__MEDIA_PLACEHOLDER__", dry_run=False)
+
+    assert target.read_text(encoding="utf-8") == "old"
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
