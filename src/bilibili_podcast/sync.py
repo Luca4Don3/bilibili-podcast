@@ -1143,22 +1143,26 @@ def download_episode(config: SeriesConfig, paths: SyncPaths, episode: dict, cook
     yt_dlp_bin = Path(sys.executable).with_name("yt-dlp")
     yt_dlp_command = str(yt_dlp_bin) if yt_dlp_bin.exists() else "yt-dlp"
     try:
-        subprocess.run(
-            [
-                yt_dlp_command,
-                "--cookies",
-                cookie_file,
-                "--extract-audio",
-                "--audio-format",
-                "mp3",
-                "--audio-quality",
-                quality,
-                "-o",
-                str(out.with_suffix(".%(ext)s")),
-                episode["link"],
-            ],
-            check=True,
-        )
+        with tempfile.TemporaryDirectory(prefix="bilibili-podcast-cookie-") as temp_dir:
+            temporary_cookie = Path(temp_dir) / "cookies.txt"
+            shutil.copyfile(cookie_file, temporary_cookie)
+            temporary_cookie.chmod(0o600)
+            subprocess.run(
+                [
+                    yt_dlp_command,
+                    "--cookies",
+                    str(temporary_cookie),
+                    "--extract-audio",
+                    "--audio-format",
+                    "mp3",
+                    "--audio-quality",
+                    quality,
+                    "-o",
+                    str(out.with_suffix(".%(ext)s")),
+                    episode["link"],
+                ],
+                check=True,
+            )
     except subprocess.CalledProcessError as exc:
         LOGGER.error("download failed series=%s bvid=%s error=%s", config.series, episode["bvid"], exc)
         return

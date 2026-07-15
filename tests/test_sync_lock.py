@@ -60,6 +60,70 @@ def test_write_metadata_dry_run_does_not_create_directory(tmp_path):
     assert not paths.json_root.exists()
 
 
+def test_download_episode_uses_private_temporary_cookie_copy(tmp_path, monkeypatch):
+    config = type("Config", (), {
+        "series": "test",
+        "sync": {"quality": "64K"},
+    })()
+    paths = type("Paths", (), {"media_root": tmp_path / "media"})()
+    episode = {
+        "bvid": "BVtest00001",
+        "link": "https://www.bilibili.com/video/BVtest00001",
+    }
+    cookie_file = tmp_path / "source-cookies.txt"
+    cookie_file.write_text("original-cookie", encoding="utf-8")
+    observed_cookie = None
+
+    def fake_run(command, check):
+        nonlocal observed_cookie
+        observed_cookie = Path(command[command.index("--cookies") + 1])
+        assert check is True
+        assert observed_cookie != cookie_file
+        assert observed_cookie.read_text(encoding="utf-8") == "original-cookie"
+        assert observed_cookie.stat().st_mode & 0o777 == 0o600
+        observed_cookie.write_text("updated-cookie", encoding="utf-8")
+        output = sync.media_path(config, paths, episode["bvid"])
+        output.write_bytes(b"audio")
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    sync.download_episode(config, paths, episode, str(cookie_file), dry_run=False)
+
+    assert observed_cookie is not None
+    assert not observed_cookie.exists()
+    assert cookie_file.read_text(encoding="utf-8") == "original-cookie"
+    assert sync.media_path(config, paths, episode["bvid"]).stat().st_mode & 0o777 == 0o644
+
+
+def test_download_episode_cleans_temporary_cookie_after_failure(tmp_path, monkeypatch):
+    config = type("Config", (), {
+        "series": "test",
+        "sync": {"quality": "64K"},
+    })()
+    paths = type("Paths", (), {"media_root": tmp_path / "media"})()
+    episode = {
+        "bvid": "BVtest00001",
+        "link": "https://www.bilibili.com/video/BVtest00001",
+    }
+    cookie_file = tmp_path / "source-cookies.txt"
+    cookie_file.write_text("original-cookie", encoding="utf-8")
+    observed_cookie = None
+
+    def fail_run(command, check):
+        nonlocal observed_cookie
+        observed_cookie = Path(command[command.index("--cookies") + 1])
+        observed_cookie.write_text("updated-cookie", encoding="utf-8")
+        raise sync.subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(sync.subprocess, "run", fail_run)
+
+    sync.download_episode(config, paths, episode, str(cookie_file), dry_run=False)
+
+    assert observed_cookie is not None
+    assert not observed_cookie.exists()
+    assert cookie_file.read_text(encoding="utf-8") == "original-cookie"
+
+
 def test_process_lock_rejects_second_holder(tmp_path):
     lock_file = tmp_path / "sync.lock"
 
