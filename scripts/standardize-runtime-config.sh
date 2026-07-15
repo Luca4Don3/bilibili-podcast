@@ -4,11 +4,12 @@
 set -euo pipefail
 
 usage() {
-    echo "ERROR: usage: scripts/standardize-runtime-config.sh [--apply] [--profile legacy-unversioned|legacy-v0] [--layout-manifest PATH] [--web-primary-port PORT --web-backup-port PORT]" >&2
+    echo "ERROR: usage: scripts/standardize-runtime-config.sh [--apply] [--system-permissions] [--profile legacy-unversioned|legacy-v0] [--layout-manifest PATH] [--web-primary-port PORT --web-backup-port PORT]" >&2
     exit 2
 }
 
 APPLY=false
+SYSTEM_PERMISSIONS=false
 PROFILE="legacy-unversioned"
 LAYOUT_MANIFEST=""
 WEB_PRIMARY_PORT=""
@@ -18,6 +19,10 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --apply)
             APPLY=true
+            shift
+            ;;
+        --system-permissions)
+            SYSTEM_PERMISSIONS=true
             shift
             ;;
         --profile)
@@ -45,6 +50,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ "$SYSTEM_PERMISSIONS" = true ] && [ "$APPLY" != true ]; then
+    echo "ERROR: --system-permissions requires --apply" >&2
+    exit 2
+fi
 
 case "$PROFILE" in
     legacy-unversioned)
@@ -311,6 +321,13 @@ if [ -s "$BACKUP_DIR/SHA256SUMS" ]; then
     shasum -a 256 -c "$BACKUP_DIR/SHA256SUMS"
 fi
 "${clean_env[@]}" bilibili-podcast-config validate
+
+permission_cmd=("${clean_env[@]}" bilibili-podcast-config --root "$BILIBILI_PODCAST_CONFIG_ROOT" permissions)
+if [ "$SYSTEM_PERMISSIONS" = true ]; then
+    "${permission_cmd[@]}" --apply
+else
+    "${permission_cmd[@]}"
+fi
 trap - ERR
 
 echo "Unified configuration and canonical units written."

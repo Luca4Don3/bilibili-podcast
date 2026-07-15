@@ -52,9 +52,11 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
         },
         "sync": {"downloads": {"scheduled_max_per_run": 1}},
     }
+    acl_apply_marker = tmp_path / "acl-apply-called"
     fake_config = fake_bin / "bilibili-podcast-config"
     fake_config.write_text(
         "#!/bin/sh\n"
+        f"case \" $* \" in *\" permissions \"*\" --apply \"*) touch '{acl_apply_marker}' ;; esac\n"
         "if [ \"$1\" = show ]; then\n"
         f"  echo '{json.dumps(config_json)}'\n"
         "fi\n"
@@ -116,6 +118,7 @@ def test_standardize_runtime_config_writes_canonical_units_without_systemctl(tmp
     assert legacy_web_unit.exists()
     assert (systemd_dir / "bilibili-podcast-sync@demo.timer").read_text() == legacy_timer.read_text()
     assert "Prepared Web units" in result.stdout
+    assert not acl_apply_marker.exists()
 
 
 def test_standardize_dry_run_does_not_require_generated_output(tmp_path: Path) -> None:
@@ -216,6 +219,16 @@ def test_standardize_requires_two_distinct_shadow_ports(tmp_path: Path) -> None:
     )
     assert result.returncode == 2
     assert "must differ" in result.stderr
+
+
+def test_standardize_requires_explicit_system_permissions_authorization(tmp_path: Path) -> None:
+    script = Path(__file__).resolve().parent.parent / "scripts" / "standardize-runtime-config.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--system-permissions"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "requires --apply" in result.stderr
 
 
 def test_standardize_restores_units_when_later_rewrite_fails(tmp_path: Path) -> None:

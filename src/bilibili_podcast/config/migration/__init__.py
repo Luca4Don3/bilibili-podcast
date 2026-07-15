@@ -18,6 +18,13 @@ from ..models import SeriesConfig
 from ..repositories import LegacyYamlRepository
 from ..schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
 
+from .runtime_permissions import (
+    PermissionPlan,
+    PermissionResult,
+    plan_runtime_permissions,
+    run_runtime_permissions,
+)
+
 
 _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _OLD_ENV_PREFIX = ("BILI" + "POD") + "_"
@@ -468,12 +475,16 @@ __all__ = (
     "VERSION_FILE",
     "MigratedSeries",
     "MigrationResult",
+    "PermissionPlan",
+    "PermissionResult",
     "VersionMigrationPlan",
     "VersionMigrationResult",
     "detect_version",
     "migrate_legacy",
     "plan_upgrade",
+    "plan_runtime_permissions",
     "read_legacy_env",
     "read_legacy_layout",
+    "run_runtime_permissions",
     "upgrade_installation",
 )

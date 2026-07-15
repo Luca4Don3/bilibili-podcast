@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from .manager import ConfigError, ConfigManager
-from .migration import LEGACY_PROFILES, migrate_legacy, upgrade_installation
+from .migration import (
+    LEGACY_PROFILES, migrate_legacy, run_runtime_permissions, upgrade_installation,
+)
 from .repositories import SQLiteSeriesRepository
 
 
@@ -106,6 +108,46 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_permissions(args: argparse.Namespace) -> int:
+    if not args.root:
+        raise ConfigError("permissions requires --root")
+    result = run_runtime_permissions(args.root, apply=args.apply, restore=args.restore)
+    plan = result.plan
+    action = "restored" if result.restored else "applied" if result.applied else "dry-run"
+    data = {
+        "action": action,
+        "series_count": len(plan.series),
+        "directory_count": plan.directory_count,
+        "file_count": plan.file_count,
+        "noncompliant_directory_count": plan.noncompliant_directory_count,
+        "noncompliant_file_count": plan.noncompliant_file_count,
+        "series": list(plan.series),
+        "backup_id": result.backup_id,
+    }
+    if args.format == "json":
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    print(
+        f"permissions {action}: {data['series_count']} series; "
+        f"{data['directory_count']} directories, {data['file_count']} files"
+    )
+    print(
+        f"noncompliant: {data['noncompliant_directory_count']} directories, "
+        f"{data['noncompliant_file_count']} files"
+    )
+    for series in plan.series:
+        series_targets = [target for target in plan.targets if target.series == series]
+        directories = sum(target.kind == "directory" for target in series_targets)
+        files = sum(target.kind == "file" for target in series_targets)
+        noncompliant = sum(not target.compliant for target in series_targets)
+        print(f"series: {series}; directories={directories}; files={files}; noncompliant={noncompliant}")
+    if result.backup_id:
+        print(f"backup: {result.backup_id}")
+    if not result.applied and not result.restored:
+        print("no ACLs were written; rerun with --apply")
+    return 0
+
+
 def _exec_environment(snapshot, scope: str) -> dict[str, str]:
     env = dict(os.environ)
     env["BILIBILI_PODCAST_CONFIG_ROOT"] = str(snapshot.root)
@@ -154,6 +196,11 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade.add_argument("--apply", action="store_true")
     upgrade.add_argument("--format", choices=("text", "json"), default="text")
     upgrade.set_defaults(handler=cmd_upgrade)
+    permissions = subparsers.add_parser("permissions")
+    permissions.add_argument("--apply", action="store_true")
+    permissions.add_argument("--restore")
+    permissions.add_argument("--format", choices=("text", "json"), default="text")
+    permissions.set_defaults(handler=cmd_permissions)
     execute = subparsers.add_parser("exec")
     execute.add_argument("--scope", choices=("sync", "web", "scheduler", "publish"), required=True)
     execute.add_argument("command", nargs=argparse.REMAINDER)
