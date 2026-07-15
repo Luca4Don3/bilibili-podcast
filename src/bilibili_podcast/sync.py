@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager
@@ -1084,8 +1085,26 @@ def write_metadata(config: SeriesConfig, paths: SyncPaths, episode: dict, dry_ru
     if dry_run:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(episode, ensure_ascii=False, indent=2), encoding="utf-8")
-    path.chmod(0o644)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(episode, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        temporary.chmod(0o644)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     LOGGER.debug("metadata written series=%s bvid=%s path=%s", config.series, episode["bvid"], path)
 
 
