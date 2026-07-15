@@ -95,9 +95,11 @@ def _weekly_occurrences(schedule: str) -> set[int]:
 
 
 def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> None:
-    period = _period_seconds(update_period)
+    # Validate the period even when timer wakeups are more frequent.  The sync
+    # process owns the update-period gate, so a denser timer is a valid and
+    # useful way to reduce scheduling drift without causing duplicate work.
+    _period_seconds(update_period)
     seen: dict[int, ScheduleEntry] = {}
-    primary_points: set[int] = set()
     if any(entry.kind == "retry" for entry in entries) and not any(
         entry.kind == "primary" for entry in entries
     ):
@@ -111,19 +113,6 @@ def validate_schedules(entries: list[ScheduleEntry], update_period: object) -> N
                     f"{entry.schedule} ({entry.kind})"
                 )
             seen[point] = entry
-            if entry.kind == "primary":
-                primary_points.add(point)
-    if len(primary_points) < 2:
-        return
-    ordered = sorted(primary_points)
-    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
-    gaps.append(7 * 86400 + ordered[0] - ordered[-1])
-    shortest = min(gaps)
-    if shortest < period:
-        raise ValueError(
-            f"primary schedules conflict: shortest interval {shortest}s "
-            f"is less than update_period {period}s"
-        )
 
 
 def replace_schedules_in_connection(
