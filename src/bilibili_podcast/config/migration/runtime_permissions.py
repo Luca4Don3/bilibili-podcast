@@ -534,6 +534,7 @@ def _apply_acl(plan: PermissionPlan) -> None:
         result = _run(("setfacl", "-P", "-n", "-m", f"u:{plan.service_user}:r", "--", *(str(path) for path in chunk)))
         if result.returncode:
             raise ConfigError("cannot apply runtime media file ACL")
+    writable_by_mask: dict[str, list[Path]] = {}
     for path in writable_files:
         entries = _acl_entries(path)
         mask = set(entries.get("mask:", entries.get("group:", "")))
@@ -542,10 +543,17 @@ def _apply_acl(plan: PermissionPlan) -> None:
                 continue
             if key.startswith(("user:", "group:")) and "w" in value and "w" not in mask:
                 raise ConfigError("JSON ACL mask expansion would widen another ACL entry")
-    for chunk in _batch(writable_files):
-        result = _run(("setfacl", "-P", "-m", f"u:{plan.service_user}:rw", "--", *(str(path) for path in chunk)))
-        if result.returncode:
-            raise ConfigError("cannot apply runtime JSON file ACL")
+        target_mask = "".join(permission if permission in mask | {"r", "w"} else "-" for permission in "rwx")
+        writable_by_mask.setdefault(target_mask, []).append(path)
+    for target_mask, paths in writable_by_mask.items():
+        for chunk in _batch(paths):
+            result = _run((
+                "setfacl", "-P", "-n", "-m",
+                f"u:{plan.service_user}:rw,m::{target_mask}", "--",
+                *(str(path) for path in chunk),
+            ))
+            if result.returncode:
+                raise ConfigError("cannot apply runtime JSON file ACL")
 
 
 def _load_inventory(backup: Path) -> list[dict]:
