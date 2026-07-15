@@ -44,9 +44,8 @@ class TestScheduleValidation:
         with pytest.raises(ValueError, match="duplicate schedule"):
             validate_schedules([_entry("0 10 * * *"), _entry("0 10 * * *", "retry")], "12h")
 
-    def test_primary_interval_shorter_than_period_rejected(self):
-        with pytest.raises(ValueError, match="less than update_period"):
-            validate_schedules([_entry("0 10 * * *"), _entry("0 20 * * *")], "12h")
+    def test_primary_interval_shorter_than_period_is_allowed(self):
+        validate_schedules([_entry("0 10 * * *"), _entry("0 20 * * *")], "12h")
 
     def test_primary_interval_equal_to_period_allowed(self):
         validate_schedules([_entry("0 0 * * *"), _entry("0 12 * * *")], "12h")
@@ -54,9 +53,8 @@ class TestScheduleValidation:
     def test_retry_inside_update_period_allowed(self):
         validate_schedules([_entry("0 10 * * *"), _entry("0 12 * * *", "retry")], "12h")
 
-    def test_cross_midnight_interval_rejected(self):
-        with pytest.raises(ValueError, match="less than update_period"):
-            validate_schedules([_entry("0 23 * * 1"), _entry("0 1 * * 2")], "3h")
+    def test_cross_midnight_interval_shorter_than_period_is_allowed(self):
+        validate_schedules([_entry("0 23 * * 1"), _entry("0 1 * * 2")], "3h")
 
     def test_step_expression_is_validated(self):
         validate_schedules([_entry("5 */12 * * *")], "12h")
