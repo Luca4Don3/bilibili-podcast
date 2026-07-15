@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import grp
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ class PermissionTarget:
     path: Path
     compliant: bool
     existed: bool = True
+    required: str = ""
 
 
 @dataclass(frozen=True)
@@ -206,20 +208,52 @@ def _acl_entries(path: Path) -> dict[str, str]:
     entries: dict[str, str] = {}
     for raw in result.stdout.splitlines():
         line = raw.split("#", 1)[0].strip()
-        if not line or line.startswith(("user::", "group::", "other::", "default:user::", "default:group::", "default:other::")):
+        if not line:
             continue
         parts = line.split(":")
-        if len(parts) == 3 and parts[0] in {"user", "mask"}:
+        if len(parts) == 3 and parts[0] in {"user", "group", "mask", "other"}:
             entries[f"{parts[0]}:{parts[1]}"] = parts[2]
-        elif len(parts) == 4 and parts[0] == "default" and parts[1] in {"user", "mask"}:
+        elif len(parts) == 4 and parts[0] == "default" and parts[1] in {"user", "group", "mask", "other"}:
             entries[f"default:{parts[1]}:{parts[2]}"] = parts[3]
     return entries
 
 
-def _acl_is_compliant(path: Path, user: str, *, directory: bool) -> bool:
+def _group_id(name: str) -> int | None:
+    if name.isdigit():
+        return int(name)
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return None
+
+
+def _acl_is_compliant(
+    path: Path,
+    user: str,
+    *,
+    directory: bool,
+    required_access: str | None = None,
+) -> bool:
     entries = _acl_entries(path)
-    required = set("rwx" if directory else "rw")
-    access = _effective_permissions(entries, f"user:{user}", "mask:")
+    required = set(required_access or ("rwx" if directory else "rw"))
+    account = pwd.getpwnam(user)
+    metadata = path.stat(follow_symlinks=False)
+    if metadata.st_uid == account.pw_uid:
+        access = set(entries.get("user:", ""))
+    elif f"user:{user}" in entries:
+        access = _effective_permissions(entries, f"user:{user}", "mask:")
+    else:
+        group_ids = set(os.getgrouplist(user, account.pw_gid))
+        group_access: set[str] = set()
+        if metadata.st_gid in group_ids:
+            group_access.update(entries.get("group:", ""))
+        for key, value in entries.items():
+            if not key.startswith("group:") or key == "group:":
+                continue
+            group_id = _group_id(key.removeprefix("group:"))
+            if group_id in group_ids:
+                group_access.update(value)
+        access = group_access & set(entries.get("mask:", "")) if group_access else set(entries.get("other:", ""))
     if not required <= access:
         return False
     if directory:
@@ -230,11 +264,11 @@ def _acl_is_compliant(path: Path, user: str, *, directory: bool) -> bool:
     return True
 
 
-def _walk(root: Path, series: str, user: str) -> Iterator[PermissionTarget]:
+def _walk(root: Path, series: str, user: str, file_access: str) -> Iterator[PermissionTarget]:
     try:
         root_stat = root.lstat()
     except FileNotFoundError:
-        yield PermissionTarget("directory", series, root, False, False)
+        yield PermissionTarget("directory", series, root, False, False, "rwx")
         return
     if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
         raise UnsafeConfigError("runtime series path is unsafe")
@@ -244,6 +278,7 @@ def _walk(root: Path, series: str, user: str) -> Iterator[PermissionTarget]:
         yield PermissionTarget(
             "directory", series, directory,
             _acl_is_compliant(directory, user, directory=True),
+            True, "rwx",
         )
         try:
             entries = sorted(os.scandir(directory), key=lambda entry: entry.name, reverse=True)
@@ -264,7 +299,10 @@ def _walk(root: Path, series: str, user: str) -> Iterator[PermissionTarget]:
                     raise UnsafeConfigError("runtime tree contains a hard-linked file")
                 yield PermissionTarget(
                     "file", series, path,
-                    _acl_is_compliant(path, user, directory=False),
+                    _acl_is_compliant(
+                        path, user, directory=False, required_access=file_access,
+                    ),
+                    True, file_access,
                 )
             else:
                 raise UnsafeConfigError("runtime tree contains an unsupported object")
@@ -280,16 +318,17 @@ def plan_runtime_permissions(root: str | Path) -> PermissionPlan:
         raise UnsafeConfigError("configured runtime roots overlap")
     series = _series_from_database(database)
     targets: list[PermissionTarget] = []
-    for runtime_root in (media_root, json_root):
+    for runtime_root, file_access in ((media_root, "r"), (json_root, "rw")):
         targets.append(PermissionTarget(
             "directory", None, runtime_root,
             _acl_is_compliant(runtime_root, service_user, directory=True),
+            True, "rwx",
         ))
         for name in series:
             target = runtime_root / name
             if target.parent != runtime_root:
                 raise UnsafeConfigError("runtime series path escapes configured root")
-            targets.extend(_walk(target, name, service_user))
+            targets.extend(_walk(target, name, service_user, file_access))
     return PermissionPlan(
         config_root, service_user, media_root, json_root,
         lock_file, series, tuple(targets),
@@ -353,11 +392,15 @@ def _inventory(plan: PermissionPlan) -> list[dict[str, int | str | bool]]:
         )
         relative = "." if target.path == runtime_root else target.path.relative_to(runtime_root).as_posix()
         if not target.existed:
-            result.append({"root": root_name, "relative": relative, "existed": False})
+            result.append({
+                "root": root_name, "relative": relative,
+                "kind": target.kind, "existed": False,
+            })
             continue
         metadata = target.path.stat(follow_symlinks=False)
         result.append({
-            "root": root_name, "relative": relative, "existed": True,
+            "root": root_name, "relative": relative,
+            "kind": target.kind, "existed": True,
             "inode": metadata.st_ino, "size": metadata.st_size,
             "mtime_ns": metadata.st_mtime_ns, "mode": stat.S_IMODE(metadata.st_mode),
             "uid": metadata.st_uid, "gid": metadata.st_gid,
@@ -471,16 +514,38 @@ def _apply_acl(plan: PermissionPlan) -> None:
     missing = [target.path for target in plan.targets if target.kind == "directory" and not target.existed]
     for path in missing:
         path.mkdir(mode=0o755)
-    directories = [target.path for target in plan.targets if target.kind == "directory"]
-    files = [target.path for target in plan.targets if target.kind == "file"]
+    directories = [
+        target.path for target in plan.targets
+        if target.kind == "directory" and not target.compliant
+    ]
+    readable_files = [
+        target.path for target in plan.targets
+        if target.kind == "file" and target.required == "r" and not target.compliant
+    ]
+    writable_files = [
+        target.path for target in plan.targets
+        if target.kind == "file" and target.required == "rw" and not target.compliant
+    ]
     for chunk in _batch(directories):
         result = _run(("setfacl", "-P", "-n", "-m", f"u:{plan.service_user}:rwx,d:u:{plan.service_user}:rwx", "--", *(str(path) for path in chunk)))
         if result.returncode:
             raise ConfigError("cannot apply runtime directory ACL")
-    for chunk in _batch(files):
-        result = _run(("setfacl", "-P", "-n", "-m", f"u:{plan.service_user}:rw", "--", *(str(path) for path in chunk)))
+    for chunk in _batch(readable_files):
+        result = _run(("setfacl", "-P", "-n", "-m", f"u:{plan.service_user}:r", "--", *(str(path) for path in chunk)))
         if result.returncode:
-            raise ConfigError("cannot apply runtime file ACL")
+            raise ConfigError("cannot apply runtime media file ACL")
+    for path in writable_files:
+        entries = _acl_entries(path)
+        mask = set(entries.get("mask:", entries.get("group:", "")))
+        for key, value in entries.items():
+            if key in {"user:", f"user:{plan.service_user}"} or key.startswith("default:"):
+                continue
+            if key.startswith(("user:", "group:")) and "w" in value and "w" not in mask:
+                raise ConfigError("JSON ACL mask expansion would widen another ACL entry")
+    for chunk in _batch(writable_files):
+        result = _run(("setfacl", "-P", "-m", f"u:{plan.service_user}:rw", "--", *(str(path) for path in chunk)))
+        if result.returncode:
+            raise ConfigError("cannot apply runtime JSON file ACL")
 
 
 def _load_inventory(backup: Path) -> list[dict]:
@@ -505,7 +570,12 @@ def _inventory_path(plan: PermissionPlan, item: dict) -> Path:
     return path
 
 
-def _verify_metadata(plan: PermissionPlan, inventory: list[dict]) -> None:
+def _verify_metadata(
+    plan: PermissionPlan,
+    inventory: list[dict],
+    *,
+    allow_json_mask_change: bool = False,
+) -> None:
     for item in inventory:
         path = _inventory_path(plan, item)
         if not item.get("existed"):
@@ -522,6 +592,15 @@ def _verify_metadata(plan: PermissionPlan, inventory: list[dict]) -> None:
             metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
             stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid,
         )
+        if (
+            actual != expected
+            and allow_json_mask_change
+            and item.get("root") == "json"
+            and item.get("kind") == "file"
+        ):
+            expected_mode = item.get("mode")
+            if isinstance(expected_mode, int):
+                expected = (*expected[:3], expected_mode | stat.S_IWGRP, *expected[4:])
         if actual != expected:
             raise ConfigError("runtime object metadata changed during permission operation")
 
@@ -550,7 +629,7 @@ def _verify_applied(plan: PermissionPlan, inventory: list[dict]) -> PermissionPl
     verified = plan_runtime_permissions(plan.root)
     if verified.noncompliant_directory_count or verified.noncompliant_file_count:
         raise ConfigError("runtime ACL verification failed")
-    _verify_metadata(verified, inventory)
+    _verify_metadata(verified, inventory, allow_json_mask_change=True)
     return verified
 
 
@@ -587,7 +666,15 @@ def run_runtime_permissions(
         if not _timer_window_is_safe():
             raise ConfigError("next scheduler timer is less than five minutes away")
         plan = plan_runtime_permissions(initial.root)
-        if plan.series != initial.series or len(plan.targets) != len(initial.targets):
+        initial_targets = tuple(
+            (target.kind, target.required, target.path, target.existed)
+            for target in initial.targets
+        )
+        current_targets = tuple(
+            (target.kind, target.required, target.path, target.existed)
+            for target in plan.targets
+        )
+        if plan.series != initial.series or current_targets != initial_targets:
             raise ConfigError("runtime permission source changed after planning")
         if restore is not None:
             backup = _backup_path(plan, restore)

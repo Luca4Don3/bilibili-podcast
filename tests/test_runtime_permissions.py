@@ -119,8 +119,33 @@ def test_acl_parser_requires_effective_access_and_default_acl(tmp_path, monkeypa
         permissions, "_run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=""),
     )
+    monkeypatch.setattr(
+        permissions.pwd, "getpwnam",
+        lambda user: SimpleNamespace(pw_uid=-1, pw_gid=-1),
+    )
     assert not permissions._acl_is_compliant(tmp_path, "service", directory=True)
     assert permissions._acl_is_compliant(tmp_path, "service", directory=False)
+
+
+def test_media_read_can_be_satisfied_by_other_without_named_acl(tmp_path, monkeypatch):
+    path = tmp_path / "episode.mp3"
+    path.write_text("audio")
+    output = "\n".join(("user::rw-", "group::r--", "other::r--"))
+    monkeypatch.setattr(
+        permissions, "_run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=""),
+    )
+    monkeypatch.setattr(
+        permissions.pwd, "getpwnam",
+        lambda user: SimpleNamespace(pw_uid=-1, pw_gid=-1),
+    )
+    monkeypatch.setattr(permissions.os, "getgrouplist", lambda user, gid: [])
+    assert permissions._acl_is_compliant(
+        path, "service", directory=False, required_access="r",
+    )
+    assert not permissions._acl_is_compliant(
+        path, "service", directory=False, required_access="rw",
+    )
 
 
 def test_rejects_symlink_and_hard_link(tmp_path, harmless_environment):
