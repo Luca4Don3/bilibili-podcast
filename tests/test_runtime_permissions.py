@@ -15,7 +15,7 @@ from bilibili_podcast.config.migration import runtime_permissions as permissions
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "version_migration" / "snapshots"
-OLD_PRODUCT = "bili" + "pod"
+LEGACY_PRODUCT = "legacy-app"
 
 
 def _installation(tmp_path: Path, version: int = 3) -> Path:
@@ -23,12 +23,12 @@ def _installation(tmp_path: Path, version: int = 3) -> Path:
     root.mkdir()
     for source in (FIXTURES / f"v{version}").glob("*.toml"):
         content = source.read_text(encoding="utf-8")
-        content = content.replace("__ROOT__", str(tmp_path)).replace("__OLD_PRODUCT__", OLD_PRODUCT)
+        content = content.replace("__ROOT__", str(tmp_path)).replace("__OLD_PRODUCT__", LEGACY_PRODUCT)
         target = root / source.name
         target.write_text(content, encoding="utf-8")
         target.chmod(0o600)
     app = (root / "app.toml").read_text(encoding="utf-8")
-    database_name = f"{OLD_PRODUCT}.db" if version == 1 else "bilibili-podcast.db"
+    database_name = f"{LEGACY_PRODUCT}.db" if version == 1 else "bilibili-podcast.db"
     database = tmp_path / "runtime" / "state" / database_name
     database.parent.mkdir(parents=True)
     with sqlite3.connect(database) as connection:
@@ -50,7 +50,7 @@ def _installation(tmp_path: Path, version: int = 3) -> Path:
 def harmless_environment(monkeypatch):
     monkeypatch.setattr(permissions, "_require_tools", lambda **kwargs: None)
     monkeypatch.setattr(permissions, "_require_service_user", lambda user: None)
-    monkeypatch.setattr(permissions, "_acl_is_compliant", lambda *args, **kwargs: False)
+    monkeypatch.setattr(permissions, "_policy_is_compliant", lambda *args, **kwargs: False)
 
 
 def _tree_digest(root: Path) -> dict[str, str]:
@@ -68,9 +68,9 @@ def test_dry_run_writes_nothing_and_checks_files(tmp_path, harmless_environment)
 
     assert not result.applied
     assert result.plan.series == ("alpha", "beta")
-    assert result.plan.file_count == 4
-    assert result.plan.directory_count == 10
-    assert result.plan.noncompliant_file_count == 4
+    assert result.plan.file_count == 15
+    assert result.plan.directory_count == 18
+    assert result.plan.noncompliant_file_count == 15
     assert _tree_digest(tmp_path) == before
     assert not (root / ".migration.lock").exists()
 
@@ -96,7 +96,7 @@ def test_read_only_plan_includes_committed_wal_rows(tmp_path, harmless_environme
     assert after == before
 
 
-@pytest.mark.parametrize("version", (1, 2, 3))
+@pytest.mark.parametrize("version", (2, 3, 4))
 def test_every_config_version_generates_the_same_target_set(
     tmp_path, monkeypatch, harmless_environment, version,
 ):
@@ -105,15 +105,17 @@ def test_every_config_version_generates_the_same_target_set(
     relative = sorted(
         (target.kind, target.series or "", target.path.name) for target in plan.targets
     )
-    assert len(relative) == 14
+    assert len(relative) == 33
     assert plan.series == ("alpha", "beta")
 
 
-def test_acl_parser_requires_effective_access_and_default_acl(tmp_path, monkeypatch):
+def test_acl_parser_requires_exact_access_and_default_acl(tmp_path, monkeypatch):
+    path = tmp_path / "directory"
+    path.mkdir()
     output = "\n".join((
-        "user::rwx", "user:service:rwx", "mask::rwx", "group::r-x", "other::---",
-        "default:user::rwx", "default:user:service:rwx", "default:mask::r-x",
-        "default:group::r-x", "default:other::---",
+        "user::rwx", "user:service:rwx", "mask::rwx", "group::---", "other::---",
+        "default:user::rwx", "default:user:service:rwx", "default:mask::rwx",
+        "default:group::---", "default:other::---",
     ))
     monkeypatch.setattr(
         permissions, "_run",
@@ -123,14 +125,24 @@ def test_acl_parser_requires_effective_access_and_default_acl(tmp_path, monkeypa
         permissions.pwd, "getpwnam",
         lambda user: SimpleNamespace(pw_uid=-1, pw_gid=-1),
     )
-    assert not permissions._acl_is_compliant(tmp_path, "service", directory=True)
-    assert permissions._acl_is_compliant(tmp_path, "service", directory=False)
+    assert permissions._acl_is_compliant(path, "service", directory=True)
+    monkeypatch.setattr(
+        permissions, "_run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=output.replace("other::---", "other::r--", 1),
+            stderr="",
+        ),
+    )
+    assert not permissions._acl_is_compliant(path, "service", directory=True)
 
 
-def test_media_read_can_be_satisfied_by_other_without_named_acl(tmp_path, monkeypatch):
+def test_media_read_requires_named_or_owner_access_without_extra_other(tmp_path, monkeypatch):
     path = tmp_path / "episode.mp3"
     path.write_text("audio")
-    output = "\n".join(("user::rw-", "group::r--", "other::r--"))
+    output = "\n".join((
+        "user::rw-", "user:service:r--", "group::---", "mask::r--", "other::---",
+    ))
     monkeypatch.setattr(
         permissions, "_run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=output, stderr=""),
@@ -139,12 +151,26 @@ def test_media_read_can_be_satisfied_by_other_without_named_acl(tmp_path, monkey
         permissions.pwd, "getpwnam",
         lambda user: SimpleNamespace(pw_uid=-1, pw_gid=-1),
     )
-    monkeypatch.setattr(permissions.os, "getgrouplist", lambda user, gid: [])
-    assert permissions._acl_is_compliant(
-        path, "service", directory=False, required_access="r",
+    assert permissions._policy_is_compliant(
+        path,
+        "service",
+        None,
+        permissions.AclPolicy("rw", service="r"),
     )
-    assert not permissions._acl_is_compliant(
-        path, "service", directory=False, required_access="rw",
+    monkeypatch.setattr(
+        permissions,
+        "_run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=output.replace("other::---", "other::r--"),
+            stderr="",
+        ),
+    )
+    assert not permissions._policy_is_compliant(
+        path,
+        "service",
+        None,
+        permissions.AclPolicy("rw", service="r"),
     )
 
 
@@ -228,7 +254,7 @@ def stat_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 
 
-def test_cli_text_and_json_do_not_expose_runtime_paths(tmp_path, monkeypatch, capsys):
+def test_cli_text_and_json_do_not_expose_runtime_paths_or_series(tmp_path, monkeypatch, capsys):
     root = _installation(tmp_path)
     target = permissions.PermissionTarget("file", "alpha", tmp_path / "private" / "secret.dat", False)
     plan = permissions.PermissionPlan(
@@ -242,17 +268,22 @@ def test_cli_text_and_json_do_not_expose_runtime_paths(tmp_path, monkeypatch, ca
     assert cli.main(["--root", str(root), "permissions"]) == 0
     text_output = capsys.readouterr().out
     assert str(tmp_path) not in text_output
-    assert "alpha" in text_output
+    assert "alpha" not in text_output
     assert cli.main(["--root", str(root), "permissions", "--format", "json"]) == 0
     json_output = capsys.readouterr().out
     assert str(tmp_path) not in json_output
+    assert "alpha" not in json_output
 
 
 def test_apply_failure_runs_verified_rollback(tmp_path, monkeypatch, harmless_environment):
+    from bilibili_podcast.config.migration import versioning
+
     plan = permissions.plan_runtime_permissions(_installation(tmp_path))
     backup = plan.root / ".backups" / "permissions-test"
     calls: list[str] = []
-    monkeypatch.setattr(permissions, "plan_runtime_permissions", lambda root: plan)
+    monkeypatch.setattr(permissions, "plan_runtime_permissions", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(permissions, "_load_snapshots", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(permissions, "_build_permission_plan", lambda *args: plan)
     monkeypatch.setattr(permissions, "_timer_window_is_safe", lambda: True)
     monkeypatch.setattr(permissions, "_create_backup", lambda value: backup)
     monkeypatch.setattr(permissions, "_load_inventory", lambda value: [])
@@ -264,28 +295,50 @@ def test_apply_failure_runs_verified_rollback(tmp_path, monkeypatch, harmless_en
         permissions, "_restore_backup",
         lambda *args, **kwargs: calls.append("restored"),
     )
+    monkeypatch.setattr(versioning, "load_plan", lambda *args: {
+        "state": "data_applied",
+        "plan_id": "a" * 48,
+    })
+    monkeypatch.setattr(versioning, "verify_plan_post_data", lambda *args: None)
     with pytest.raises(ConfigError, match="injected apply failure"):
-        permissions.run_runtime_permissions(plan.root, apply=True)
+        permissions.run_runtime_permissions(
+            plan.root,
+            apply=True,
+            plan_id="a" * 48,
+        )
     assert calls == ["restored"]
 
 
 def test_verification_failure_runs_rollback(tmp_path, monkeypatch, harmless_environment):
+    from bilibili_podcast.config.migration import versioning
+
     plan = permissions.plan_runtime_permissions(_installation(tmp_path))
     backup = plan.root / ".backups" / "permissions-test"
     calls: list[str] = []
-    monkeypatch.setattr(permissions, "plan_runtime_permissions", lambda root: plan)
+    monkeypatch.setattr(permissions, "plan_runtime_permissions", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(permissions, "_load_snapshots", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(permissions, "_build_permission_plan", lambda *args: plan)
     monkeypatch.setattr(permissions, "_timer_window_is_safe", lambda: True)
     monkeypatch.setattr(permissions, "_create_backup", lambda value: backup)
     monkeypatch.setattr(permissions, "_load_inventory", lambda value: [])
     monkeypatch.setattr(permissions, "_apply_acl", lambda value: None)
     monkeypatch.setattr(
         permissions, "_verify_applied",
-        lambda *args: (_ for _ in ()).throw(ConfigError("injected verification failure")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConfigError("injected verification failure")),
     )
     monkeypatch.setattr(
         permissions, "_restore_backup",
         lambda *args, **kwargs: calls.append("restored"),
     )
+    monkeypatch.setattr(versioning, "load_plan", lambda *args: {
+        "state": "data_applied",
+        "plan_id": "a" * 48,
+    })
+    monkeypatch.setattr(versioning, "verify_plan_post_data", lambda *args: None)
     with pytest.raises(ConfigError, match="injected verification failure"):
-        permissions.run_runtime_permissions(plan.root, apply=True)
+        permissions.run_runtime_permissions(
+            plan.root,
+            apply=True,
+            plan_id="a" * 48,
+        )
     assert calls == ["restored"]

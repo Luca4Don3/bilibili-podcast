@@ -1,17 +1,13 @@
 from __future__ import annotations
 
 import shutil
-import tomllib
-import json
-import os
-import re
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .. import db
+from ..config.manager import ConfigError, ConfigManager
 
 
 @dataclass
@@ -184,29 +180,7 @@ class SeriesRemovalService:
             path.unlink(missing_ok=True)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._atomic_write(path, content, mode)
-
-    def _atomic_write_users_conf(self, content: bytes, mode: int) -> None:
-        self._atomic_write(self.users_conf, content, mode)
-
-    @staticmethod
-    def _atomic_write(path: Path, content: bytes, mode: int) -> None:
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=path.parent,
-                prefix=f".{path.name}.", suffix=".tmp", delete=False,
-            ) as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-                temporary = Path(handle.name)
-            temporary.chmod(mode)
-            temporary.replace(path)
-            temporary = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        ConfigManager.write_file_bytes(path, content, mode)
 
     @staticmethod
     def _file_count(path: Path) -> int:
@@ -231,23 +205,19 @@ class SeriesRemovalService:
         if not self.users_conf.exists():
             return
         users = self._read_toml_users()
-        output: list[str] = []
         changed = False
         for name, user in users.items():
             names = [item for item in user.get("series", []) if item != series]
             changed = changed or len(names) != len(user.get("series", []))
             if not names:
+                user["series"] = []
                 continue
-            token = user.get("token")
-            encoded_series = ", ".join(json.dumps(item, ensure_ascii=False) for item in names)
-            output.extend((
-                f"[users.{json.dumps(name, ensure_ascii=False)}]",
-                f"token = {json.dumps(token, ensure_ascii=False)}",
-                f"series = [{encoded_series}]", "",
-            ))
+            user["series"] = names
         if changed:
-            self._atomic_write_users_conf(
-                "\n".join(output).encode("utf-8"),
+            ConfigManager.write_rss_users_file(
+                self.users_conf,
+                {name: user for name, user in users.items()
+                 if user.get("series")},
                 self.users_conf.stat().st_mode & 0o777,
             )
 
@@ -255,48 +225,24 @@ class SeriesRemovalService:
         if not self.publish_conf.is_file():
             raise ValueError("publish.toml is required for series removal")
         try:
-            with self.publish_conf.open("rb") as handle:
-                data = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise ValueError(f"invalid publish.toml: {type(exc).__name__}") from None
-        gone = (data.get("publish") or {}).get("gone_series")
-        if not isinstance(gone, list) or not all(isinstance(item, str) for item in gone):
-            raise ValueError("invalid publish.toml gone_series")
-        return gone
+            return ConfigManager.read_publish_gone_series(self.publish_conf)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from None
 
     def _mark_series_gone(self, series: str, gone_series: list[str]) -> None:
         if series in gone_series:
             return
-        replacement = "gone_series = " + json.dumps([*gone_series, series], ensure_ascii=False)
-        content, count = re.subn(
-            r"(?m)^gone_series\s*=\s*\[[^\r\n]*\]\s*$",
-            replacement,
-            self.publish_conf.read_text(encoding="utf-8"),
-            count=1,
-        )
-        if count != 1:
-            raise ValueError("invalid publish.toml gone_series declaration")
-        self._atomic_write(
-            self.publish_conf,
-            content.encode("utf-8"),
-            self.publish_conf.stat().st_mode & 0o777,
-        )
+        try:
+            ConfigManager.write_publish_gone_series(
+                self.publish_conf,
+                [*gone_series, series],
+                self.publish_conf.stat().st_mode & 0o777,
+            )
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from None
 
     def _read_toml_users(self) -> dict[str, dict[str, Any]]:
-        with self.users_conf.open("rb") as handle:
-            data = tomllib.load(handle)
-        users = data.get("users") or {}
-        if not isinstance(users, dict):
-            raise ValueError("invalid rss-users.toml users table")
-        for name, user in users.items():
-            if not isinstance(name, str) or not name or not isinstance(user, dict):
-                raise ValueError("invalid rss-users.toml user entry")
-            if set(user) - {"token", "series"}:
-                raise ValueError("unknown rss-users.toml user field")
-            token = user.get("token")
-            series = user.get("series")
-            if not isinstance(token, str) or not token or any(ord(char) < 32 for char in token):
-                raise ValueError("invalid rss-users.toml token")
-            if not isinstance(series, list) or not all(isinstance(item, str) for item in series):
-                raise ValueError("invalid rss-users.toml series list")
-        return users
+        try:
+            return ConfigManager.read_rss_users_file(self.users_conf)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from None

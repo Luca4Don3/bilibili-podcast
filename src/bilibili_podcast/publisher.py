@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import logging
 import os
@@ -15,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .config.models import ConfigSnapshot
+from .locks import LockKind, ordered_lock
+from .secure_files import ensure_directory
 
 
 LOGGER = logging.getLogger(__name__)
@@ -31,16 +32,13 @@ def token_digest(token: str) -> str:
 
 @contextmanager
 def _publish_lock(root: Path):
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_directory(root)
     lock_path = root / ".publish.lock"
-    if lock_path.is_symlink():
-        raise PublishError(f"unsafe publish lock: {lock_path}")
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+    try:
+        with ordered_lock(lock_path, LockKind.PUBLISH, blocking=True):
             yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise PublishError(f"unsafe publish lock: {type(exc).__name__}") from None
 
 
 def _fsync_file(path: Path) -> None:

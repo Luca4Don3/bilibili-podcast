@@ -30,8 +30,8 @@ def test_write_metadata_atomically_replaces_existing_file(tmp_path, monkeypatch)
     sync.write_metadata(config, paths, episode, dry_run=False)
 
     assert json.loads(target.read_text(encoding="utf-8")) == episode
-    assert target.stat().st_mode & 0o777 == 0o644
-    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert list(target.parent.glob(".file-operation-*")) == []
 
 
 def test_write_metadata_replace_failure_preserves_original(tmp_path, monkeypatch):
@@ -40,7 +40,7 @@ def test_write_metadata_replace_failure_preserves_original(tmp_path, monkeypatch
     target.parent.mkdir(parents=True)
     target.write_text("old", encoding="utf-8")
 
-    def fail_replace(source, destination):
+    def fail_replace(source, destination, **kwargs):
         raise OSError("replace failed")
 
     monkeypatch.setattr(os, "replace", fail_replace)
@@ -49,7 +49,7 @@ def test_write_metadata_replace_failure_preserves_original(tmp_path, monkeypatch
         sync.write_metadata(config, paths, episode, dry_run=False)
 
     assert target.read_text(encoding="utf-8") == "old"
-    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+    assert list(target.parent.glob(".file-operation-*")) == []
 
 
 def test_write_metadata_dry_run_does_not_create_directory(tmp_path):
@@ -74,25 +74,27 @@ def test_download_episode_uses_private_temporary_cookie_copy(tmp_path, monkeypat
     cookie_file.write_text("original-cookie", encoding="utf-8")
     observed_cookie = None
 
-    def fake_run(command, check):
+    def fake_run(command, **kwargs):
         nonlocal observed_cookie
         observed_cookie = Path(command[command.index("--cookies") + 1])
-        assert check is True
+        assert kwargs["check"] is False
         assert observed_cookie != cookie_file
         assert observed_cookie.read_text(encoding="utf-8") == "original-cookie"
         assert observed_cookie.stat().st_mode & 0o777 == 0o600
         observed_cookie.write_text("updated-cookie", encoding="utf-8")
-        output = sync.media_path(config, paths, episode["bvid"])
+        output = Path(command[command.index("-o") + 1].replace("%(ext)s", "mp3"))
         output.write_bytes(b"audio")
+        return sync.subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(sync.subprocess, "run", fake_run)
+    monkeypatch.setattr("bilibili_podcast.media_security._probe_media_fd", lambda *args, **kwargs: None)
 
     sync.download_episode(config, paths, episode, str(cookie_file), dry_run=False)
 
     assert observed_cookie is not None
     assert not observed_cookie.exists()
     assert cookie_file.read_text(encoding="utf-8") == "original-cookie"
-    assert sync.media_path(config, paths, episode["bvid"]).stat().st_mode & 0o777 == 0o644
+    assert sync.media_path(config, paths, episode["bvid"]).stat().st_mode & 0o777 == 0o400
 
 
 def test_download_episode_cleans_temporary_cookie_after_failure(tmp_path, monkeypatch):
@@ -109,7 +111,7 @@ def test_download_episode_cleans_temporary_cookie_after_failure(tmp_path, monkey
     cookie_file.write_text("original-cookie", encoding="utf-8")
     observed_cookie = None
 
-    def fail_run(command, check):
+    def fail_run(command, **kwargs):
         nonlocal observed_cookie
         observed_cookie = Path(command[command.index("--cookies") + 1])
         observed_cookie.write_text("updated-cookie", encoding="utf-8")
@@ -117,7 +119,8 @@ def test_download_episode_cleans_temporary_cookie_after_failure(tmp_path, monkey
 
     monkeypatch.setattr(sync.subprocess, "run", fail_run)
 
-    sync.download_episode(config, paths, episode, str(cookie_file), dry_run=False)
+    with pytest.raises(sync.MediaDownloadError):
+        sync.download_episode(config, paths, episode, str(cookie_file), dry_run=False)
 
     assert observed_cookie is not None
     assert not observed_cookie.exists()

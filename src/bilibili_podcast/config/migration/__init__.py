@@ -9,6 +9,7 @@ import sqlite3
 import stat
 import tempfile
 import tomllib
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -16,20 +17,33 @@ from typing import Mapping
 from ..manager import ConfigError, ConfigManager, UnsafeConfigError
 from ..models import SeriesConfig
 from ..repositories import LegacyYamlRepository
-from ..schema import QUALITY_ALIASES, REMOVED_LEGACY_ENV
+from ..schema import (
+    LEGACY_ENV_MAP,
+    LEGACY_INPUT_ONLY,
+    QUALITY_ALIASES,
+    REMOVED_LEGACY_ENV,
+)
 
 from .runtime_permissions import (
     PermissionPlan,
     PermissionResult,
     plan_runtime_permissions,
+    verify_permissions_applied,
     run_runtime_permissions,
+)
+from .system_upgrade import (
+    SystemFile,
+    SystemUpgradePlan,
+    SystemUpgradeResult,
+    plan_system_upgrade,
+    restore_system_backup,
+    run_system_upgrade,
+    verify_system_applied,
 )
 
 
 _ASSIGNMENT_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
-_OLD_ENV_PREFIX = ("BILI" + "POD") + "_"
 _CURRENT_ENV_PREFIX = "BILIBILI_PODCAST_"
-_LEGACY_COOKIE_NAME = _OLD_ENV_PREFIX.lower().rstrip("_") + "_session"
 LEGACY_UNVERSIONED_PROFILE = "legacy-unversioned"
 LEGACY_V0_PROFILE = "legacy-v0"
 LEGACY_PROFILES = (LEGACY_UNVERSIONED_PROFILE, LEGACY_V0_PROFILE)
@@ -54,6 +68,29 @@ _LAYOUT_FIELDS = {
     "cron_script_dir": "BILIBILI_PODCAST_CRON_SCRIPT_DIR",
     "wrapper_dir": "BILIBILI_PODCAST_WRAPPER_DIR",
 }
+_KNOWN_ENV_NAMES = frozenset(
+    set(_LAYOUT_FIELDS.values())
+    | set(LEGACY_ENV_MAP)
+    | set(LEGACY_INPUT_ONLY)
+    | set(REMOVED_LEGACY_ENV)
+)
+
+
+def _normalize_legacy_key(key: str) -> tuple[str, str | None]:
+    if key in _KNOWN_ENV_NAMES:
+        return key, None
+    candidates = []
+    for current in _KNOWN_ENV_NAMES:
+        if not current.startswith(_CURRENT_ENV_PREFIX):
+            continue
+        suffix = current.removeprefix(_CURRENT_ENV_PREFIX)
+        marker = f"_{suffix}"
+        if key.endswith(marker) and len(key) > len(marker):
+            candidates.append((len(marker), current, key[:-len(marker)]))
+    if not candidates:
+        return key, None
+    _, current, prefix = max(candidates)
+    return current, prefix
 
 
 @dataclass(frozen=True)
@@ -70,15 +107,18 @@ class MigratedSeries:
     config: SeriesConfig
     schedules: tuple[str, ...]
     retry_schedules: tuple[str, ...]
+    cron_enabled: bool = True
+    allowed_users: tuple[str, ...] = ()
 
 
-def read_legacy_env(path: str | Path | None) -> dict[str, str]:
+def _read_legacy_env(path: str | Path | None) -> tuple[dict[str, str], frozenset[str]]:
     if path is None:
-        return {}
+        return {}, frozenset()
     source = Path(path)
     if not source.exists():
         raise ConfigError(f"legacy env file does not exist: {source}")
     result: dict[str, str] = {}
+    prefixes: set[str] = set()
     try:
         lines = source.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
@@ -91,15 +131,21 @@ def read_legacy_env(path: str | Path | None) -> dict[str, str]:
         if not match:
             raise ConfigError(f"unsupported legacy env syntax {source}:{line_number}")
         key, value = match.groups()
-        if key.startswith(_OLD_ENV_PREFIX):
-            key = _CURRENT_ENV_PREFIX + key.removeprefix(_OLD_ENV_PREFIX)
+        key, prefix = _normalize_legacy_key(key)
+        if prefix is not None:
+            prefixes.add(prefix)
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
             value = value[1:-1]
         if "$" in value or "`" in value:
             raise ConfigError(f"dynamic legacy env value is not supported {source}:{line_number}")
         result[key] = value
-    return result
+    return result, frozenset(prefixes)
+
+
+def read_legacy_env(path: str | Path | None) -> dict[str, str]:
+    values, _ = _read_legacy_env(path)
+    return values
 
 
 def read_legacy_layout(path: str | Path) -> dict[str, str]:
@@ -225,15 +271,23 @@ def _rss_users_toml(users: list[tuple[str, str, list[str]]]) -> str:
     return "\n\n".join(chunks) + "\n"
 
 
-def _normalize_legacy_series(root: Path) -> tuple[list[MigratedSeries], tuple[str, ...]]:
-    repository = LegacyYamlRepository(root)
+def _normalize_legacy_series_paths(
+    paths: list[Path] | tuple[Path, ...],
+) -> tuple[list[MigratedSeries], tuple[str, ...]]:
     configs = []
     normalizations: list[str] = []
-    for path in repository.paths():
+    for path in paths:
         try:
-            raw = repository.read_raw(path)
+            raw = LegacyYamlRepository(path.parent).read_raw(path)
             raw_sync = raw.get("sync") or {}
-            config = SeriesConfig.from_yaml(path)
+            access_value = raw.get("access")
+            if isinstance(access_value, dict):
+                unknown_access = set(access_value) - {"allowed_users", "users"}
+                if unknown_access:
+                    raise ValueError(
+                        f"unknown access field: {sorted(unknown_access)[0]}"
+                    )
+            config = SeriesConfig.from_yaml(path, legacy=True)
         except (OSError, UnicodeError, ValueError) as exc:
             raise ConfigError(
                 f"invalid legacy series configuration {path}: {type(exc).__name__}"
@@ -248,8 +302,20 @@ def _normalize_legacy_series(root: Path) -> tuple[list[MigratedSeries], tuple[st
         cron = raw.get("cron") or {}
         schedules = tuple(cron.get("schedules", [])) if isinstance(cron, dict) else ()
         retry_schedules = tuple(cron.get("retry_schedules", [])) if isinstance(cron, dict) else ()
-        configs.append(MigratedSeries(config, schedules, retry_schedules))
+        cron_enabled = _bool(str(cron.get("enabled", True)), True) if isinstance(cron, dict) else True
+        access = raw.get("access") or {}
+        allowed = access.get("allowed_users", access.get("users", [])) if isinstance(access, dict) else []
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
+            raise ConfigError(f"invalid legacy access users {path}")
+        configs.append(MigratedSeries(config, schedules, retry_schedules, cron_enabled, tuple(allowed)))
     return configs, tuple(normalizations)
+
+
+def _normalize_legacy_series(root: Path) -> tuple[list[MigratedSeries], tuple[str, ...]]:
+    repository = LegacyYamlRepository(root)
+    return _normalize_legacy_series_paths(list(repository.paths()))
 
 
 def _write_migrated_series(path: Path, configs: list[MigratedSeries]) -> None:
@@ -269,18 +335,25 @@ def _write_migrated_series(path: Path, configs: list[MigratedSeries]) -> None:
                 conn, config.series,
                 list(migrated.schedules), list(migrated.retry_schedules),
             )
+            conn.execute("UPDATE cron_schedule SET enabled=? WHERE series=?", (int(migrated.cron_enabled), config.series))
+            conn.execute("DELETE FROM access_rule WHERE series=?", (config.series,))
+            conn.executemany(
+                "INSERT INTO access_rule(series, allowed_user) VALUES(?, ?)",
+                [(config.series, user) for user in migrated.allowed_users],
+            )
 
 
 def migrate_legacy(
     *,
     legacy_env: str | Path | None,
     legacy_web_env: str | Path | None,
-    legacy_series_dir: str | Path | None,
+    legacy_series_dir: str | Path | list[str | Path] | tuple[str | Path, ...] | None,
     legacy_rss_users: str | Path | None,
     output_root: str | Path,
     apply: bool = False,
     profile: str = LEGACY_UNVERSIONED_PROFILE,
     layout_manifest: str | Path | None = None,
+    series_source: str | None = None,
 ) -> MigrationResult:
     if profile not in LEGACY_PROFILES:
         raise ConfigError(f"unknown legacy migration profile: {profile}")
@@ -288,13 +361,46 @@ def migrate_legacy(
         raise ConfigError("legacy-v0 migration requires a layout manifest")
     if profile != LEGACY_V0_PROFILE and layout_manifest is not None:
         raise ConfigError("layout manifest is only valid with legacy-v0")
-    env = read_legacy_env(legacy_env)
-    web_env = read_legacy_env(legacy_web_env)
+    if series_source not in {None, "yaml", "db-authoritative"}:
+        raise ConfigError("unknown legacy series source")
+    env, env_prefixes = _read_legacy_env(legacy_env)
+    web_env, web_prefixes = _read_legacy_env(legacy_web_env)
+    legacy_prefixes = env_prefixes | web_prefixes
+    if len(legacy_prefixes) > 1:
+        raise ConfigError("legacy migration inputs use inconsistent environment prefixes")
+    legacy_cookie_names = (
+        [f"{next(iter(legacy_prefixes)).lower()}_session"]
+        if profile == LEGACY_V0_PROFILE and legacy_prefixes
+        else []
+    )
     merged = {**env, **web_env}
     if layout_manifest is not None:
         # The explicit manifest is authoritative for paths. Historical shell
         # files were incomplete and frequently retained pre-release paths.
         merged.update(read_legacy_layout(layout_manifest))
+    candidate_state_root = merged.get("BILIBILI_PODCAST_STATE_ROOT", "")
+    candidate_database = Path(
+        merged.get(
+            "BILIBILI_PODCAST_CONFIG_DB",
+            f"{candidate_state_root}/bilibili-podcast.db",
+        )
+    )
+    if series_source is None:
+        active_rows = False
+        if candidate_database.exists():
+            from .versioning import database_fingerprint
+
+            counts = database_fingerprint(candidate_database)["table_counts"]
+            active_rows = any(
+                count
+                for table, count in counts.items()
+                if table != "schema_version"
+            )
+        if active_rows:
+            raise ConfigError(
+                "active database contains data; explicitly select --series-source"
+            )
+        series_source = "yaml"
     app_dir = _require(merged, "BILIBILI_PODCAST_APP_DIR")
     state_root = _require(merged, "BILIBILI_PODCAST_STATE_ROOT")
     removed_rsync = sorted(set(merged) & REMOVED_LEGACY_ENV)
@@ -308,10 +414,11 @@ def migrate_legacy(
                 "published_rss_root": _require(merged, "BILIBILI_PODCAST_PUBLISHED_RSS_ROOT"),
                 "state_root": state_root,
                 "log_dir": _require(merged, "BILIBILI_PODCAST_LOG_DIR"),
+                "fallback_log_dir": "/tmp/bilibili-podcast-logs",
                 "secrets_dir": _require(merged, "BILIBILI_PODCAST_SECRETS_DIR"),
             }),
             ("install", {"app_dir": app_dir, "venv_bin": _require(merged, "BILIBILI_PODCAST_VENV_BIN")}),
-            ("executables", {"sync": _require(merged, "BILIBILI_PODCAST_SYNC_PATH"), "ffmpeg": "ffmpeg", "bilibili_podcast_config": "bilibili-podcast-config"}),
+            ("executables", {"sync": _require(merged, "BILIBILI_PODCAST_SYNC_PATH"), "ffmpeg": "ffmpeg", "ffprobe": "ffprobe", "bilibili_podcast_config": "bilibili-podcast-config"}),
         ]),
         "sync.toml": _toml([
             ("downloads", {"max_per_run": 20, "scheduled_max_per_run": 1, "min_free_gb": _number(merged.get("BILIBILI_PODCAST_MIN_FREE_GB", "5"), "BILIBILI_PODCAST_MIN_FREE_GB", float)}),
@@ -322,7 +429,7 @@ def migrate_legacy(
         ]),
         "web.toml": _toml([
             ("server", {"enabled": bool(merged.get("BILIBILI_PODCAST_WEB_PASSWORD")), "host": "127.0.0.1", "port": 8000}),
-            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": [_LEGACY_COOKIE_NAME] if profile == LEGACY_V0_PROFILE else [], "session_max_age_seconds": 86400}),
+            ("security", {"password": merged.get("BILIBILI_PODCAST_WEB_PASSWORD", ""), "https": _bool(merged.get("BILIBILI_PODCAST_HTTPS")), "cookie_name": "bilibili_podcast_session", "previous_cookie_names": legacy_cookie_names, "session_max_age_seconds": 86400}),
         ]),
         "scheduler.toml": _toml([
             ("runtime", {"user": "bilibili-podcast", "group": "bilibili-podcast"}),
@@ -337,8 +444,39 @@ def migrate_legacy(
         "rss-users.toml": _rss_users_toml(_parse_rss_users(legacy_rss_users)),
     }
     configs, normalizations = ([], ())
-    if legacy_series_dir is not None:
-        configs, normalizations = _normalize_legacy_series(Path(legacy_series_dir))
+    series_dirs = [] if legacy_series_dir is None else (
+        list(legacy_series_dir) if isinstance(legacy_series_dir, (list, tuple))
+        else [legacy_series_dir]
+    )
+    seen_files: dict[str, str] = {}
+    unique_paths: list[Path] = []
+    for series_dir in series_dirs:
+        repository = LegacyYamlRepository(Path(series_dir))
+        for path in repository.paths():
+            raw_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            previous = seen_files.get(path.name)
+            if previous is not None and previous != raw_digest:
+                raise ConfigError(
+                    f"conflicting legacy series file: {path.name}"
+                )
+            if previous is None:
+                seen_files[path.name] = raw_digest
+                unique_paths.append(path)
+    found, notes = _normalize_legacy_series_paths(unique_paths)
+    seen_series: dict[str, str] = {}
+    for migrated in found:
+        semantic_digest = hashlib.sha256(
+            repr(migrated).encode("utf-8")
+        ).hexdigest()
+        previous = seen_series.get(migrated.config.series)
+        if previous is not None and previous != semantic_digest:
+            raise ConfigError(
+                f"conflicting legacy series configuration: {migrated.config.series}"
+            )
+        if previous is None:
+            seen_series[migrated.config.series] = semantic_digest
+            configs.append(migrated)
+    normalizations += notes
     if removed_rsync:
         normalizations += ("legacy rsync configuration was removed and was not migrated",)
     output = Path(output_root).expanduser()
@@ -351,7 +489,7 @@ def migrate_legacy(
                 staged.write_text(content, encoding="utf-8")
                 staged.chmod(0o600)
             ConfigManager(validation_root, environ={}).load()
-            if configs:
+            if configs and series_source == "yaml":
                 _write_migrated_series(validation_root / "series.db", configs)
         return MigrationResult(output, files, len(configs), normalizations, False)
 
@@ -369,6 +507,7 @@ def migrate_legacy(
     db_path: Path | None = None
     db_existed = False
     db_backup: Path | None = None
+    authoritative_before: dict | None = None
     database_changed = False
     replaced: list[tuple[Path, Path | None]] = []
     try:
@@ -377,26 +516,47 @@ def migrate_legacy(
             staged.write_text(content, encoding="utf-8")
             staged.chmod(0o600)
         ConfigManager(temp_root, environ={}).load()
-        if configs:
-            db_path = Path(merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db"))
+        db_path = Path(merged.get("BILIBILI_PODCAST_CONFIG_DB", f"{state_root}/bilibili-podcast.db"))
+        db_existed = db_path.exists()
+        if series_source == "db-authoritative":
+            from .versioning import database_fingerprint
+
+            authoritative_before = database_fingerprint(db_path)
+        if configs and series_source == "yaml":
             if db_path.is_symlink():
                 raise UnsafeConfigError(f"unsafe migration database {db_path}: symlink")
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            db_existed = db_path.exists()
             fd, staged_name = tempfile.mkstemp(prefix=f".{db_path.name}.", dir=db_path.parent)
             os.close(fd)
             staged_db = Path(staged_name)
             if db_existed:
                 with sqlite3.connect(db_path) as source_conn, sqlite3.connect(staged_db) as staged_conn:
                     source_conn.backup(staged_conn)
+            else:
+                staged_db.unlink()
             _write_migrated_series(staged_db, configs)
             with sqlite3.connect(staged_db) as conn:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.execute("PRAGMA journal_mode=DELETE")
         from .versioning import _application_lock, _online_database_backup, _write_manifest
 
+        from .versioning import LATEST_VERSION, VERSION_FILE, _version_rows
+
+        database_versions = _version_rows(db_path) if db_existed else ()
+        if db_existed and (
+            len(database_versions) != 1
+            or not 1 <= database_versions[0] <= LATEST_VERSION
+        ):
+            raise ConfigError(
+                "active database must have one supported version before legacy migration"
+            )
+        install_version = database_versions[0] if database_versions else LATEST_VERSION
+        marker = temp_root / VERSION_FILE
+        marker.write_text(f"{install_version}\n", encoding="ascii")
+        marker.chmod(0o600)
+
         planned_configs: list[tuple[Path, Path, Path | None]] = []
-        for name in generated:
+        for name in (*generated, VERSION_FILE):
             target = output / name
             backup: Path | None = None
             if target.exists():
@@ -421,6 +581,13 @@ def migrate_legacy(
                     staged_db.replace(db_path)
                     replaced.append((db_path, None))
                     staged_db = None
+            if authoritative_before is not None:
+                from .versioning import database_fingerprint
+
+                if database_fingerprint(db_path) != authoritative_before:
+                    raise ConfigError(
+                        "db-authoritative migration changed the active database"
+                    )
     except Exception:
         for target, backup in reversed(replaced):
             if backup is not None and backup.exists():
@@ -435,37 +602,32 @@ def migrate_legacy(
         if staged_db is not None:
             staged_db.unlink(missing_ok=True)
         shutil.rmtree(temp_root, ignore_errors=True)
-    from .versioning import upgrade_installation
-
-    try:
-        upgrade_installation(output, apply=True)
-    except Exception:
-        for target, backup in reversed(replaced):
-            if backup is not None and backup.exists():
-                shutil.copy2(backup, target)
-            else:
-                target.unlink(missing_ok=True)
-        if database_changed and db_backup is not None and db_path is not None:
-            with sqlite3.connect(db_backup) as source_conn, sqlite3.connect(db_path) as live_conn:
-                source_conn.backup(live_conn)
-        raise
     return MigrationResult(output, files, len(configs), normalizations, True)
 
 
 from .versioning import (  # noqa: E402  (legacy adapter is defined before the public facade)
+    ACTIVE_UPGRADE_SENTINEL,
     EARLIEST_UNIFIED_VERSION,
     LATEST_VERSION,
     PRE_VERSIONED_CURRENT,
     VERSION_FILE,
     VersionMigrationPlan,
     VersionMigrationResult,
+    apply_data_upgrade,
     detect_version,
+    finalize_upgrade,
+    load_plan,
     plan_upgrade,
+    prepare_upgrade,
+    rollback_upgrade,
+    status_upgrade,
+    update_plan_state,
     upgrade_installation,
 )
 
 
 __all__ = (
+    "ACTIVE_UPGRADE_SENTINEL",
     "EARLIEST_UNIFIED_VERSION",
     "LATEST_VERSION",
     "LEGACY_PROFILES",
@@ -479,12 +641,27 @@ __all__ = (
     "PermissionResult",
     "VersionMigrationPlan",
     "VersionMigrationResult",
+    "apply_data_upgrade",
     "detect_version",
+    "finalize_upgrade",
+    "load_plan",
     "migrate_legacy",
     "plan_upgrade",
+    "prepare_upgrade",
     "plan_runtime_permissions",
+    "verify_permissions_applied",
     "read_legacy_env",
     "read_legacy_layout",
     "run_runtime_permissions",
+    "SystemFile",
+    "SystemUpgradePlan",
+    "SystemUpgradeResult",
+    "plan_system_upgrade",
+    "restore_system_backup",
+    "run_system_upgrade",
+    "verify_system_applied",
+    "rollback_upgrade",
+    "status_upgrade",
+    "update_plan_state",
     "upgrade_installation",
 )

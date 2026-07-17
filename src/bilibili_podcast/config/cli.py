@@ -12,7 +12,15 @@ from typing import Any
 
 from .manager import ConfigError, ConfigManager
 from .migration import (
-    LEGACY_PROFILES, migrate_legacy, run_runtime_permissions, upgrade_installation,
+    LEGACY_PROFILES,
+    finalize_upgrade,
+    migrate_legacy,
+    prepare_upgrade,
+    rollback_upgrade,
+    run_runtime_permissions,
+    run_system_upgrade,
+    status_upgrade,
+    upgrade_installation,
 )
 from .repositories import SQLiteSeriesRepository
 
@@ -70,6 +78,7 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         apply=args.apply,
         profile=args.profile,
         layout_manifest=args.layout_manifest,
+        series_source=args.series_source,
     )
     action = "applied" if result.applied else "dry-run"
     print(f"migration {action}: {len(result.files)} config files, {result.series_count} series")
@@ -83,16 +92,38 @@ def cmd_migrate(args: argparse.Namespace) -> int:
 def cmd_upgrade(args: argparse.Namespace) -> int:
     if not args.root:
         raise ConfigError("upgrade requires --root")
-    result = upgrade_installation(args.root, apply=args.apply)
-    action = "applied" if result.applied else "dry-run"
-    plan = result.plan
+    if args.prepare:
+        if args.plan_id:
+            raise ConfigError("upgrade --prepare generates its own plan id")
+        plan = prepare_upgrade(
+            args.root,
+            system_manifest=args.system_manifest,
+        )
+        result = None
+        action = "prepared"
+    else:
+        if args.system_manifest:
+            raise ConfigError("--system-manifest is valid only with upgrade --prepare")
+        result = upgrade_installation(
+            args.root,
+            apply=args.apply,
+            plan_id=args.plan_id,
+        )
+        plan = result.plan
+        action = "data_applied" if result.applied else "dry-run"
     if args.format == "json":
         print(json.dumps({
-            "action": action,
+            "category": "upgrade",
+            "status": action,
             "source_version": plan.source_version,
             "target_version": plan.target_version,
             "steps": list(plan.steps),
-            "backup_root": str(result.backup_root) if result.backup_root else None,
+            "plan_id": plan.plan_id,
+            "backup_id": (
+                result.backup_root.name
+                if result is not None and result.backup_root
+                else None
+            ),
         }, ensure_ascii=False))
         return 0
     print(
@@ -101,28 +132,86 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     )
     for step in plan.steps:
         print(f"step: {step}")
-    if result.backup_root is not None:
-        print(f"backup: {result.backup_root}")
-    if not result.applied and plan.steps:
+    if result is not None and result.backup_root is not None:
+        print(f"backup: {result.backup_root.name}")
+    if result is not None and not result.applied and plan.steps:
         print("no files were written; rerun with --apply")
+    return 0
+
+
+def cmd_finalize(args: argparse.Namespace) -> int:
+    if not args.root or not args.plan_id:
+        raise ConfigError("finalize requires --root and --plan-id")
+    plan = finalize_upgrade(
+        args.root,
+        args.plan_id,
+        apply=args.apply,
+    )
+    print(json.dumps({
+        "category": "finalize",
+        "status": plan.state,
+        "source_version": plan.source_version,
+        "target_version": plan.target_version,
+        "steps": list(plan.steps),
+        "plan_id": plan.plan_id,
+    }, ensure_ascii=False))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    if not args.root:
+        raise ConfigError("status requires --root")
+    plan = status_upgrade(args.root, args.plan_id)
+    print(json.dumps({
+        "category": "status",
+        "status": plan.state or "not_prepared",
+        "source_version": plan.source_version,
+        "target_version": plan.target_version,
+        "steps": list(plan.steps),
+        "plan_id": plan.plan_id,
+    }, ensure_ascii=False))
+    return 0
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    if not args.root or not args.plan_id:
+        raise ConfigError("rollback requires --root and --plan-id")
+    plan = rollback_upgrade(
+        args.root,
+        args.plan_id,
+        apply=args.apply,
+    )
+    print(json.dumps({
+        "category": "rollback",
+        "status": plan.state,
+        "source_version": plan.source_version,
+        "target_version": plan.target_version,
+        "steps": list(plan.steps),
+        "plan_id": plan.plan_id,
+    }, ensure_ascii=False))
     return 0
 
 
 def cmd_permissions(args: argparse.Namespace) -> int:
     if not args.root:
         raise ConfigError("permissions requires --root")
-    result = run_runtime_permissions(args.root, apply=args.apply, restore=args.restore)
+    result = run_runtime_permissions(
+        args.root, apply=args.apply, restore=args.restore,
+        plan_id=args.plan_id,
+    )
     plan = result.plan
     action = "restored" if result.restored else "applied" if result.applied else "dry-run"
     data = {
+        "category": "permissions",
+        "status": action,
         "action": action,
         "series_count": len(plan.series),
         "directory_count": plan.directory_count,
         "file_count": plan.file_count,
         "noncompliant_directory_count": plan.noncompliant_directory_count,
         "noncompliant_file_count": plan.noncompliant_file_count,
-        "series": list(plan.series),
         "backup_id": result.backup_id,
+        "plan_id": args.plan_id,
     }
     if args.format == "json":
         print(json.dumps(data, ensure_ascii=False))
@@ -135,16 +224,32 @@ def cmd_permissions(args: argparse.Namespace) -> int:
         f"noncompliant: {data['noncompliant_directory_count']} directories, "
         f"{data['noncompliant_file_count']} files"
     )
-    for series in plan.series:
-        series_targets = [target for target in plan.targets if target.series == series]
-        directories = sum(target.kind == "directory" for target in series_targets)
-        files = sum(target.kind == "file" for target in series_targets)
-        noncompliant = sum(not target.compliant for target in series_targets)
-        print(f"series: {series}; directories={directories}; files={files}; noncompliant={noncompliant}")
     if result.backup_id:
         print(f"backup: {result.backup_id}")
     if not result.applied and not result.restored:
         print("no ACLs were written; rerun with --apply")
+    return 0
+
+
+def cmd_system_upgrade(args: argparse.Namespace) -> int:
+    if not args.root:
+        raise ConfigError("system-upgrade requires --root")
+    result = run_system_upgrade(
+        args.root,
+        apply=args.apply,
+        plan_id=args.plan_id,
+    )
+    data = {
+        "category": "system-upgrade",
+        "status": "system_applied" if result.applied else "dry-run",
+        "file_count": len(result.plan.files),
+        "unit_count": result.plan.unit_count,
+        "timer_count": result.plan.timer_count,
+        "wrapper_count": result.plan.wrapper_count,
+        "plan_id": args.plan_id,
+        "backup_id": result.backup_id,
+    }
+    print(json.dumps(data, ensure_ascii=False))
     return 0
 
 
@@ -187,20 +292,41 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--layout-manifest")
     migrate.add_argument("--legacy-env", required=True)
     migrate.add_argument("--legacy-web-env", required=True)
-    migrate.add_argument("--legacy-series-dir", required=True)
+    migrate.add_argument("--legacy-series-dir", action="append", required=True)
+    migrate.add_argument("--series-source", choices=("yaml", "db-authoritative"))
     migrate.add_argument("--legacy-rss-users", required=True)
     migrate.add_argument("--output-root", required=True)
     migrate.add_argument("--apply", action="store_true")
     migrate.set_defaults(handler=cmd_migrate)
     upgrade = subparsers.add_parser("upgrade")
-    upgrade.add_argument("--apply", action="store_true")
+    upgrade_action = upgrade.add_mutually_exclusive_group()
+    upgrade_action.add_argument("--prepare", action="store_true")
+    upgrade_action.add_argument("--apply", action="store_true")
+    upgrade.add_argument("--plan-id")
+    upgrade.add_argument("--system-manifest")
     upgrade.add_argument("--format", choices=("text", "json"), default="text")
     upgrade.set_defaults(handler=cmd_upgrade)
+    finalize = subparsers.add_parser("finalize")
+    finalize.add_argument("--plan-id", required=True)
+    finalize.add_argument("--apply", action="store_true")
+    finalize.set_defaults(handler=cmd_finalize)
+    status = subparsers.add_parser("status")
+    status.add_argument("--plan-id")
+    status.set_defaults(handler=cmd_status)
+    rollback = subparsers.add_parser("rollback")
+    rollback.add_argument("--plan-id", required=True)
+    rollback.add_argument("--apply", action="store_true")
+    rollback.set_defaults(handler=cmd_rollback)
     permissions = subparsers.add_parser("permissions")
     permissions.add_argument("--apply", action="store_true")
     permissions.add_argument("--restore")
+    permissions.add_argument("--plan-id")
     permissions.add_argument("--format", choices=("text", "json"), default="text")
     permissions.set_defaults(handler=cmd_permissions)
+    system_upgrade = subparsers.add_parser("system-upgrade")
+    system_upgrade.add_argument("--apply", action="store_true")
+    system_upgrade.add_argument("--plan-id")
+    system_upgrade.set_defaults(handler=cmd_system_upgrade)
     execute = subparsers.add_parser("exec")
     execute.add_argument("--scope", choices=("sync", "web", "scheduler", "publish"), required=True)
     execute.add_argument("command", nargs=argparse.REMAINDER)

@@ -19,6 +19,10 @@ if [ "$SYSTEM_PERMISSIONS" = true ] && [ "$APPLY" != true ]; then
     echo "ERROR: --system-permissions requires --apply" >&2
     exit 2
 fi
+if [ "$APPLY" = true ]; then
+    echo "ERROR: scripts/deploy.sh --apply is disabled; use an immutable release prepare/activate workflow" >&2
+    exit 3
+fi
 
 if [ -z "${BILIBILI_PODCAST_CONFIG_ROOT:-}" ]; then
     echo "ERROR: BILIBILI_PODCAST_CONFIG_ROOT is required" >&2
@@ -65,9 +69,6 @@ BACKUP_DIR="$BACKUP_TEMPLATE"
 
 echo "Bilibili Podcast unified deployment"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
-echo "  config root: $CONFIG_ROOT"
-echo "  code dir: $CODE_DIR"
-echo "  database: $DB_PATH"
 
 bilibili-podcast-config validate
 
@@ -169,5 +170,5 @@ PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" "$CODE_DIR/scripts/bilibili-podcast-cro
 
 bilibili-podcast-config validate
 echo "Deployment completed without service restart."
-echo "Backup: $BACKUP_DIR"
+echo "Backup ID: $(basename "$BACKUP_DIR")"
 echo "Next gate: review unit diffs and health checks before separately authorizing restart or production sync."

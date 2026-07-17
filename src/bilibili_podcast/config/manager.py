@@ -24,6 +24,7 @@ from .models import (
     WebSecurityConfig, WebServerConfig,
 )
 from .repositories import TomlRepository
+from ..secure_files import atomic_write_bytes
 from .schema import (
     FILE_SCHEMAS, LEGACY_ENV_MAP, LEGACY_INPUT_ONLY, MISSING,
     REMOVED_LEGACY_ENV, FieldSpec,
@@ -40,6 +41,10 @@ class UnsafeConfigError(ConfigError):
 
 class LegacyConfigError(ConfigError):
     pass
+
+
+class ActiveUpgradeError(ConfigError):
+    exit_code = 6
 
 
 MIGRATION_LOCK_NAME = ".migration.lock"
@@ -108,6 +113,10 @@ def _to_plain(value: Any) -> Any:
     return value
 
 
+def _toml_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
 class ConfigManager:
     """Load one immutable snapshot. ``reload`` is intentionally explicit."""
 
@@ -145,13 +154,26 @@ class ConfigManager:
             "configuration root is not set; set BILIBILI_PODCAST_CONFIG_ROOT or pass root to ConfigManager"
         )
 
-    def load(self, *, templates: bool = False) -> ConfigSnapshot:
+    def load(
+        self,
+        *,
+        templates: bool = False,
+        allow_active_upgrade: bool = False,
+    ) -> ConfigSnapshot:
         with self._lock:
             if self._snapshot is not None and not templates:
                 return self._snapshot
             if not templates:
                 self._reject_legacy_environment()
             root = self.root
+            if (
+                not templates
+                and not allow_active_upgrade
+                and (root / ".active-upgrade").exists()
+            ):
+                raise ActiveUpgradeError(
+                    "installation has an active v4 upgrade plan; use status, finalize, or rollback"
+                )
             if templates:
                 return self._load_files(root, templates=True)
             with _shared_migration_lock(root):
@@ -181,6 +203,82 @@ class ConfigManager:
         with self._lock:
             self._snapshot = None
             return self.load()
+
+    def load_for_migration(self) -> ConfigSnapshot:
+        """Load while the caller already holds the exclusive migration lock."""
+        with self._lock:
+            self._reject_legacy_environment()
+            snapshot = self._load_files(self.root, templates=False)
+            self._snapshot = snapshot
+            return snapshot
+
+    def load_system(self):
+        """Load the privileged system scope; runtime services never call this."""
+        from .system import load_system_config
+
+        return load_system_config(self.root)
+
+    def import_system_manifest(self, path: str | Path):
+        """Normalize one restricted import source into ``system.toml``."""
+        from .system import import_system_manifest
+
+        return import_system_manifest(self.root, path)
+
+    @staticmethod
+    def read_rss_users_file(path: str | Path) -> dict[str, dict[str, Any]]:
+        """Read the legacy-compatible users scope through the config layer."""
+        value = TomlRepository().read(Path(path))
+        users = value.get("users") or {}
+        if not isinstance(users, dict):
+            raise ConfigError("invalid rss-users.toml users table")
+        result: dict[str, dict[str, Any]] = {}
+        for name, user in users.items():
+            if not isinstance(name, str) or not name or not isinstance(user, dict):
+                raise ConfigError("invalid rss-users.toml user entry")
+            if set(user) - {"token", "series"}:
+                raise ConfigError("unknown rss-users.toml user field")
+            token, series = user.get("token"), user.get("series")
+            if not isinstance(token, str) or not token or any(ord(c) < 32 for c in token):
+                raise ConfigError("invalid rss-users.toml token")
+            if not isinstance(series, list) or not all(isinstance(item, str) for item in series):
+                raise ConfigError("invalid rss-users.toml series list")
+            result[name] = {"token": token, "series": list(series)}
+        return result
+
+    @staticmethod
+    def read_publish_gone_series(path: str | Path) -> list[str]:
+        value = TomlRepository().read(Path(path))
+        gone = (value.get("publish") or {}).get("gone_series")
+        if not isinstance(gone, list) or not all(isinstance(item, str) for item in gone):
+            raise ConfigError("invalid publish.toml gone_series")
+        return list(gone)
+
+    @staticmethod
+    def write_rss_users_file(path: str | Path, users: Mapping[str, Mapping[str, Any]], mode: int) -> None:
+        lines: list[str] = []
+        for name, user in users.items():
+            token = user.get("token")
+            series = user.get("series")
+            if not isinstance(token, str) or not isinstance(series, list):
+                raise ConfigError("invalid rss-users.toml user entry")
+            lines.extend((f"[users.{_toml_quote(str(name))}]", f"token = {_toml_quote(token)}"))
+            lines.append("series = [" + ", ".join(_toml_quote(item) for item in series) + "]")
+            lines.append("")
+        atomic_write_bytes(Path(path), "\n".join(lines).encode("utf-8"), mode=mode)
+
+    @staticmethod
+    def write_publish_gone_series(path: str | Path, gone_series: list[str], mode: int) -> None:
+        target = Path(path)
+        content = target.read_text(encoding="utf-8")
+        replacement = "gone_series = " + "[" + ", ".join(_toml_quote(item) for item in gone_series) + "]"
+        updated, count = re.subn(r"(?m)^gone_series\s*=\s*\[[^\r\n]*\]\s*$", replacement, content, count=1)
+        if count != 1:
+            raise ConfigError("invalid publish.toml gone_series declaration")
+        atomic_write_bytes(target, updated.encode("utf-8"), mode=mode)
+
+    @staticmethod
+    def write_file_bytes(path: str | Path, content: bytes, mode: int) -> None:
+        atomic_write_bytes(Path(path), content, mode=mode)
 
     def _reject_legacy_environment(self) -> None:
         removed = sorted(REMOVED_LEGACY_ENV & set(self._environ))
@@ -390,10 +488,16 @@ class ConfigManager:
             app=AppConfig(
                 database=DatabaseConfig(_path(a["database.path"])),
                 paths=AppPathsConfig(*(_path(a[f"paths.{key}"]) for key in (
-                    "media_root", "json_root", "rss_root", "published_rss_root", "state_root", "log_dir", "secrets_dir"
+                    "media_root", "json_root", "rss_root", "published_rss_root",
+                    "state_root", "log_dir", "fallback_log_dir", "secrets_dir",
                 ))),
                 install=InstallConfig(_path(a["install.app_dir"]), _path(a["install.venv_bin"])),
-                executables=ExecutablesConfig(_path(a["executables.sync"]), a["executables.ffmpeg"], a["executables.bilibili_podcast_config"]),
+                executables=ExecutablesConfig(
+                    _path(a["executables.sync"]),
+                    a["executables.ffmpeg"],
+                    a["executables.ffprobe"],
+                    a["executables.bilibili_podcast_config"],
+                ),
             ),
             sync=SyncConfig(
                 downloads=DownloadConfig(s["downloads.max_per_run"], s["downloads.scheduled_max_per_run"], float(s["downloads.min_free_gb"])),

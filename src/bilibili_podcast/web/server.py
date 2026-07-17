@@ -37,6 +37,7 @@ from ..cli_admin import (
     rebuild_paid_rss,
 )
 from ..config import ConfigManager, ConfigSnapshot
+from ..media_security import atomic_media_copy, media_is_valid, media_update_lock
 from .. import cli_admin as _cli_admin
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -97,6 +98,20 @@ def _runtime_config() -> ConfigSnapshot:
     if _CONFIG_SNAPSHOT is None:
         raise RuntimeError("web configuration was not injected")
     return _CONFIG_SNAPSHOT
+
+
+def _sync_lock_path(config) -> Path | None:
+    return getattr(getattr(config.sync, "paths", None), "lock_file", None)
+
+
+def _ffprobe_bin(config) -> str:
+    return str(
+        getattr(
+            getattr(getattr(config, "app", None), "executables", None),
+            "ffprobe",
+            "ffprobe",
+        )
+    )
 
 
 def _scheduler_service() -> SchedulerService:
@@ -1049,7 +1064,7 @@ async def manual_media_page(request: Request, series: str,
     for f in sorted(json_files, key=lambda p: p.stem):
         bvid = f.stem.split("_")[0]
         media_file = media_dir / f"{bvid}_{quality}.mp3"
-        if not media_file.exists():
+        if not media_is_valid(media_file, ffprobe_bin=_ffprobe_bin(config)):
             title = bvid
             try:
                 meta = json.loads(f.read_text(encoding="utf-8"))
@@ -1114,37 +1129,39 @@ async def manual_media_attach(
     rss_path = rss_root / f"{series}.xml"
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    if dst.exists() and replace != "1":
-        return _manual_media_redirect(series, error="target exists; use replace")
+    if os.path.lexists(dst):
+        media_is_valid(dst, ffprobe_bin=_ffprobe_bin(config))
+        if replace != "1":
+            return _manual_media_redirect(series, error="target exists; use replace")
 
-    media_backup, rss_backup = _file_backups(dst, rss_path)
-    try:
-        shutil.copy2(str(resolved), str(dst))
-        dst.chmod(0o644)
-        rebuild_paid_rss(
-            DB_PATH,
-            series,
-            json_root=json_root,
-            media_root=media_root,
-            rss_root=rss_root,
-            media_base_url=media_base_url,
-        )
-    except (OSError, ValueError) as exc:
-        _restore_file(dst, media_backup)
-        _restore_file(rss_path, rss_backup)
-        return _manual_media_redirect(series, error=f"rss rebuild failed: {exc}")
-
-    if _CONFIG_SNAPSHOT and _CONFIG_SNAPSHOT.publish.publish.enabled:
+    with media_update_lock(_sync_lock_path(config)):
+        media_backup, rss_backup = _file_backups(dst, rss_path)
         try:
-            from ..publisher import publish
-            publish(_CONFIG_SNAPSHOT)
-        except (OSError, RuntimeError) as exc:
+            atomic_media_copy(
+                resolved,
+                dst,
+                replace=replace == "1",
+                ffprobe_bin=_ffprobe_bin(config),
+                mode=0o400,
+            )
+            rebuild_paid_rss(
+                DB_PATH,
+                series,
+                json_root=json_root,
+                media_root=media_root,
+                rss_root=rss_root,
+                media_base_url=media_base_url,
+            )
+            if _CONFIG_SNAPSHOT and _CONFIG_SNAPSHOT.publish.publish.enabled:
+                from ..publisher import publish
+                publish(_CONFIG_SNAPSHOT)
+        except (OSError, RuntimeError, ValueError) as exc:
             _restore_file(dst, media_backup)
             _restore_file(rss_path, rss_backup)
-            return _manual_media_redirect(series, error=f"rss publish failed: {exc}")
+            return _manual_media_redirect(series, error=f"rss update failed: {exc}")
 
-    _discard_file_backup(media_backup)
-    _discard_file_backup(rss_backup)
+        _discard_file_backup(media_backup)
+        _discard_file_backup(rss_backup)
     return _manual_media_redirect(series, success="media attached and RSS updated")
 
 

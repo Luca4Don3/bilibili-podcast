@@ -5,8 +5,8 @@
 set -euo pipefail
 
 usage() {
-    echo "ERROR: usage: scripts/deploy-release.sh [--apply] prepare --root PATH --commit SHA --artifact FILE --artifact-sha256 SHA --bootstrap-wheel FILE --bootstrap-wheel-sha256 SHA [--python PATH]" >&2
-    echo "       scripts/deploy-release.sh [--apply] activate --root PATH --commit SHA [--python PATH]" >&2
+    echo "ERROR: usage: scripts/deploy-release.sh [--apply] prepare --root PATH --commit SHA --artifact FILE --artifact-sha256 SHA --wheelhouse DIR --wheel-manifest FILE [--python PATH]" >&2
+    echo "       scripts/deploy-release.sh [--apply] activate --root PATH --commit SHA --config-root PATH [--python PATH]" >&2
     exit 2
 }
 
@@ -22,8 +22,9 @@ ROOT=""
 COMMIT=""
 ARTIFACT=""
 ARTIFACT_SHA256=""
-BOOTSTRAP_WHEEL=""
-BOOTSTRAP_WHEEL_SHA256=""
+WHEELHOUSE=""
+WHEEL_MANIFEST=""
+CONFIG_ROOT=""
 PYTHON_BIN="python3"
 
 while [ "$#" -gt 0 ]; do
@@ -32,8 +33,9 @@ while [ "$#" -gt 0 ]; do
         --commit) [ "$#" -ge 2 ] || usage; COMMIT="$2"; shift 2 ;;
         --artifact) [ "$#" -ge 2 ] || usage; ARTIFACT="$2"; shift 2 ;;
         --artifact-sha256) [ "$#" -ge 2 ] || usage; ARTIFACT_SHA256="$2"; shift 2 ;;
-        --bootstrap-wheel) [ "$#" -ge 2 ] || usage; BOOTSTRAP_WHEEL="$2"; shift 2 ;;
-        --bootstrap-wheel-sha256) [ "$#" -ge 2 ] || usage; BOOTSTRAP_WHEEL_SHA256="$2"; shift 2 ;;
+        --wheelhouse) [ "$#" -ge 2 ] || usage; WHEELHOUSE="$2"; shift 2 ;;
+        --wheel-manifest) [ "$#" -ge 2 ] || usage; WHEEL_MANIFEST="$2"; shift 2 ;;
+        --config-root) [ "$#" -ge 2 ] || usage; CONFIG_ROOT="$2"; shift 2 ;;
         --python) [ "$#" -ge 2 ] || usage; PYTHON_BIN="$2"; shift 2 ;;
         *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
     esac
@@ -138,17 +140,88 @@ if not required.issubset(files):
 ' "$ARTIFACT"
 }
 
-validate_bootstrap_wheel() {
+validate_wheelhouse() {
+    [ -d "$WHEELHOUSE" ] && [ ! -L "$WHEELHOUSE" ] || {
+        echo "ERROR: wheelhouse is missing, not a directory, or a symlink" >&2
+        exit 3
+    }
+    verify_file "$WHEEL_MANIFEST" "$(sha256_file "$WHEEL_MANIFEST")" "wheel manifest"
     "$PYTHON_BIN" -c '
-import sys, zipfile
-wheel = sys.argv[1]
-if not zipfile.is_zipfile(wheel):
-    raise SystemExit("invalid bootstrap wheel")
-with zipfile.ZipFile(wheel) as archive:
-    names = archive.namelist()
-    if not any(name.endswith(".dist-info/WHEEL") for name in names):
-        raise SystemExit("invalid bootstrap wheel metadata")
-' "$BOOTSTRAP_WHEEL"
+import hashlib, pathlib, re, sys, zipfile
+root = pathlib.Path(sys.argv[1])
+manifest = pathlib.Path(sys.argv[2])
+expected = {}
+for raw in manifest.read_text(encoding="ascii").splitlines():
+    match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.+-]+\.whl)", raw)
+    if match is None or match.group(2) in expected:
+        raise SystemExit("invalid wheel manifest")
+    expected[match.group(2)] = match.group(1)
+actual = {path.name for path in root.iterdir() if path.is_file()}
+if not expected or actual != set(expected):
+    raise SystemExit("wheelhouse and manifest inventory differ")
+for name, digest in expected.items():
+    path = root / name
+    if path.is_symlink() or not zipfile.is_zipfile(path):
+        raise SystemExit("wheelhouse contains an unsafe or invalid wheel")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+        raise SystemExit("wheel manifest SHA-256 mismatch")
+    with zipfile.ZipFile(path) as archive:
+        if not any(item.endswith(".dist-info/WHEEL") for item in archive.namelist()):
+            raise SystemExit("wheelhouse contains invalid wheel metadata")
+' "$WHEELHOUSE" "$WHEEL_MANIFEST"
+}
+
+validate_python_metadata() {
+    interpreter="$1"
+    metadata_source="${2:-$ARTIFACT}"
+    "$interpreter" -c '
+import pathlib, platform, sys, tarfile, tomllib
+try:
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import Version
+except ImportError:
+    from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from pip._vendor.packaging.version import Version
+source = pathlib.Path(sys.argv[1])
+if source.is_dir():
+    metadata = tomllib.loads((source / "pyproject.toml").read_text(encoding="utf-8"))
+else:
+    with tarfile.open(source, "r:gz") as handle:
+        member = handle.getmember("pyproject.toml")
+        metadata = tomllib.loads(handle.extractfile(member).read().decode("utf-8"))
+required = str(metadata.get("project", {}).get("requires-python", ""))
+try:
+    specifier = SpecifierSet(required)
+except InvalidSpecifier:
+    raise SystemExit("invalid Requires-Python in release metadata")
+if required and Version(platform.python_version()) not in specifier:
+    raise SystemExit("configured Python does not satisfy release Requires-Python")
+' "$metadata_source"
+    if [ -f "$metadata_source" ]; then
+        [ -s "$metadata_source" ] || { echo "ERROR: release artifact is empty" >&2; exit 3; }
+    fi
+}
+
+validate_lock_file() {
+    archive="$1"
+    "$PYTHON_BIN" -c '
+import re, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as handle:
+    lines = handle.extractfile("requirements.lock").read().decode("utf-8").splitlines()
+requirements = []
+for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith(("-", ".")) or " @ " in line or "://" in line:
+        raise SystemExit("requirements.lock contains a non-offline requirement")
+    requirement = line.split(";", 1)[0].strip()
+    if "==" not in requirement:
+        raise SystemExit("requirements.lock contains an unpinned requirement")
+    requirements.append(requirement)
+if len(requirements) != len(set(requirements)):
+    raise SystemExit("requirements.lock contains duplicate requirements")
+' "$archive"
 }
 
 RELEASES="$ROOT/releases"
@@ -187,16 +260,28 @@ verify_required_executables() {
 
 if [ "$ACTION" = "prepare" ]; then
     [ -n "$ARTIFACT" ] && [ -n "$ARTIFACT_SHA256" ] || usage
-    [ -n "$BOOTSTRAP_WHEEL" ] && [ -n "$BOOTSTRAP_WHEEL_SHA256" ] || usage
+    [ -n "$WHEELHOUSE" ] && [ -n "$WHEEL_MANIFEST" ] || usage
+    [ -z "$CONFIG_ROOT" ] || usage
     verify_file "$ARTIFACT" "$ARTIFACT_SHA256" "release artifact"
-    verify_file "$BOOTSTRAP_WHEEL" "$BOOTSTRAP_WHEEL_SHA256" "bootstrap wheel"
     validate_release_artifact
-    validate_bootstrap_wheel
+    validate_wheelhouse
+    validate_python_metadata "$PYTHON_BIN"
+    validate_lock_file "$ARTIFACT"
+    "$PYTHON_BIN" -m pip --version >/dev/null 2>&1 || {
+        echo "ERROR: configured Python does not provide pip" >&2
+        exit 3
+    }
+    "$PYTHON_BIN" -m pip install --dry-run --ignore-installed \
+        --no-index --find-links "$WHEELHOUSE" -r <(
+            "$PYTHON_BIN" -c '
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as handle:
+    sys.stdout.buffer.write(handle.extractfile("requirements.lock").read())
+' "$ARTIFACT"
+        ) >/dev/null
     echo "Release preparation"
     echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
     echo "  commit: $COMMIT"
-    echo "  release: $RELEASE"
-    echo "  virtualenv: $VENV"
     echo "  service actions: none"
     if [ "$APPLY" != true ]; then
         echo "Dry-run complete; checksums verified and no files were written."
@@ -230,6 +315,8 @@ if [ "$ACTION" = "prepare" ]; then
         }
         verify_marker "$RELEASE/.release-commit" "$COMMIT" "release commit"
         verify_marker "$RELEASE/.release-artifact-sha256" "$ARTIFACT_SHA256" "release artifact"
+        wheel_manifest_sha256="$(marker_value "$RELEASE/.wheel-manifest-sha256" "wheel manifest")"
+        verify_file "$WHEEL_MANIFEST" "$wheel_manifest_sha256" "wheel manifest"
         requirements_sha256="$(marker_value "$RELEASE/.requirements-lock-sha256" "requirements lock")"
         verify_file "$RELEASE/requirements.lock" "$requirements_sha256" "requirements lock"
     else
@@ -254,7 +341,9 @@ with tarfile.open(archive, "r:gz") as handle:
         printf '%s\n' "$COMMIT" > "$release_stage/.release-commit"
         printf '%s\n' "$ARTIFACT_SHA256" > "$release_stage/.release-artifact-sha256"
         requirements_sha256="$(sha256_file "$release_stage/requirements.lock")"
+        wheel_manifest_sha256="$(sha256_file "$WHEEL_MANIFEST")"
         printf '%s\n' "$requirements_sha256" > "$release_stage/.requirements-lock-sha256"
+        printf '%s\n' "$wheel_manifest_sha256" > "$release_stage/.wheel-manifest-sha256"
         mv "$release_stage" "$RELEASE"
     fi
 
@@ -264,14 +353,15 @@ with tarfile.open(archive, "r:gz") as handle:
             exit 3
         }
         verify_marker "$VENV/.release-commit" "$COMMIT" "virtualenv commit"
-        verify_marker "$VENV/.bootstrap-wheel-sha256" "$BOOTSTRAP_WHEEL_SHA256" "bootstrap wheel"
+        verify_marker "$VENV/.wheel-manifest-sha256" "$wheel_manifest_sha256" "wheel manifest"
         verify_marker "$VENV/.release-artifact-sha256" "$ARTIFACT_SHA256" "virtualenv release artifact"
         verify_marker "$VENV/.requirements-lock-sha256" "$requirements_sha256" "virtualenv requirements lock"
     else
         "$PYTHON_BIN" -m venv "$venv_stage"
-        "$venv_stage/bin/pip" install "$BOOTSTRAP_WHEEL"
-        "$venv_stage/bin/pip" install -c "$RELEASE/requirements.lock" -r "$RELEASE/requirements.lock"
-        "$venv_stage/bin/pip" install --no-deps "$RELEASE"
+        "$venv_stage/bin/pip" install --no-index --find-links "$WHEELHOUSE" \
+            -r "$RELEASE/requirements.lock"
+        "$venv_stage/bin/pip" install --no-index --find-links "$WHEELHOUSE" \
+            --no-deps --no-build-isolation "$RELEASE"
         "$venv_stage/bin/python3" -m compileall -q "$RELEASE/src"
         "$venv_stage/bin/python3" -c 'import bilibili_api, bilibili_podcast, sqlite3, uvicorn'
         "$PYTHON_BIN" -c '
@@ -287,7 +377,7 @@ for path in (source / "bin").iterdir():
         path.write_bytes(payload.replace(old, new))
 ' "$venv_stage" "$VENV"
         printf '%s\n' "$COMMIT" > "$venv_stage/.release-commit"
-        printf '%s\n' "$BOOTSTRAP_WHEEL_SHA256" > "$venv_stage/.bootstrap-wheel-sha256"
+        printf '%s\n' "$wheel_manifest_sha256" > "$venv_stage/.wheel-manifest-sha256"
         printf '%s\n' "$ARTIFACT_SHA256" > "$venv_stage/.release-artifact-sha256"
         printf '%s\n' "$requirements_sha256" > "$venv_stage/.requirements-lock-sha256"
         mv "$venv_stage" "$VENV"
@@ -300,6 +390,12 @@ for path in (source / "bin").iterdir():
     exit 0
 fi
 
+[ -n "$CONFIG_ROOT" ] || usage
+[ -z "$ARTIFACT$ARTIFACT_SHA256$WHEELHOUSE$WHEEL_MANIFEST" ] || usage
+case "$CONFIG_ROOT" in
+    /*) ;;
+    *) echo "ERROR: --config-root must be an absolute path" >&2; exit 2 ;;
+esac
 if [ ! -d "$RELEASE" ] || [ -L "$RELEASE" ] || [ ! -d "$VENV" ] || [ -L "$VENV" ]; then
     echo "ERROR: requested release is not completely prepared" >&2
     exit 3
@@ -319,18 +415,37 @@ fi
 requirements_sha256="$(marker_value "$RELEASE/.requirements-lock-sha256" "requirements lock")"
 verify_file "$RELEASE/requirements.lock" "$requirements_sha256" "requirements lock"
 verify_marker "$VENV/.requirements-lock-sha256" "$requirements_sha256" "virtualenv requirements lock"
-bootstrap_sha256="$(marker_value "$VENV/.bootstrap-wheel-sha256" "bootstrap wheel")"
-if ! printf '%s' "$bootstrap_sha256" | grep -Eq '^[0-9a-f]{64}$'; then
-    echo "ERROR: invalid bootstrap wheel completion marker" >&2
+wheel_manifest_sha256="$(marker_value "$RELEASE/.wheel-manifest-sha256" "wheel manifest")"
+verify_marker "$VENV/.wheel-manifest-sha256" "$wheel_manifest_sha256" "virtualenv wheel manifest"
+if ! printf '%s' "$wheel_manifest_sha256" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "ERROR: invalid wheel manifest completion marker" >&2
     exit 3
 fi
 verify_required_executables
+validate_python_metadata "$VENV/bin/python3" "$RELEASE"
+
+candidate_config="$VENV/bin/bilibili-podcast-config"
+"$candidate_config" --root "$CONFIG_ROOT" validate >/dev/null
+status_json="$("$candidate_config" --root "$CONFIG_ROOT" status)"
+"$VENV/bin/python3" -c '
+import json, sys
+value = json.loads(sys.argv[1])
+if value.get("target_version") != 4 or value.get("source_version") != 4:
+    raise SystemExit("candidate and installation versions differ")
+if value.get("status") not in {"not_prepared", "finalized"}:
+    raise SystemExit("installation has an active or pending upgrade plan")
+' "$status_json"
+permissions_json="$("$candidate_config" --root "$CONFIG_ROOT" permissions --format json)"
+"$VENV/bin/python3" -c '
+import json, sys
+value = json.loads(sys.argv[1])
+if value.get("noncompliant_directory_count") or value.get("noncompliant_file_count"):
+    raise SystemExit("runtime permissions are not compliant")
+' "$permissions_json"
 
 echo "Release activation"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
 echo "  commit: $COMMIT"
-echo "  current release: $RELEASE"
-echo "  current virtualenv: $VENV"
 echo "  service actions: none"
 if [ "$APPLY" != true ]; then
     echo "Dry-run complete; no symlinks were changed."

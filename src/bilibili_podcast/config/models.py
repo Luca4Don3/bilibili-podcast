@@ -23,6 +23,7 @@ class AppPathsConfig:
     published_rss_root: Path
     state_root: Path
     log_dir: Path
+    fallback_log_dir: Path
     secrets_dir: Path
 
 
@@ -36,6 +37,7 @@ class InstallConfig:
 class ExecutablesConfig:
     sync: Path
     ffmpeg: str
+    ffprobe: str
     bilibili_podcast_config: str
 
 
@@ -184,6 +186,27 @@ class ConfigSnapshot:
     sources: Mapping[str, Path] = field(default_factory=lambda: MappingProxyType({}))
 
 
+@dataclass(frozen=True)
+class OperatorConfig:
+    user: str
+
+
+@dataclass(frozen=True)
+class NginxSystemConfig:
+    user: str
+    group: str
+    config_path: Path
+    access_log_path: Path
+    error_log_path: Path
+
+
+@dataclass(frozen=True)
+class SystemConfigSnapshot:
+    root: Path
+    operator: OperatorConfig
+    nginx: NginxSystemConfig
+
+
 @dataclass
 class SeriesConfig:
     series: str
@@ -215,7 +238,12 @@ class SeriesConfig:
         raise ValueError("source.uid or source.space_url with UID is required")
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "SeriesConfig":
+    def from_yaml(
+        cls,
+        path: str | Path,
+        *,
+        legacy: bool = False,
+    ) -> "SeriesConfig":
         import yaml
 
         from .schema import (
@@ -228,6 +256,17 @@ class SeriesConfig:
         data = yaml.safe_load(source_path.read_text(encoding="utf-8")) or {}
         if not isinstance(data, dict):
             raise ValueError("series config root must be a mapping")
+        if legacy:
+            data = dict(data)
+            data.pop("access", None)
+            legacy_source = data.get("source")
+            if isinstance(legacy_source, dict) and legacy_source.get("sid") is None:
+                data["source"] = dict(legacy_source)
+                data["source"].pop("sid", None)
+            legacy_cron = data.get("cron")
+            if isinstance(legacy_cron, dict):
+                data["cron"] = dict(legacy_cron)
+                data["cron"].pop("enabled", None)
         unknown_top = sorted(set(data) - SERIES_TOP_FIELDS)
         if unknown_top:
             raise ValueError(f"unknown series field: {unknown_top[0]}")
