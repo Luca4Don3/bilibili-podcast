@@ -12,12 +12,16 @@ import pytest
 from bilibili_podcast.config.manager import ConfigError, UnsafeConfigError
 from bilibili_podcast.config import cli as config_cli
 from bilibili_podcast.config.migration import (
+    EARLIEST_UNIFIED_VERSION,
     LATEST_VERSION,
     VERSION_FILE,
     detect_version,
+    finalize_upgrade,
     plan_upgrade,
+    prepare_upgrade,
     read_legacy_env,
     upgrade_installation,
+    update_plan_state,
 )
 from bilibili_podcast.config.migration import versioning
 
@@ -26,9 +30,54 @@ FIXTURES = Path(__file__).parent / "fixtures" / "version_migration"
 OLD_PRODUCT = "bili" + "pod"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_privileged_final_checks(monkeypatch):
+    from bilibili_podcast.config.migration import runtime_permissions, system_upgrade
+
+    monkeypatch.setattr(
+        runtime_permissions,
+        "verify_permissions_applied",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        system_upgrade,
+        "verify_system_applied",
+        lambda *args, **kwargs: None,
+    )
+
+
+def _complete_upgrade(root: Path):
+    plan = prepare_upgrade(root)
+    result = upgrade_installation(root, apply=True, plan_id=plan.plan_id)
+    update_plan_state(
+        root,
+        plan.plan_id,
+        expected="data_applied",
+        new_state="permissions_applied",
+        permissions_backup_id="test-permissions",
+    )
+    update_plan_state(
+        root,
+        plan.plan_id,
+        expected="permissions_applied",
+        new_state="system_applied",
+        system_backup_id="test-system",
+    )
+    finalize_upgrade(root, plan.plan_id, apply=True)
+    return result
+
+
 def _fixture_version(name: str) -> int:
     with (FIXTURES / f"{name}.toml").open("rb") as handle:
         return int(tomllib.load(handle)["fixture"]["version"])
+
+
+def _published_fixtures() -> tuple[tuple[str, int], ...]:
+    fixtures = []
+    for path in sorted(FIXTURES.glob("v*.toml")):
+        version = _fixture_version(path.stem)
+        fixtures.append((path.stem, version))
+    return tuple(sorted(fixtures, key=lambda item: item[1]))
 
 
 def _installation(tmp_path: Path, fixture: str, *, database: bool = True) -> Path:
@@ -46,8 +95,8 @@ def _installation(tmp_path: Path, fixture: str, *, database: bool = True) -> Pat
         target.chmod(0o600)
 
     version = _fixture_version(fixture)
-    if version == LATEST_VERSION:
-        (root / VERSION_FILE).write_text(f"{LATEST_VERSION}\n", encoding="ascii")
+    if version >= 3:
+        (root / VERSION_FILE).write_text(f"{version}\n", encoding="ascii")
         (root / VERSION_FILE).chmod(0o600)
 
     if database:
@@ -59,8 +108,11 @@ def _installation(tmp_path: Path, fixture: str, *, database: bool = True) -> Pat
             connection.executescript(
                 (FIXTURES / "snapshots" / "schema-v1-v3.sql").read_text(encoding="utf-8")
             )
-            if version == LATEST_VERSION:
-                connection.execute("INSERT INTO schema_version(version) VALUES(?)", (LATEST_VERSION,))
+            if version >= 3:
+                connection.execute(
+                    "INSERT INTO schema_version(version) VALUES(?)",
+                    (version,),
+                )
     return root
 
 
@@ -72,7 +124,20 @@ def _digest_tree(root: Path) -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize(("fixture", "source"), (("v1", 1), ("v2", 2), ("v3", 3)))
+def test_fixture_and_step_registry_covers_every_published_version():
+    fixtures = _published_fixtures()
+    versions = tuple(version for _, version in fixtures)
+
+    assert versions == tuple(range(EARLIEST_UNIFIED_VERSION, LATEST_VERSION + 1))
+    assert set(versioning._STEPS) == set(
+        range(EARLIEST_UNIFIED_VERSION + 1, LATEST_VERSION + 1)
+    )
+    for name, version in fixtures:
+        assert name == f"v{version}"
+        assert (FIXTURES / "snapshots" / name).is_dir()
+
+
+@pytest.mark.parametrize(("fixture", "source"), _published_fixtures())
 def test_detects_every_historical_fixture(tmp_path, fixture, source):
     assert detect_version(_installation(tmp_path, fixture)) == source
 
@@ -85,10 +150,10 @@ def test_v1_upgrades_across_every_step_and_preserves_quoted_user(tmp_path):
         f'[users."fixture.user"]\ntoken = "{preserved_token}"\nseries = ["series-one"]\n'
     )
 
-    result = upgrade_installation(root, apply=True)
+    result = _complete_upgrade(root)
 
     assert result.plan.source_version == 1
-    assert len(result.plan.steps) == 2
+    assert len(result.plan.steps) == 3
     assert detect_version(root) == LATEST_VERSION
     with users.open("rb") as handle:
         migrated_user = tomllib.load(handle)["users"]["fixture.user"]
@@ -124,7 +189,7 @@ def test_v1_upgrade_preserves_custom_cookie_as_compatibility_name(tmp_path):
         encoding="utf-8",
     )
 
-    upgrade_installation(root, apply=True)
+    _complete_upgrade(root)
 
     security = tomllib.loads(web.read_text(encoding="utf-8"))["security"]
     assert security["cookie_name"] == "bilibili_podcast_session"
@@ -133,8 +198,11 @@ def test_v1_upgrade_preserves_custom_cookie_as_compatibility_name(tmp_path):
 
 def test_v2_upgrades_to_latest_and_sets_database_version(tmp_path):
     root = _installation(tmp_path, "v2")
-    result = upgrade_installation(root, apply=True)
-    assert result.plan.steps == ("initialize-versioned-installation",)
+    result = _complete_upgrade(root)
+    assert result.plan.steps == (
+        "initialize-versioned-installation",
+        "apply-v4-security-contract",
+    )
     app = tomllib.loads((root / "app.toml").read_text())["database"]
     with sqlite3.connect(app["path"]) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchall() == [(LATEST_VERSION,)]
@@ -147,7 +215,7 @@ def test_upgrade_keeps_database_inode_for_live_blue_green_connections(tmp_path):
     inode = database_path.stat().st_ino
     old_connection = sqlite3.connect(database_path)
     try:
-        upgrade_installation(root, apply=True)
+        _complete_upgrade(root)
         assert database_path.stat().st_ino == inode
         old_connection.execute(
             "INSERT INTO schema_version(version) VALUES(?) ON CONFLICT(version) DO NOTHING",
@@ -166,15 +234,17 @@ def test_historical_v3_step_does_not_follow_future_latest_constant(tmp_path, mon
     root = _installation(tmp_path, "v2")
     monkeypatch.setattr(versioning, "LATEST_VERSION", 4)
 
-    upgrade_installation(root, apply=True, target_version=3)
+    plan = plan_upgrade(root, target_version=3)
 
-    assert (root / VERSION_FILE).read_text(encoding="ascii").strip() == "3"
+    assert plan.target_version == 3
+    assert plan.steps == ("initialize-versioned-installation",)
+    assert not (root / VERSION_FILE).exists()
 
 
 def test_latest_is_idempotent(tmp_path):
-    root = _installation(tmp_path, "v3")
+    root = _installation(tmp_path, f"v{LATEST_VERSION}")
     before = _digest_tree(tmp_path)
-    result = upgrade_installation(root, apply=True)
+    result = upgrade_installation(root)
     assert result.plan.steps == ()
     assert result.backup_root is None
     assert _digest_tree(tmp_path) == before
@@ -184,7 +254,7 @@ def test_database_created_after_upgrade_gets_current_version(tmp_path):
     from bilibili_podcast import db
 
     root = _installation(tmp_path, "v2", database=False)
-    upgrade_installation(root, apply=True)
+    _complete_upgrade(root)
     database_path = Path(tomllib.loads((root / "app.toml").read_text())["database"]["path"])
 
     db.migrate(database_path)
@@ -221,8 +291,8 @@ def test_rejects_symlinked_version_target_before_apply(tmp_path):
     linked.write_text((root / "sync.toml").read_text(), encoding="utf-8")
     (root / "sync.toml").unlink()
     (root / "sync.toml").symlink_to(linked)
-    with pytest.raises(UnsafeConfigError, match="unsafe migration source"):
-        upgrade_installation(root, apply=True)
+    with pytest.raises(UnsafeConfigError, match="unsafe configuration input"):
+        prepare_upgrade(root)
 
 
 def test_rejects_symlinked_database(tmp_path):
@@ -262,30 +332,34 @@ def test_rejects_missing_registered_step(tmp_path, monkeypatch):
 
 def test_lock_conflict_is_explicit(tmp_path):
     root = _installation(tmp_path, "v2")
+    plan = prepare_upgrade(root)
     with (root / ".migration.lock").open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(ConfigError, match="another installation migration"):
-            upgrade_installation(root, apply=True)
+            upgrade_installation(root, apply=True, plan_id=plan.plan_id)
 
 
 def test_rejects_symlinked_migration_lock(tmp_path):
     root = _installation(tmp_path, "v2")
+    plan = prepare_upgrade(root)
     linked = tmp_path / "migration-lock"
     linked.write_text("", encoding="utf-8")
+    (root / ".migration.lock").unlink()
     (root / ".migration.lock").symlink_to(linked)
     with pytest.raises(UnsafeConfigError, match="migration lock.*symlink"):
-        upgrade_installation(root, apply=True)
+        upgrade_installation(root, apply=True, plan_id=plan.plan_id)
 
 
 def test_apply_rejects_active_application_lock(tmp_path):
     root = _installation(tmp_path, "v2")
+    plan = prepare_upgrade(root)
     app = tomllib.loads((root / "sync.toml").read_text())
     lock_path = Path(app["paths"]["lock_file"])
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(ConfigError, match="another application process"):
-            upgrade_installation(root, apply=True)
+            upgrade_installation(root, apply=True, plan_id=plan.plan_id)
 
 
 def test_failure_after_replacement_rolls_back_every_live_file(tmp_path, monkeypatch):
@@ -293,21 +367,28 @@ def test_failure_after_replacement_rolls_back_every_live_file(tmp_path, monkeypa
     before = _digest_tree(root)
     database_path = tmp_path / "runtime" / "state" / f"{OLD_PRODUCT}.db"
     inode = database_path.stat().st_ino
-    original_replace = Path.replace
+    plan = prepare_upgrade(root)
+    before = _digest_tree(root)
+    original_replace = versioning.os.replace
 
-    def fail_marker_replace(path, target):
+    def fail_config_replace(path, target, *args, **kwargs):
         if Path(target).name == VERSION_FILE:
-            raise RuntimeError("injected marker replacement failure")
-        return original_replace(path, target)
+            return original_replace(path, target, *args, **kwargs)
+        if Path(target).name == "web.toml":
+            raise RuntimeError("injected config replacement failure")
+        return original_replace(path, target, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "replace", fail_marker_replace)
-    with pytest.raises(RuntimeError, match="injected marker replacement failure"):
-        upgrade_installation(root, apply=True)
+    monkeypatch.setattr(versioning.os, "replace", fail_config_replace)
+    with pytest.raises(RuntimeError, match="injected config replacement failure"):
+        upgrade_installation(root, apply=True, plan_id=plan.plan_id)
     after = _digest_tree(root)
     assert {
         key: value for key, value in after.items()
         if ".backups/" not in key and key != ".migration.lock"
-    } == before
+    } == {
+        key: value for key, value in before.items()
+        if key != ".migration.lock"
+    }
     assert database_path.stat().st_ino == inode
     with sqlite3.connect(database_path) as connection:
         assert connection.execute("SELECT version FROM schema_version").fetchall() == []
@@ -318,7 +399,7 @@ def test_failure_after_replacement_rolls_back_every_live_file(tmp_path, monkeypa
 
 def test_migrated_database_integrity(tmp_path):
     root = _installation(tmp_path, "v2")
-    upgrade_installation(root, apply=True)
+    _complete_upgrade(root)
     app = tomllib.loads((root / "app.toml").read_text())["database"]
     with sqlite3.connect(app["path"]) as connection:
         assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
@@ -329,7 +410,7 @@ def test_upgrade_cli_defaults_to_dry_run_and_never_prints_values(tmp_path, capsy
     root = _installation(tmp_path, "v2")
     assert config_cli.main(["--root", str(root), "upgrade"]) == 0
     output = capsys.readouterr().out
-    assert "upgrade dry-run: version 2 -> 3" in output
+    assert "upgrade dry-run: version 2 -> 4" in output
     assert "fixture-credential" not in output
     assert not (root / VERSION_FILE).exists()
 
@@ -342,11 +423,15 @@ def test_upgrade_cli_json_is_machine_readable_and_redacted(tmp_path, capsys):
     output = capsys.readouterr().out.strip()
     payload = json.loads(output)
     assert payload["source_version"] == 2
-    assert payload["steps"] == ["initialize-versioned-installation"]
+    assert payload["steps"] == [
+        "initialize-versioned-installation",
+        "apply-v4-security-contract",
+    ]
+    assert "backup_root" not in payload
     assert "fixture-credential" not in output
 
 
 def test_legacy_adapter_normalizes_earliest_environment_prefix(tmp_path):
     source = tmp_path / "legacy.env"
-    source.write_text(f'{("BILI" + "POD")}_APP_DIR="/tmp/fixture-app"\n')
+    source.write_text('LEGACYAPP_APP_DIR="/tmp/fixture-app"\n')
     assert read_legacy_env(source) == {"BILIBILI_PODCAST_APP_DIR": "/tmp/fixture-app"}

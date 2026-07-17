@@ -29,23 +29,78 @@ CREATE TABLE IF NOT EXISTS scheduler_backend (
 """
 
 
+class DatabaseUpgradeRequired(RuntimeError):
+    """An existing database must be upgraded by the migration state machine."""
+
+
+def _validate_current_schema(conn: sqlite3.Connection, expected_version: int) -> None:
+    if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
+        raise sqlite3.DatabaseError("SQLite quick_check failed")
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise sqlite3.DatabaseError("SQLite foreign_key_check failed")
+    table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    rows = (
+        tuple(row[0] for row in conn.execute("SELECT version FROM schema_version"))
+        if table
+        else ()
+    )
+    if rows != (expected_version,):
+        raise DatabaseUpgradeRequired(
+            f"database schema version {rows or 'unversioned'} requires an explicit upgrade plan"
+        )
+    required = {
+        "series",
+        "series_source",
+        "sync_policy",
+        "filter_rule",
+        "paid_preview_policy",
+        "cron_schedule",
+        "scheduler_backend",
+        "access_rule",
+        "sync_state",
+        "schema_version",
+    }
+    actual = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    missing = sorted(required - actual)
+    if missing:
+        raise sqlite3.DatabaseError(f"SQLite schema is missing table {missing[0]}")
+
+
 def migrate(db_path: str | Path, *, initialize_version: bool = True) -> None:
-    """Create or migrate the SQLite schema."""
+    """Initialize a new database or validate an existing current database.
+
+    ``initialize_version`` remains accepted for source compatibility, but an
+    existing historical schema is never upgraded here.
+    """
     path = Path(db_path)
+    existed = path.exists()
+    if existed and (path.is_symlink() or not path.is_file()):
+        raise sqlite3.DatabaseError("unsafe SQLite database path")
+    from .config.migration.versioning import LATEST_VERSION
+
+    if existed:
+        conn = connect(path)
+        try:
+            _validate_current_schema(conn, LATEST_VERSION)
+        finally:
+            conn.close()
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = connect(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         for statement in _schema_statements(SCHEMA_SQL):
             conn.execute(statement)
-        _ensure_column(conn, "cron_schedule", "kind", "TEXT NOT NULL DEFAULT 'primary'")
-        _ensure_column(conn, "sync_state", "retry_pending", "INTEGER NOT NULL DEFAULT 0")
-        _ensure_column(conn, "sync_policy", "update_period_grace_seconds", "INTEGER NOT NULL DEFAULT 120")
-        _ensure_column(conn, "sync_policy", "media_mode", "TEXT NOT NULL DEFAULT 'auto'")
-        if initialize_version and conn.execute("SELECT 1 FROM schema_version LIMIT 1").fetchone() is None:
-            from .config.migration.versioning import LATEST_VERSION
-
-            conn.execute("INSERT INTO schema_version(version) VALUES(?)", (LATEST_VERSION,))
+        conn.execute("INSERT INTO schema_version(version) VALUES(?)", (LATEST_VERSION,))
+        _validate_current_schema(conn, LATEST_VERSION)
         conn.commit()
     except Exception:
         conn.rollback()

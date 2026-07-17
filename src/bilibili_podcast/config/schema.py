@@ -31,11 +31,13 @@ APP_FIELDS = (
     FieldSpec("paths.published_rss_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_PUBLISHED_RSS_ROOT",)),
     FieldSpec("paths.state_root", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_STATE_ROOT",)),
     FieldSpec("paths.log_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_LOG_DIR",)),
+    FieldSpec("paths.fallback_log_dir", str, "/tmp/bilibili-podcast-logs", owner="app"),
     FieldSpec("paths.secrets_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_SECRETS_DIR",)),
     FieldSpec("install.app_dir", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_APP_DIR",)),
     FieldSpec("install.venv_bin", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_VENV_BIN",)),
     FieldSpec("executables.sync", str, required=True, owner="app", legacy_aliases=("BILIBILI_PODCAST_SYNC_PATH",)),
     FieldSpec("executables.ffmpeg", str, "ffmpeg", owner="app"),
+    FieldSpec("executables.ffprobe", str, "ffprobe", owner="app"),
     FieldSpec("executables.bilibili_podcast_config", str, "bilibili-podcast-config", owner="app"),
 )
 

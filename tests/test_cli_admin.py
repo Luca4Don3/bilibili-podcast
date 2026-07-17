@@ -54,7 +54,11 @@ def reset_admin_config_snapshot(tmp_path: Path):
         rss_users=SimpleNamespace(users={}),
         manual_media=ManualMedia(),
     )
-    yield
+    with patch(
+        "bilibili_podcast.media_security._probe_media_fd",
+        lambda *args, **kwargs: None,
+    ):
+        yield
     cli_admin._CONFIG = None
 
 
@@ -943,6 +947,36 @@ def test_crontab_excludes_systemd_backend_without_disabling_schedule(tmp_path: P
         ).fetchone()[0] == 1
 
 
+def test_crontab_database_reader_uses_shared_connection_policy(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import runpy
+
+    from bilibili_podcast import sqlite_connection
+
+    db_path = _migrate(tmp_path)
+    observed = {}
+    original_connect = sqlite_connection.connect
+
+    def recording_connect(*args, **kwargs):
+        connection = original_connect(*args, **kwargs)
+        observed["journal_mode"] = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        observed["foreign_keys"] = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+        observed["busy_timeout"] = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        return connection
+
+    monkeypatch.setattr(sqlite_connection, "connect", recording_connect)
+    script = Path(__file__).resolve().parent.parent / "scripts" / "bilibili-podcast-crontab"
+    module = runpy.run_path(str(script))
+    module["_load_configs_from_db"](db_path)
+
+    assert observed == {
+        "journal_mode": "wal",
+        "foreign_keys": 1,
+        "busy_timeout": 5000,
+    }
+
+
 def test_crontab_merge_preserves_manual_marker_text(monkeypatch) -> None:
     """A manual comment mentioning the marker must not be treated as an auto block."""
     import runpy
@@ -1091,7 +1125,7 @@ def test_paid_attach_media_success(tmp_path: Path) -> None:
         cli_admin.cmd_paid_attach_media(ns)
         assert target.exists(), f"target file not created: {target}"
         assert target.read_text() == "fake audio content"
-        assert oct(target.stat().st_mode)[-3:] == "644"
+        assert oct(target.stat().st_mode)[-3:] == "400"
     finally:
         if original_dirs is None:
             del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
@@ -1914,3 +1948,65 @@ def test_generate_rss_has_channel_itunes_image(tmp_path: Path) -> None:
     content = rss_path.read_text(encoding="utf-8")
     assert "itunes:image" in content
     assert "https://example.invalid/cover.jpg" in content
+
+
+def test_generate_rss_atomically_replaces_existing_file(tmp_path: Path, monkeypatch) -> None:
+    from bilibili_podcast.sync import SyncPaths, generate_rss
+    from bilibili_podcast.utils.series_config import SeriesConfig
+
+    cfg = SeriesConfig(
+        series="atomic", enabled=True, title="Atomic", description="desc", author="A",
+        cover_art="", category="", subcategories=[], explicit=False, lang="zh-CN",
+        source={"uid": 1}, sync={"quality": "64K"}, filters={}, paid_preview={}, keep_last=0,
+    )
+    paths = SyncPaths(
+        media_root=tmp_path / "media", json_root=tmp_path / "json",
+        rss_root=tmp_path / "rss", media_base_url="http://test:8080",
+    )
+    target = paths.rss_root / "atomic.xml"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+    original_chmod = Path.chmod
+
+    def reject_target_chmod(path, mode, *, follow_symlinks=True):
+        assert path != target
+        return original_chmod(path, mode, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "chmod", reject_target_chmod)
+
+    generate_rss(cfg, paths, {"name": "A"}, [], "__MEDIA_PLACEHOLDER__", dry_run=False)
+
+    assert target.read_text(encoding="utf-8").startswith("<?xml")
+    assert target.stat().st_mode & 0o777 == 0o600
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+
+
+def test_generate_rss_failure_preserves_existing_file(tmp_path: Path, monkeypatch) -> None:
+    from feedgen.feed import FeedGenerator
+    from bilibili_podcast.sync import SyncPaths, generate_rss
+    from bilibili_podcast.utils.series_config import SeriesConfig
+
+    cfg = SeriesConfig(
+        series="atomic", enabled=True, title="Atomic", description="desc", author="A",
+        cover_art="", category="", subcategories=[], explicit=False, lang="zh-CN",
+        source={"uid": 1}, sync={"quality": "64K"}, filters={}, paid_preview={}, keep_last=0,
+    )
+    paths = SyncPaths(
+        media_root=tmp_path / "media", json_root=tmp_path / "json",
+        rss_root=tmp_path / "rss", media_base_url="http://test:8080",
+    )
+    target = paths.rss_root / "atomic.xml"
+    target.parent.mkdir(parents=True)
+    target.write_text("old", encoding="utf-8")
+
+    def fail_write(self, filename, **kwargs):
+        Path(filename).write_text("partial", encoding="utf-8")
+        raise OSError("rss write failed")
+
+    monkeypatch.setattr(FeedGenerator, "rss_file", fail_write)
+
+    with pytest.raises(OSError, match="rss write failed"):
+        generate_rss(cfg, paths, {"name": "A"}, [], "__MEDIA_PLACEHOLDER__", dry_run=False)
+
+    assert target.read_text(encoding="utf-8") == "old"
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []

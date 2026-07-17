@@ -84,6 +84,19 @@ bilibili-podcast-config migrate \
 
 `migrate` 只有加 `--apply` 才写入；写入前会 staged 校验，并把被替换的配置和 SQLite 备份到 `config/.backups/`。真实生产值必须由旧配置迁移和人工核对产生，不要把模板占位符当作实际配置。
 
+最早生产布局使用独立 `legacy-v0` profile。历史 env 保持只读，缺失的路径由权限为 `0600` 的 manifest 显式提供；manifest 只允许 `[layout]`，包含数据库、media、JSON、RSS、state、secrets、浏览器、systemd、wrapper 和候选 release 的绝对路径，不得包含 token、Cookie 或密码：
+
+```bash
+bilibili-podcast-config migrate \
+  --profile legacy-v0 \
+  --layout-manifest <server_path>/.temp/legacy-layout.toml \
+  --legacy-env <server_path>/legacy.env \
+  --legacy-web-env <server_path>/legacy-web.env \
+  --legacy-series-dir <server_path>/series.d \
+  --legacy-rss-users <server_path>/rss-users.conf \
+  --output-root <server_path>/config
+```
+
 ## 独立版本迁移模块
 
 `bilibili_podcast.config.migration` 是唯一允许修改历史安装格式的独立模块。同步器、Web、Admin、publisher 和部署脚本只能调用该模块，不能各自维护升级分支。
@@ -91,13 +104,14 @@ bilibili-podcast-config migrate \
 迁移模块的接口契约是“任意已发布版本 → 当前最新版本”，而不是只支持相邻版本：
 
 - 自动检测来源版本，并按已登记步骤连续升级到当前版本。
-- 未标记的早期安装统一识别为 `legacy-unversioned`，通过显式适配器进入版本链。
+- 未标记的统一配置安装通过 `legacy-unversioned` 进入版本链；真实 partial-env 的最早生产布局通过 `legacy-v0` 和 layout manifest 进入同一版本链。
 - 配置、SQLite schema、文件布局、systemd unit、Cookie 和 RSS 发布格式均属于版本状态。
 - 默认 dry-run；`--apply` 前执行在线备份、checksum、staged 验证和回滚准备。
 - 当前版本重复执行必须幂等；未知未来版本、损坏状态、缺失步骤或活动同步锁必须显式失败。
 - 每次发布改变持久状态时，必须同时登记迁移步骤，并加入从最老 fixture、所有中间版本和跨多个版本直升的测试。
+- 测试会动态核对 `EARLIEST_UNIFIED_VERSION..LATEST_VERSION` 的连续 fixture、snapshot 和 step 注册；未来提升版本号但漏掉任一历史升级材料会直接失败。
 
-当前 legacy env/YAML/RSS-user 输入是 `legacy-unversioned` 适配器。后续版本不得通过改写这个适配器来伪装历史兼容，而应追加不可变的版本迁移步骤。
+`legacy-unversioned` 和 `legacy-v0` 是两个独立 source adapter。后续版本不得改写其历史语义来伪装兼容，而应追加不可变迁移步骤和对应 fixture。
 
 已统一配置的历史安装使用独立升级入口；默认只规划和验证，不写入：
 
@@ -358,20 +372,37 @@ python3 scripts/bilibili-podcast-crontab \
 
 ### 生产部署
 
-`scripts/deploy.sh` 实现一键部署，自动处理以下流程：
+零停机生产部署使用 `scripts/deploy-release.sh`。它从已校验的 source artifact 和固定 Git 依赖 wheel 创建 immutable release 与独立 venv；准备和 symlink 激活是两个独立动作，均默认 dry-run，且都不会 reload 或 restart 服务：
+
+```bash
+# 校验并准备候选 release；默认不写入
+scripts/deploy-release.sh prepare \
+  --root <server_path> \
+  --commit <commit_sha> \
+  --artifact <server_path>/.temp/release.tar.gz \
+  --artifact-sha256 <sha256> \
+  --bootstrap-wheel <server_path>/.temp/dependency.whl \
+  --bootstrap-wheel-sha256 <sha256>
+
+# 分别授权后执行 prepare 和原子 symlink 激活
+scripts/deploy-release.sh --apply prepare <same_arguments>
+scripts/deploy-release.sh --apply activate \
+  --root <server_path> --commit <commit_sha>
+```
+
+archive 只允许普通文件和目录，并拒绝 `.git`、`.temp`、`.venv`、`build` 和 `*.egg-info` 等本地/生成目录；路径穿越、symlink、重复 entry、checksum 差异、已有不完整 release 或非 symlink 的 `current` 都会显式失败。venv 移动前会修正 console script 的 staging shebang，release/venv marker 必须交叉一致，最终目录移除写权限；6 个项目命令和 Python 入口缺一不可。服务启动、timer 切换、Nginx/fail2ban reload 仍是后续独立门禁。并行影子 Web 可使用 `bilibili-podcast-web --host 127.0.0.1 --port <shadow_port>`；host 覆盖只接受 loopback IP，且覆盖只作用于当前进程，不改变 TOML。
+
+`scripts/deploy.sh` 仅用于已经采用单一活动代码目录的原地维护，不属于零停机蓝绿工具。它处理以下流程：
 
 | 步骤 | 处理内容 |
 |------|----------|
 | 环境检查 | 检查 Git 仓库/remote、系统用户 `bilibili-podcast`、secrets、日志/数据目录 |
-| Python 检测 + `_sqlite3` 编译 | 优先 Python 3.14，允许 3.13 回退；低于 3.13 时中止；缺失 `_sqlite3` 时尝试修复 |
-| 拉取最新代码 | `git pull --ff-only` |
-| 依赖安装 | `pip install -c requirements.lock -e .`；GitHub 不可达时自动回退 PyPI 安装 |
-| 模块验证 | 验证 sqlite3/yaml/aiohttp/curl_cffi/feedgen/lxml/bilibili-api/yt-dlp 已就绪 |
-| 运行配置标准化 | 将旧 env/RSS 用户配置迁为 TOML；unit 只保留 config root |
-| DB 迁移 | YAML 配置 + JSON 状态 → SQLite（自动备份） |
-| wrapper/调度准备 | 生成 auto/run_*.sh；可用于 cron 兼容路径，也可供 scheduler/systemd 使用 |
-| 验证 | DB 配置计数 + `exclude_paid` 语义检查 + Web 健康检查；默认不访问 B 站 API |
-| 清理 | 删除 `/tmp/Python-*` 编译残留（脚本末尾自动执行） |
+| 候选预检 | 使用活动 venv 和候选源码规划安装版本升级 |
+| 备份 | 在线备份 TOML、SQLite、systemd unit 和 wrapper，并校验 SHA-256 |
+| 原地更新 | `git pull --ff-only` 后在活动 venv 执行锁定依赖安装 |
+| 版本升级 | 再次使用候选模块规划并应用连续迁移步骤 |
+| wrapper 准备 | 使用唯一配置根重新生成 wrapper |
+| 验证 | 验证配置并编译 Python；不访问 B 站 API，不操作服务 |
 
 **前置依赖**（脚本会检查并提示设置方式）：
 
@@ -391,13 +422,13 @@ ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config ba
 ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config bash -s -- --apply' < scripts/deploy.sh
 ```
 
-首次部署先干跑确认步骤，再用 `--apply`。
+首次部署先干跑确认步骤，再用 `--apply`。有在线用户时不得用原地模式替代 release 模式。
 
 部署脚本不会执行真实同步请求。生产部署后的进一步验证应以只读检查为主：确认部署版本、timer 状态、日志 warning/error、RSS 中媒体/图片/JSON URL 均包含 token 或占位符。服务器别名、真实路径、访问控制和日志清理等运维动作请放在不提交 git 的运维手册中维护。
 
 #### 运行配置标准化
 
-标准化脚本把旧 env、Web env、系列 YAML 和 RSS 用户文件视为只读迁移输入。它先执行 dry-run/校验；`--apply` 时生成实际 TOML、备份旧配置和 unit，并把 unit 改为只含 `BILIBILI_PODCAST_CONFIG_ROOT`。脚本不会显示密文。
+标准化脚本把旧 env、Web env、系列 YAML 和 RSS 用户文件视为只读迁移输入。它先执行 dry-run/校验；`--apply` 时生成实际 TOML、备份旧配置和 unit，并把 unit 改为只含 `BILIBILI_PODCAST_CONFIG_ROOT`。最早生产布局必须显式传入 `--profile legacy-v0 --layout-manifest <server_path>/.temp/legacy-layout.toml`。需要两个候选 Web 实例时，同时传入不同的 `--web-primary-port` 和 `--web-backup-port`；脚本会生成主 unit 与 `bilibili-podcast-web-backup.service`，但不会启动它们或调用 `systemctl`。脚本不会显示密文。
 
 可单独运行标准化脚本：
 
@@ -407,6 +438,9 @@ ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BI
 
 # 实际修复
 ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --apply' < scripts/standardize-runtime-config.sh
+
+# legacy-v0 + 两个独立 localhost 候选端口（仍默认 dry-run）
+ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BILIBILI_PODCAST_ENV_FILE=<server_path>/legacy.env BILIBILI_PODCAST_WEB_ENV_FILE=<server_path>/legacy-web.env BILIBILI_PODCAST_LEGACY_SERIES_DIR=<server_path>/series.d RSS_USERS_CONF=<server_path>/rss-users.conf bash -s -- --profile legacy-v0 --layout-manifest <server_path>/.temp/legacy-layout.toml --web-primary-port <primary_port> --web-backup-port <backup_port>' < scripts/standardize-runtime-config.sh
 ```
 
 生产切换前必须确认所有同步与手动媒体入口都调用内建 publisher，且服务器上不存在仍被 unit、wrapper 或 cron 引用的外部发布脚本。
@@ -739,7 +773,7 @@ bilibili-podcast-admin scheduler status --backend systemd
 
 systemd 调度的安全约束：
 
-- 主调度之间不得重复，且最短间隔不得小于该系列的 `update_period`；兜底调度必须通过 `--retry-schedule` 显式标记。
+- 主调度之间不得重复；允许 timer 唤醒频率高于该系列的 `update_period`，实际重复同步由 sync 的 update-period gate 跳过。兜底调度必须通过 `--retry-schedule` 显式标记。
 - 主调度成功后，兜底 timer 当天触发时只记录 `retry_not_needed`，不会请求 B 站；主调度失败后，兜底可绕过 `update_period` 尝试一次。
 - `rate_limit_cooldown` 的优先级始终高于兜底调度，兜底不会绕过限流冷却。
 - cron 仅作为 systemd 不可用时的手工兜底链路，默认不启用；cron backend 不支持条件兜底，存在 retry schedule 时 `plan/apply` 会显式失败。
@@ -770,7 +804,9 @@ systemd 调度的安全约束：
 https://podcast.example.invalid/rss/<user_token>/{series}.xml
 ```
 
-Nginx 通过应用 `auth_request` 将 URL 中的 token 映射为 hash 目录。published RSS 权限为 `0640`，Nginx worker 必须通过专用 `bilibili-podcast` 共享组获得只读权限，不能放宽为其他用户可读。鉴权 upstream 的主备实例都必须运行带 `/auth` 接口的新版本；旧 Web 不能作为鉴权 backup。旧站点回退由外层负载均衡完成。删除系列由内部 `403 + X-RSS-Denial-Status: 410` 映射为公网 `410 Gone`，因为 Nginx `auth_request` 不能直接传播任意状态码。
+Nginx 通过应用 `auth_request` 将 URL 中的 token 映射为 hash 目录。published RSS 权限为 `0640`，Nginx worker 必须通过专用 `bilibili-podcast` 共享组获得只读权限，不能放宽为其他用户可读。鉴权 upstream 的主备实例都必须运行带 `/auth` 接口的新版本；旧 Web 不能作为鉴权 backup。回滚使用已校验的旧 Nginx 配置热 reload。删除系列由内部 `403 + X-RSS-Denial-Status: 410` 映射为公网 `410 Gone`，因为 Nginx `auth_request` 不能直接传播任意状态码。
+
+Nginx 和 Uvicorn 日志不得记录 URI、query、token、Authorization 或 Cookie。存在 fail2ban 时，生产探针只允许携带完整正确参数的单条、低频正向请求；错误 token、缺参和完整负向矩阵只能在进程内或隔离 listener 验证。
 
 ### 用户配置文件
 

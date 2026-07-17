@@ -15,7 +15,13 @@ from bilibili_podcast.config.manager import (
     ConfigError, ConfigManager, LegacyConfigError, UnsafeConfigError,
 )
 from bilibili_podcast.config.schema import LEGACY_ENV_MAP, LEGACY_INPUT_ONLY
-from bilibili_podcast.config.migration import LATEST_VERSION, VERSION_FILE, migrate_legacy
+from bilibili_podcast.config.migration import (
+    LATEST_VERSION,
+    LEGACY_V0_PROFILE,
+    VERSION_FILE,
+    migrate_legacy,
+    read_legacy_layout,
+)
 from bilibili_podcast import db
 
 
@@ -103,6 +109,17 @@ def test_rejects_non_finite_numbers_and_unsafe_unit_names(tmp_path: Path) -> Non
         )
     )
     with pytest.raises(ConfigError, match="overlaps web unit"):
+        ConfigManager(root, environ={}).load()
+
+    root = _actual_config(tmp_path / "venv-space")
+    app = root / "app.toml"
+    app.write_text(
+        app.read_text().replace(
+            f'venv_bin = "{tmp_path / "venv-space" / "runtime"}/venv/bin"',
+            f'venv_bin = "{tmp_path / "venv-space" / "runtime"}/venv with space/bin"',
+        )
+    )
+    with pytest.raises(ConfigError, match="systemd configuration paths"):
         ConfigManager(root, environ={}).load()
 
 
@@ -195,6 +212,128 @@ def _legacy_env(tmp_path: Path) -> Path:
     path = tmp_path / "legacy.env"
     path.write_text("\n".join(f"export {key}={value}" for key, value in values.items()) + "\n")
     return path
+
+
+def _legacy_v0_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
+    fixture = Path(__file__).parent / "fixtures" / "legacy_v0"
+    runtime = tmp_path / "runtime"
+    old_prefix = "LEGACYAPP"
+    legacy_env = tmp_path / "runtime.env"
+    legacy_env.write_text(
+        (fixture / "runtime.env").read_text(encoding="utf-8")
+        .replace("__OLD_PREFIX__", old_prefix)
+        .replace("<runtime>", str(runtime)),
+        encoding="utf-8",
+    )
+    web_env = tmp_path / "web.env"
+    web_env.write_text(
+        (fixture / "web.env").read_text(encoding="utf-8")
+        .replace("__OLD_PREFIX__", old_prefix),
+        encoding="utf-8",
+    )
+    users = tmp_path / "rss-users.conf"
+    users.write_bytes((fixture / "rss-users.conf").read_bytes())
+    series = tmp_path / "series.d"
+    series.mkdir()
+    (series / "demo.yaml").write_bytes((fixture / "series.d" / "demo.yaml").read_bytes())
+    layout_values = {
+        "app_dir": runtime / "current",
+        "venv_bin": runtime / "current-venv/bin",
+        "sync_path": runtime / "current-venv/bin/bilibili-podcast",
+        "database_path": runtime / "old-state/series.db",
+        "media_root": runtime / "media",
+        "json_root": runtime / "json",
+        "rss_root": runtime / "rss",
+        "published_rss_root": runtime / "published-rss",
+        "state_root": runtime / "old-state",
+        "log_dir": runtime / "logs",
+        "secrets_dir": runtime / "secrets",
+        "cookie_file": runtime / "secrets/cookie.txt",
+        "lock_file": runtime / "old-state/sync.lock",
+        "browser_user_data_root": runtime / "browser",
+        "playwright_browsers_path": runtime / "playwright",
+        "systemd_dir": runtime / "systemd",
+        "cron_script_dir": runtime / "cron",
+        "wrapper_dir": runtime / "wrappers",
+    }
+    layout = tmp_path / "layout.toml"
+    layout.write_text(
+        "[layout]\n" + "".join(
+            f'{key} = "{value}"\n' for key, value in layout_values.items()
+        ),
+        encoding="utf-8",
+    )
+    layout.chmod(0o600)
+    return legacy_env, web_env, series, users, layout, runtime
+
+
+def test_legacy_v0_profile_migrates_real_partial_environment_and_cookie(tmp_path: Path) -> None:
+    legacy_env, web_env, series, users, layout, runtime = _legacy_v0_inputs(tmp_path)
+    database_path = runtime / "old-state/series.db"
+    db.migrate(database_path)
+    inode = database_path.stat().st_ino
+    output = tmp_path / "config"
+
+    dry_run = migrate_legacy(
+        legacy_env=legacy_env,
+        legacy_web_env=web_env,
+        legacy_series_dir=series,
+        legacy_rss_users=users,
+        output_root=output,
+        profile=LEGACY_V0_PROFILE,
+        layout_manifest=layout,
+    )
+    assert dry_run.applied is False
+    assert not output.exists()
+
+    result = migrate_legacy(
+        legacy_env=legacy_env,
+        legacy_web_env=web_env,
+        legacy_series_dir=series,
+        legacy_rss_users=users,
+        output_root=output,
+        profile=LEGACY_V0_PROFILE,
+        layout_manifest=layout,
+        apply=True,
+    )
+    assert result.applied is True
+    assert database_path.stat().st_ino == inode
+    snapshot = ConfigManager(output, environ={}).load()
+    assert snapshot.app.database.path == database_path
+    assert snapshot.app.install.app_dir == runtime / "current"
+    assert snapshot.scheduler.paths.wrapper_dir == runtime / "wrappers"
+    assert snapshot.web.security.previous_cookie_names == (
+        "legacyapp_session",
+    )
+    assert [user.series for user in snapshot.rss_users.users.values()] == [
+        ("all",), ("demo",),
+    ]
+    assert (output / VERSION_FILE).read_text(encoding="ascii").strip() == str(LATEST_VERSION)
+    assert any("rsync" in item for item in result.normalizations)
+
+
+def test_legacy_v0_layout_is_restricted_and_never_prints_values(tmp_path: Path, capsys) -> None:
+    legacy_env, web_env, series, users, layout, _, = _legacy_v0_inputs(tmp_path)
+    layout.chmod(0o644)
+    with pytest.raises(UnsafeConfigError, match="manifest permissions"):
+        read_legacy_layout(layout)
+    layout.chmod(0o600)
+    with pytest.raises(UnsafeConfigError, match="not a regular file"):
+        read_legacy_layout(series)
+
+    returncode = config_main([
+        "migrate", "--profile", LEGACY_V0_PROFILE,
+        "--layout-manifest", str(layout),
+        "--legacy-env", str(legacy_env),
+        "--legacy-web-env", str(web_env),
+        "--legacy-series-dir", str(series),
+        "--legacy-rss-users", str(users),
+        "--output-root", str(tmp_path / "config"),
+    ])
+    output = capsys.readouterr().out
+    assert returncode == 0
+    assert "fixture-password" not in output
+    assert "test-token-a" not in output
 
 
 def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) -> None:
@@ -326,7 +465,7 @@ def test_legacy_migration_keeps_existing_database_inode_and_backup(tmp_path: Pat
 def test_legacy_migration_restores_config_and_database_when_upgrade_fails(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from bilibili_podcast.config.migration import versioning
+    from bilibili_podcast.config import migration
 
     env = _legacy_env(tmp_path)
     empty = tmp_path / "empty"
@@ -349,14 +488,22 @@ def test_legacy_migration_restores_config_and_database_when_upgrade_fails(
         )
     inode = database_path.stat().st_ino
 
-    def fail_upgrade(*args, **kwargs):
-        raise RuntimeError("injected version upgrade failure")
+    original_write = migration._write_migrated_series
+    calls = 0
 
-    monkeypatch.setattr(versioning, "upgrade_installation", fail_upgrade)
-    with pytest.raises(RuntimeError, match="injected version upgrade failure"):
+    def fail_live_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected live database failure")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(migration, "_write_migrated_series", fail_live_write)
+    with pytest.raises(RuntimeError, match="injected live database failure"):
         migrate_legacy(
             legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
             legacy_rss_users=empty, output_root=output, apply=True,
+            series_source="yaml",
         )
 
     assert (output / "web.toml").read_text(encoding="utf-8") == original_web

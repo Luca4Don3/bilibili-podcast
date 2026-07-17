@@ -1,0 +1,7 @@
+[fixture]
+version = 4
+marker = true
+legacy_product_names = false
+previous_cookie_names = true
+gone_series = true
+media_contract = true

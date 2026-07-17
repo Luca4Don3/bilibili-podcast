@@ -40,6 +40,10 @@ def _load_web_server(monkeypatch, db_path: Path):
         )),
         rss_users=SimpleNamespace(users={}),
     )
+    monkeypatch.setattr(
+        "bilibili_podcast.media_security._probe_media_fd",
+        lambda *args, **kwargs: None,
+    )
     return server
 
 
@@ -74,6 +78,15 @@ def test_rss_authorization_matrix_and_gone_series_are_local_only(monkeypatch, tm
     assert gone.status_code == 403
     assert gone.headers["X-RSS-Denial-Status"] == "410"
     assert asyncio.run(server.authorize_rss("invalid-token", "series-06")).status_code == 403
+
+    server._CONFIG_SNAPSHOT.rss_users = SimpleNamespace(users={
+        "all-user": SimpleNamespace(token="all-user-token", series=("all",)),
+    })
+    missing = asyncio.run(server.authorize_rss("all-user-token", "not-published"))
+    assert missing.status_code == 204
+    assert missing.headers["X-RSS-Token-Hash"] == hashlib.sha256(
+        b"all-user-token"
+    ).hexdigest()
 
 
 def test_media_authorization_and_previous_cookie_refresh(monkeypatch, tmp_path: Path) -> None:

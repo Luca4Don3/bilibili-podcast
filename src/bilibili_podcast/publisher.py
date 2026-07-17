@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -14,9 +14,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .config.models import ConfigSnapshot
+from .locks import LockKind, ordered_lock
+from .secure_files import ensure_directory
 
 
 LOGGER = logging.getLogger(__name__)
+_GENERATION_RE = re.compile(r"^[0-9]+-[0-9a-f]{12}$")
 
 
 class PublishError(RuntimeError):
@@ -29,14 +32,13 @@ def token_digest(token: str) -> str:
 
 @contextmanager
 def _publish_lock(root: Path):
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_directory(root)
     lock_path = root / ".publish.lock"
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+    try:
+        with ordered_lock(lock_path, LockKind.PUBLISH, blocking=True):
             yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError as exc:
+        raise PublishError(f"unsafe publish lock: {type(exc).__name__}") from None
 
 
 def _fsync_file(path: Path) -> None:
@@ -130,7 +132,12 @@ def publish(snapshot: ConfigSnapshot) -> str:
             try:
                 _fsync_dir(output_root)
                 retained = sorted(
-                    (item for item in generations.iterdir() if item.is_dir() and not item.name.startswith(".staging-")),
+                    (
+                        item for item in generations.iterdir()
+                        if item.is_dir()
+                        and not item.is_symlink()
+                        and _GENERATION_RE.fullmatch(item.name)
+                    ),
                     key=lambda item: item.name,
                     reverse=True,
                 )

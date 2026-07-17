@@ -6,11 +6,22 @@
 set -euo pipefail
 
 APPLY=false
-if [ "${1:-}" = "--apply" ]; then
-    APPLY=true
-elif [ -n "${1:-}" ]; then
-    echo "ERROR: usage: scripts/deploy.sh [--apply]" >&2
+SYSTEM_PERMISSIONS=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --apply) APPLY=true ;;
+        --system-permissions) SYSTEM_PERMISSIONS=true ;;
+        *) echo "ERROR: usage: scripts/deploy.sh [--apply] [--system-permissions]" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ "$SYSTEM_PERMISSIONS" = true ] && [ "$APPLY" != true ]; then
+    echo "ERROR: --system-permissions requires --apply" >&2
     exit 2
+fi
+if [ "$APPLY" = true ]; then
+    echo "ERROR: scripts/deploy.sh --apply is disabled; use an immutable release prepare/activate workflow" >&2
+    exit 3
 fi
 
 if [ -z "${BILIBILI_PODCAST_CONFIG_ROOT:-}" ]; then
@@ -58,9 +69,6 @@ BACKUP_DIR="$BACKUP_TEMPLATE"
 
 echo "Bilibili Podcast unified deployment"
 echo "  mode: $([ "$APPLY" = true ] && echo apply || echo dry-run)"
-echo "  config root: $CONFIG_ROOT"
-echo "  code dir: $CODE_DIR"
-echo "  database: $DB_PATH"
 
 bilibili-podcast-config validate
 
@@ -84,6 +92,7 @@ candidate_config() {
 
 UPGRADE_JSON="$(candidate_config upgrade --format json)"
 UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])["steps"]))' "$UPGRADE_JSON")"
+candidate_config permissions --format json
 if [ "$UPGRADE_STEPS" -gt 0 ]; then
     echo "Required installation upgrade: $UPGRADE_JSON"
     if [ "$APPLY" != true ]; then
@@ -144,6 +153,10 @@ UPGRADE_STEPS="$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])[
 if [ "$UPGRADE_STEPS" -gt 0 ]; then
     candidate_config upgrade --apply
 fi
+candidate_config permissions --format json
+if [ "$SYSTEM_PERMISSIONS" = true ]; then
+    candidate_config permissions --apply
+fi
 bilibili-podcast-config validate
 PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" -m compileall -q "$CODE_DIR/src"
 
@@ -157,5 +170,5 @@ PYTHONPATH="$CODE_DIR/src" "$PYTHON_BIN" "$CODE_DIR/scripts/bilibili-podcast-cro
 
 bilibili-podcast-config validate
 echo "Deployment completed without service restart."
-echo "Backup: $BACKUP_DIR"
+echo "Backup ID: $(basename "$BACKUP_DIR")"
 echo "Next gate: review unit diffs and health checks before separately authorizing restart or production sync."

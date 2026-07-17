@@ -64,11 +64,15 @@ def test_failed_generation_does_not_switch_current(tmp_path):
 
 def test_only_two_complete_generations_are_retained(tmp_path):
     snapshot = _snapshot(tmp_path)
+    unrelated = snapshot.app.paths.published_rss_root / ".generations" / "operator-notes"
+    unrelated.mkdir(parents=True)
     for _ in range(3):
         publish(snapshot)
 
     generations = snapshot.app.paths.published_rss_root / ".generations"
-    assert len([item for item in generations.iterdir() if not item.name.startswith(".")]) == 2
+    retained = [item for item in generations.iterdir() if item.name != "operator-notes"]
+    assert len(retained) == 2
+    assert unrelated.is_dir()
 
 
 def test_concurrent_publishers_serialize(tmp_path):
@@ -98,6 +102,21 @@ def test_master_with_configured_token_is_rejected(tmp_path):
 
     with pytest.raises(PublishError, match="configured user token"):
         publish(snapshot)
+
+
+def test_symlinked_publish_lock_is_rejected_without_touching_target(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    published = snapshot.app.paths.published_rss_root
+    published.mkdir()
+    target = tmp_path / "outside-lock"
+    target.write_text("preserve")
+    (published / ".publish.lock").symlink_to(target)
+
+    with pytest.raises(PublishError, match="unsafe publish lock"):
+        publish(snapshot)
+
+    assert target.read_text() == "preserve"
+    assert not (published / "current").exists()
 
 
 def test_empty_master_set_is_rejected_without_switching(tmp_path):

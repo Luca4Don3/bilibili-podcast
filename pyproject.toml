@@ -59,4 +59,4 @@ package-dir = {"" = "src"}
 include-package-data = true
 
 [tool.setuptools.package-data]
-bilibili_podcast = ["web/templates/*.html"]
+bilibili_podcast = ["web/templates/*.html", "config/migration/schemas/*.sql"]
