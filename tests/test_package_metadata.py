@@ -6,7 +6,8 @@ def test_wheel_declares_templates_and_all_console_entry_points():
     metadata = tomllib.loads(Path("pyproject.toml").read_text())
 
     assert metadata["tool"]["setuptools"]["package-data"]["bilibili_podcast"] == [
-        "web/templates/*.html"
+        "web/templates/*.html",
+        "config/migration/schemas/*.sql",
     ]
     assert metadata["project"]["scripts"] == {
         "bilibili-podcast": "bilibili_podcast.sync:main",

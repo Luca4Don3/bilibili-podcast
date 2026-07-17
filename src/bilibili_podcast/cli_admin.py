@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,13 @@ from .services.scheduler_service import ScheduleEntry, SchedulerService, validat
 from .services.series_removal_service import SeriesRemovalPlan, SeriesRemovalService
 from .utils.bilibili_url import parse_space_source
 from .config import ConfigError, ConfigManager, ConfigSnapshot
+from .media_security import (
+    atomic_media_copy,
+    media_is_valid,
+    media_update_lock,
+    private_cookie_copy,
+)
+from .secure_files import atomic_write_bytes
 
 _CONFIG: ConfigSnapshot | None = None
 
@@ -39,6 +47,11 @@ def _require_config() -> ConfigSnapshot:
     if _CONFIG is None:
         raise ConfigError("admin configuration was not injected")
     return _CONFIG
+
+
+def _ffprobe_bin() -> str:
+    executables = getattr(_require_config().app, "executables", None)
+    return str(getattr(executables, "ffprobe", "ffprobe"))
 
 
 def _scheduler_service(db_path: str, **kwargs) -> SchedulerService:
@@ -1907,15 +1920,20 @@ def _ensure_channel_itunes_image(rss_path: Path, image_url: str) -> None:
     node = ET.Element(tag)
     node.set("href", image_url)
     channel.insert(4, node)
-    tree.write(rss_path, encoding="utf-8", xml_declaration=True)
-    rss_path.chmod(0o644)
+    atomic_write_bytes(
+        rss_path,
+        ET.tostring(root, encoding="utf-8", xml_declaration=True),
+        mode=0o600,
+    )
 
 
 def _write_metadata_file(json_root: Path, series: str, bvid: str, quality: str, metadata: dict[str, Any]) -> Path:
     dst = json_root / series / f"{bvid}_{quality}.info.json"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    dst.chmod(0o644)
+    atomic_write_bytes(
+        dst,
+        json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
+        mode=0o600,
+    )
     return dst
 
 
@@ -2017,7 +2035,22 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
             sys.exit(EXIT_VALIDATION)
         quality = _get_series_quality(db_path, args.series)
         normalized = _episode_from_metadata(metadata, requested_bvid)
-        path = _write_metadata_file(Path(args.json_root), args.series, requested_bvid, quality, normalized)
+        path = Path(args.json_root) / args.series / f"{requested_bvid}_{quality}.info.json"
+        with media_update_lock(_require_config().sync.paths.lock_file):
+            backup = _file_backup(path)
+            try:
+                path = _write_metadata_file(
+                    Path(args.json_root),
+                    args.series,
+                    requested_bvid,
+                    quality,
+                    normalized,
+                )
+            except Exception:
+                _restore_file(path, backup)
+                raise
+            else:
+                _discard_file_backup(backup)
         result = {
             "series": args.series,
             "bvid": requested_bvid,
@@ -2040,16 +2073,31 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
         sys.exit(EXIT_SYNC_FAIL)
 
     json_root = Path(args.json_root) if hasattr(args, "json_root") and args.json_root else _require_config().app.paths.json_root
-    ep_dir = json_root / args.series
-    ep_dir.mkdir(parents=True, exist_ok=True)
     written = 0
     quality = _get_series_quality(db_path, args.series)
-    for ep in episodes:
-        bvid = ep["bvid"]
-        path = ep_dir / f"{bvid}_{quality}.info.json"
-        path.write_text(json.dumps(ep, ensure_ascii=False, indent=2), encoding="utf-8")
-        path.chmod(0o644)
-        written += 1
+    targets = tuple(
+        json_root / args.series / f"{episode['bvid']}_{quality}.info.json"
+        for episode in episodes
+    )
+    with media_update_lock(_require_config().sync.paths.lock_file):
+        backups = _file_backups(*targets)
+        try:
+            for episode in episodes:
+                _write_metadata_file(
+                    json_root,
+                    args.series,
+                    episode["bvid"],
+                    quality,
+                    episode,
+                )
+                written += 1
+        except Exception:
+            for target, backup in zip(targets, backups, strict=True):
+                _restore_file(target, backup)
+            raise
+        else:
+            for backup in backups:
+                _discard_file_backup(backup)
     if _should_json(args):
         _run_json(args, {"series": args.series, "metadata_written": written})
     else:
@@ -2074,7 +2122,7 @@ def cmd_paid_list_missing(args: argparse.Namespace) -> None:
     for f in sorted(json_dir.glob("*.info.json")):
         bvid = f.stem.split("_")[0]
         media_file = media_dir / f"{bvid}_{quality}.mp3"
-        if not media_file.exists():
+        if not media_is_valid(media_file, ffprobe_bin=_ffprobe_bin()):
             import json
             try:
                 meta = json.loads(f.read_text(encoding="utf-8"))
@@ -2123,24 +2171,36 @@ def cmd_paid_attach_media(args: argparse.Namespace) -> None:
     dst = media_root / args.series / dst_name
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    if dst.exists() and not args.replace:
-        print(f"❌ 目标文件已存在: {dst}")
-        print(f"   使用 --replace 覆盖")
-        sys.exit(EXIT_VALIDATION)
+    if os.path.lexists(dst):
+        media_is_valid(dst, ffprobe_bin=_ffprobe_bin())
+        if not args.replace:
+            print(f"❌ 目标文件已存在: {dst}")
+            print(f"   使用 --replace 覆盖")
+            sys.exit(EXIT_VALIDATION)
 
-    import shutil
-    shutil.copy2(str(resolved), str(dst))
-    dst.chmod(0o644)
+    lock_path = getattr(_CONFIG.sync.paths, "lock_file", None) if _CONFIG is not None else None
+    with media_update_lock(lock_path):
+        atomic_media_copy(
+            resolved,
+            dst,
+            replace=args.replace,
+            ffprobe_bin=_ffprobe_bin(),
+            mode=0o400,
+        )
     print(f"  ✅ media 已关联: {dst.name} ({dst.stat().st_size} bytes)")
 
 
 def _fetch_single_video_metadata(video_url: str, cookie_file: str | None) -> dict[str, Any]:
     cmd = [sys.executable, "-m", "yt_dlp", "--dump-json", "--skip-download"]
-    if cookie_file:
-        cmd.extend(["--cookies", cookie_file])
-    cmd.append(video_url)
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if cookie_file:
+            with private_cookie_copy(cookie_file) as private_cookie:
+                result = subprocess.run(
+                    [*cmd, "--cookies", str(private_cookie), video_url],
+                    check=True, capture_output=True, text=True,
+                )
+        else:
+            result = subprocess.run([*cmd, video_url], check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as exc:
         err = (exc.stderr or exc.stdout or "").strip()
         raise RuntimeError(f"metadata 获取失败: {_sanitize(err)}") from exc
@@ -2155,7 +2215,7 @@ def _convert_media_to_mp3(src: Path, dst_dir: Path, bvid: str, quality: str, ffm
         return src, False
     bitrate = quality.lower()
     dst_dir.mkdir(parents=True, exist_ok=True)
-    tmp = dst_dir / f".{bvid}_{quality}.{os.getpid()}.mp3"
+    tmp = dst_dir / f".{bvid}_{quality}.{uuid.uuid4().hex}.mp3"
     cmd = [
         ffmpeg_bin, "-y",
         "-i", str(src),
@@ -2175,12 +2235,13 @@ def _convert_media_to_mp3(src: Path, dst_dir: Path, bvid: str, quality: str, ffm
 
 
 def _copy_attached_media(src: Path, dst: Path, replace: bool) -> None:
-    if dst.exists() and not replace:
-        raise ValueError(f"目标文件已存在: {dst}")
-    import shutil
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(str(src), str(dst))
-    dst.chmod(0o644)
+    atomic_media_copy(
+        src,
+        dst,
+        replace=replace,
+        ffprobe_bin=_ffprobe_bin(),
+        mode=0o400,
+    )
 
 
 def cmd_paid_add_item(args: argparse.Namespace) -> None:
@@ -2211,63 +2272,64 @@ def cmd_paid_add_item(args: argparse.Namespace) -> None:
     media_dst = media_root / args.series / f"{bvid}_{quality}.mp3"
     json_dst = json_root / args.series / f"{bvid}_{quality}.info.json"
     rss_dst = rss_root / f"{args.series}.xml"
-    if media_dst.exists() and not args.replace:
-        print(f"❌ 目标文件已存在: {media_dst}")
-        print("   使用 --replace 覆盖")
-        sys.exit(EXIT_VALIDATION)
+    if os.path.lexists(media_dst):
+        media_is_valid(media_dst, ffprobe_bin=_ffprobe_bin())
+        if not args.replace:
+            print(f"❌ 目标文件已存在: {media_dst}")
+            print("   使用 --replace 覆盖")
+            sys.exit(EXIT_VALIDATION)
 
-    media_backup, json_backup, rss_backup = _file_backups(
-        media_dst, json_dst, rss_dst,
-    )
-    try:
-        metadata = _fetch_single_video_metadata(
-            args.url, args.cookie_file or str(config.sync.paths.cookie_file)
+    lock_path = getattr(config.sync.paths, "lock_file", None)
+    with media_update_lock(lock_path):
+        media_backup, json_backup, rss_backup = _file_backups(
+            media_dst, json_dst, rss_dst,
         )
-        meta_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id") or bvid
-        if meta_bvid != bvid:
-            raise ValueError(f"metadata BVID 与 URL 不一致: {meta_bvid} != {bvid}")
-        converted, is_temp = _convert_media_to_mp3(src, media_dst.parent, bvid, quality, args.ffmpeg_bin or "ffmpeg")
         try:
-            _copy_attached_media(converted, media_dst, args.replace)
-        finally:
-            if is_temp:
-                converted.unlink(missing_ok=True)
+            metadata = _fetch_single_video_metadata(
+                args.url, args.cookie_file or str(config.sync.paths.cookie_file)
+            )
+            meta_bvid = metadata.get("bvid") or metadata.get("id") or metadata.get("display_id") or bvid
+            if meta_bvid != bvid:
+                raise ValueError(f"metadata BVID 与 URL 不一致: {meta_bvid} != {bvid}")
+            converted, is_temp = _convert_media_to_mp3(
+                src,
+                media_dst.parent,
+                bvid,
+                quality,
+                args.ffmpeg_bin or "ffmpeg",
+            )
+            try:
+                _copy_attached_media(converted, media_dst, args.replace)
+            finally:
+                if is_temp:
+                    converted.unlink(missing_ok=True)
 
-        metadata["bvid"] = bvid
-        metadata["duration"] = _normalize_duration(metadata.get("duration"))
-        metadata.setdefault("webpage_url", args.url)
-        metadata.setdefault("link", args.url)
-        _write_metadata_file(json_root, args.series, bvid, quality, metadata)
+            metadata["bvid"] = bvid
+            metadata["duration"] = _normalize_duration(metadata.get("duration"))
+            metadata.setdefault("webpage_url", args.url)
+            metadata.setdefault("link", args.url)
+            _write_metadata_file(json_root, args.series, bvid, quality, metadata)
 
-        rss_path, item_count = rebuild_paid_rss(
-            db_path,
-            args.series,
-            json_root=json_root,
-            media_root=media_root,
-            rss_root=rss_root,
-            media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
-        )
-    except (ValueError, RuntimeError, OSError) as exc:
-        _restore_file(media_dst, media_backup)
-        _restore_file(json_dst, json_backup)
-        _restore_file(rss_dst, rss_backup)
-        print(f"❌ {exc}")
-        sys.exit(EXIT_VALIDATION if isinstance(exc, ValueError) else EXIT_SYNC_FAIL)
+            rss_path, item_count = rebuild_paid_rss(
+                db_path,
+                args.series,
+                json_root=json_root,
+                media_root=media_root,
+                rss_root=rss_root,
+                media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
+            )
+            if config.publish.publish.enabled:
+                from .publisher import publish
+                publish(config)
+        except (ValueError, RuntimeError, OSError) as exc:
+            _restore_file(media_dst, media_backup)
+            _restore_file(json_dst, json_backup)
+            _restore_file(rss_dst, rss_backup)
+            print(f"❌ {exc}")
+            sys.exit(EXIT_VALIDATION if isinstance(exc, ValueError) else EXIT_SYNC_FAIL)
 
-    try:
-        config = _require_config()
-        if config.publish.publish.enabled:
-            from .publisher import publish
-            publish(config)
-    except (OSError, RuntimeError) as exc:
-        _restore_file(media_dst, media_backup)
-        _restore_file(json_dst, json_backup)
-        _restore_file(rss_dst, rss_backup)
-        print(f"❌ RSS 发布失败: {_sanitize(str(exc))}")
-        sys.exit(EXIT_SYNC_FAIL)
-
-    for backup in (media_backup, json_backup, rss_backup):
-        _discard_file_backup(backup)
+        for backup in (media_backup, json_backup, rss_backup):
+            _discard_file_backup(backup)
 
     result = {
         "series": args.series,
@@ -2321,7 +2383,7 @@ def rebuild_paid_rss(
     for f in sorted(json_dir.glob("*.info.json")):
         bvid = f.stem.split("_")[0]
         media_file = media_dir / f"{bvid}_{quality}.mp3"
-        if not media_file.exists():
+        if not media_is_valid(media_file, ffprobe_bin=_ffprobe_bin()):
             continue
         try:
             meta = json.loads(f.read_text(encoding="utf-8"))
@@ -2380,14 +2442,15 @@ def cmd_paid_rebuild_rss(args: argparse.Namespace) -> None:
     rss_root = Path(args.rss_root) if args.rss_root else config.app.paths.rss_root
 
     try:
-        rss_path, item_count = rebuild_paid_rss(
-            db_path,
-            args.series,
-            json_root=json_root,
-            media_root=media_root,
-            rss_root=rss_root,
-            media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
-        )
+        with media_update_lock(config.sync.paths.lock_file):
+            rss_path, item_count = rebuild_paid_rss(
+                db_path,
+                args.series,
+                json_root=json_root,
+                media_root=media_root,
+                rss_root=rss_root,
+                media_base_url=args.media_base_url or _require_config().publish.publish.media_base_url,
+            )
     except ValueError as exc:
         message = str(exc)
         if "没有可写入 RSS" in message:

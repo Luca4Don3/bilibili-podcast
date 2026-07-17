@@ -335,4 +335,4 @@ if [ -n "$WEB_BACKUP_PORT" ]; then
     echo "Prepared Web units: $WEB_UNIT ($WEB_PRIMARY_PORT), $WEB_BACKUP_UNIT ($WEB_BACKUP_PORT)."
 fi
 echo "No systemd reload, restart, start, or enable action was performed."
-echo "Backup: $BACKUP_DIR"
+echo "Backup ID: $(basename "$BACKUP_DIR")"

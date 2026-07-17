@@ -131,26 +131,14 @@ class TestMigrate:
             ).fetchone()[0] == "L"
         legacy.close()
 
-    def test_online_migration_rolls_back_partial_column_changes(self, tmp_path: Path, monkeypatch):
+    def test_existing_old_schema_requires_explicit_upgrade_plan(self, tmp_path: Path):
         path = tmp_path / "old-schema.db"
         with sqlite3.connect(path) as conn:
             conn.execute(
                 "CREATE TABLE cron_schedule(id INTEGER PRIMARY KEY, series TEXT, schedule TEXT)"
             )
 
-        original = db._ensure_column
-        calls = 0
-
-        def fail_after_first_column(conn, table, column, definition):
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                original(conn, table, column, definition)
-                return
-            raise RuntimeError("injected migration failure")
-
-        monkeypatch.setattr(db, "_ensure_column", fail_after_first_column)
-        with pytest.raises(RuntimeError, match="injected migration failure"):
+        with pytest.raises(db.DatabaseUpgradeRequired, match="explicit upgrade plan"):
             db.migrate(path)
 
         with sqlite3.connect(path) as conn:

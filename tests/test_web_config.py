@@ -40,6 +40,10 @@ def _load_web_server(monkeypatch, db_path: Path):
         )),
         rss_users=SimpleNamespace(users={}),
     )
+    monkeypatch.setattr(
+        "bilibili_podcast.media_security._probe_media_fd",
+        lambda *args, **kwargs: None,
+    )
     return server
 
 

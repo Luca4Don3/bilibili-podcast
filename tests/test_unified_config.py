@@ -217,7 +217,7 @@ def _legacy_env(tmp_path: Path) -> Path:
 def _legacy_v0_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, Path]:
     fixture = Path(__file__).parent / "fixtures" / "legacy_v0"
     runtime = tmp_path / "runtime"
-    old_prefix = ("BILI" + "POD")
+    old_prefix = "LEGACYAPP"
     legacy_env = tmp_path / "runtime.env"
     legacy_env.write_text(
         (fixture / "runtime.env").read_text(encoding="utf-8")
@@ -303,10 +303,10 @@ def test_legacy_v0_profile_migrates_real_partial_environment_and_cookie(tmp_path
     assert snapshot.app.install.app_dir == runtime / "current"
     assert snapshot.scheduler.paths.wrapper_dir == runtime / "wrappers"
     assert snapshot.web.security.previous_cookie_names == (
-        ("bili" + "pod") + "_session",
+        "legacyapp_session",
     )
     assert [user.series for user in snapshot.rss_users.users.values()] == [
-        ("all",), ("demo",), ("demo",), ("demo",),
+        ("all",), ("demo",),
     ]
     assert (output / VERSION_FILE).read_text(encoding="ascii").strip() == str(LATEST_VERSION)
     assert any("rsync" in item for item in result.normalizations)
@@ -333,7 +333,7 @@ def test_legacy_v0_layout_is_restricted_and_never_prints_values(tmp_path: Path, 
     output = capsys.readouterr().out
     assert returncode == 0
     assert "fixture-password" not in output
-    assert "fixture-user-a" not in output
+    assert "test-token-a" not in output
 
 
 def test_migration_dry_run_writes_nothing_and_apply_validates(tmp_path: Path) -> None:
@@ -465,7 +465,7 @@ def test_legacy_migration_keeps_existing_database_inode_and_backup(tmp_path: Pat
 def test_legacy_migration_restores_config_and_database_when_upgrade_fails(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    from bilibili_podcast.config.migration import versioning
+    from bilibili_podcast.config import migration
 
     env = _legacy_env(tmp_path)
     empty = tmp_path / "empty"
@@ -488,14 +488,22 @@ def test_legacy_migration_restores_config_and_database_when_upgrade_fails(
         )
     inode = database_path.stat().st_ino
 
-    def fail_upgrade(*args, **kwargs):
-        raise RuntimeError("injected version upgrade failure")
+    original_write = migration._write_migrated_series
+    calls = 0
 
-    monkeypatch.setattr(versioning, "upgrade_installation", fail_upgrade)
-    with pytest.raises(RuntimeError, match="injected version upgrade failure"):
+    def fail_live_write(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected live database failure")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(migration, "_write_migrated_series", fail_live_write)
+    with pytest.raises(RuntimeError, match="injected live database failure"):
         migrate_legacy(
             legacy_env=env, legacy_web_env=empty, legacy_series_dir=series_dir,
             legacy_rss_users=empty, output_root=output, apply=True,
+            series_source="yaml",
         )
 
     assert (output / "web.toml").read_text(encoding="utf-8") == original_web

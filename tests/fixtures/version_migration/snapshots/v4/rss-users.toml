@@ -1,0 +1,3 @@
+[users.fixture]
+token = "fixture-credential"
+series = ["series-one"]

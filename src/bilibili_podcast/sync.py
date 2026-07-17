@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import fcntl
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -24,6 +23,16 @@ from .utils.series_config import SeriesConfig
 from .config_store import from_args as make_store
 from .utils.paid_content import has_paid_state, is_paid_content
 from .config import ConfigError, ConfigManager, ConfigSnapshot
+from .media_security import (
+    download_media,
+    MediaDownloadError,
+    MediaIntegrityError,
+    media_is_valid,
+    private_cookie_copy,
+    validate_media,
+)
+from .locks import LockBusyError, LockKind, ordered_lock
+from .secure_files import UnsafeFileError, atomic_write_bytes, staged_replace
 
 
 QUALITY_TO_AUDIO = {
@@ -195,25 +204,22 @@ def log_result(result: dict) -> None:
 
 @contextmanager
 def process_lock(lock_file: str):
-    path = Path(lock_file)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            LOGGER.warning("another bilibili-podcast process is already running lock_file=%s", lock_file)
-            print(f"another bilibili-podcast process is already running: {lock_file}", file=sys.stderr)
-            raise SystemExit(2)
-        lock.seek(0)
-        lock.truncate()
-        lock.write(str(os.getpid()))
-        lock.flush()
-        LOGGER.info("acquired process lock lock_file=%s", lock_file)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            LOGGER.info("released process lock lock_file=%s", lock_file)
+    try:
+        with ordered_lock(lock_file, LockKind.SYNC) as descriptor:
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, str(os.getpid()).encode("ascii"))
+            os.fsync(descriptor)
+            LOGGER.info("acquired process lock")
+            try:
+                yield
+            finally:
+                LOGGER.info("released process lock")
+    except LockBusyError:
+        LOGGER.warning("another bilibili-podcast process is already running lock_file=%s", lock_file)
+        print(f"another bilibili-podcast process is already running: {lock_file}", file=sys.stderr)
+        raise SystemExit(2)
+    except UnsafeFileError as exc:
+        raise ConfigError(f"unsafe sync lock file: {type(exc).__name__}") from None
 
 
 @dataclass
@@ -222,6 +228,7 @@ class SyncPaths:
     json_root: Path
     rss_root: Path
     media_base_url: str
+    ffprobe_bin: str = "ffprobe"
 
 
 def now_timestamp() -> int:
@@ -334,9 +341,10 @@ def load_cookie_file(cookie_file: Optional[str]):
     from bilibili_api import Credential
 
     values = {}
-    for parts in iter_netscape_cookie_parts(cookie_file):
-        if len(parts) >= 7:
-            values[parts[5]] = parts[6]
+    with private_cookie_copy(cookie_file) as private_cookie:
+        for parts in iter_netscape_cookie_parts(str(private_cookie)):
+            if len(parts) >= 7:
+                values[parts[5]] = parts[6]
 
     sessdata = values.get("SESSDATA")
     bili_jct = values.get("bili_jct")
@@ -359,24 +367,25 @@ def load_browser_cookies(cookie_file: Optional[str]) -> list[dict]:
     if not cookie_file:
         return []
     cookies = []
-    for parts in iter_netscape_cookie_parts(cookie_file):
-        if len(parts) < 7:
-            continue
-        domain, _, path, secure, expires, name, value = parts[:7]
-        cookie = {
-            "name": name,
-            "value": value,
-            "domain": domain,
-            "path": path or "/",
-            "secure": secure.upper() == "TRUE",
-        }
-        try:
-            expires_int = int(expires)
-        except ValueError:
-            expires_int = 0
-        if expires_int > 0:
-            cookie["expires"] = expires_int
-        cookies.append(cookie)
+    with private_cookie_copy(cookie_file) as private_cookie:
+        for parts in iter_netscape_cookie_parts(str(private_cookie)):
+            if len(parts) < 7:
+                continue
+            domain, _, path, secure, expires, name, value = parts[:7]
+            cookie = {
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": path or "/",
+                "secure": secure.upper() == "TRUE",
+            }
+            try:
+                expires_int = int(expires)
+            except ValueError:
+                expires_int = 0
+            if expires_int > 0:
+                cookie["expires"] = expires_int
+            cookies.append(cookie)
     return cookies
 
 
@@ -1084,28 +1093,12 @@ def write_metadata(config: SeriesConfig, paths: SyncPaths, episode: dict, dry_ru
     path = json_path(config, paths, episode["bvid"])
     if dry_run:
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            json.dump(episode, handle, ensure_ascii=False, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-            temporary = Path(handle.name)
-        temporary.chmod(0o644)
-        os.replace(temporary, path)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
-    LOGGER.debug("metadata written series=%s bvid=%s path=%s", config.series, episode["bvid"], path)
+    atomic_write_bytes(
+        path,
+        json.dumps(episode, ensure_ascii=False, indent=2).encode("utf-8"),
+        mode=0o600,
+    )
+    LOGGER.debug("metadata written series=%s bvid=%s", config.series, episode["bvid"])
 
 
 def ensure_free_space(path: Path, min_free_gb: float) -> None:
@@ -1131,8 +1124,10 @@ def ensure_free_space(path: Path, min_free_gb: float) -> None:
 
 def download_episode(config: SeriesConfig, paths: SyncPaths, episode: dict, cookie_file: str, dry_run: bool) -> None:
     out = media_path(config, paths, episode["bvid"])
-    if out.exists():
-        LOGGER.info("download skipped existing series=%s bvid=%s path=%s", config.series, episode["bvid"], out)
+    ffprobe_bin = getattr(paths, "ffprobe_bin", "ffprobe")
+    if os.path.lexists(out):
+        validate_media(out, ffprobe_bin=ffprobe_bin)
+        LOGGER.info("download skipped existing series=%s bvid=%s", config.series, episode["bvid"])
         return
     if dry_run:
         LOGGER.info("download planned dry-run series=%s bvid=%s path=%s", config.series, episode["bvid"], out)
@@ -1143,30 +1138,17 @@ def download_episode(config: SeriesConfig, paths: SyncPaths, episode: dict, cook
     yt_dlp_bin = Path(sys.executable).with_name("yt-dlp")
     yt_dlp_command = str(yt_dlp_bin) if yt_dlp_bin.exists() else "yt-dlp"
     try:
-        with tempfile.TemporaryDirectory(prefix="bilibili-podcast-cookie-") as temp_dir:
-            temporary_cookie = Path(temp_dir) / "cookies.txt"
-            shutil.copyfile(cookie_file, temporary_cookie)
-            temporary_cookie.chmod(0o600)
-            subprocess.run(
-                [
-                    yt_dlp_command,
-                    "--cookies",
-                    str(temporary_cookie),
-                    "--extract-audio",
-                    "--audio-format",
-                    "mp3",
-                    "--audio-quality",
-                    quality,
-                    "-o",
-                    str(out.with_suffix(".%(ext)s")),
-                    episode["link"],
-                ],
-                check=True,
-            )
-    except subprocess.CalledProcessError as exc:
-        LOGGER.error("download failed series=%s bvid=%s error=%s", config.series, episode["bvid"], exc)
-        return
-    out.chmod(0o644)
+        download_media(
+            [yt_dlp_command, "--extract-audio", "--audio-format", "mp3",
+             "--audio-quality", quality, episode["link"]],
+            out,
+            cookie_file=cookie_file,
+            ffprobe_bin=ffprobe_bin,
+            mode=0o400,
+        )
+    except (MediaDownloadError, MediaIntegrityError) as exc:
+        LOGGER.error("download failed series=%s bvid=%s error=%s", config.series, episode["bvid"], type(exc).__name__)
+        raise
     LOGGER.info("download complete series=%s bvid=%s bytes=%s", config.series, episode["bvid"], out.stat().st_size)
 
 
@@ -1203,7 +1185,7 @@ def generate_rss(
         path = media_path(config, paths, episode["bvid"])
         enclosure_url = ""
         enclosure_length = 0
-        if path.exists():
+        if media_is_valid(path, ffprobe_bin=getattr(paths, "ffprobe_bin", "ffprobe")):
             enclosure_url = media_url(config, paths, episode["bvid"], token)
             enclosure_length = path.stat().st_size
         elif episode.get("_existing_enclosure_url") and is_safe_enclosure_url(episode["_existing_enclosure_url"]):
@@ -1229,22 +1211,9 @@ def generate_rss(
             entry.podcast.itunes_image(episode["image"])
 
     item_count = len(episodes)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=rss_path.parent,
-            prefix=f".{rss_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
+    with staged_replace(rss_path, mode=0o600) as temporary:
         fg.rss_file(str(temporary), pretty=True)
-        temporary.chmod(0o644)
-        os.replace(temporary, rss_path)
-        temporary = None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        ET.parse(temporary)
     LOGGER.info(
         "rss written series=%s path=%s input_items=%s output_items=%s",
         config.series, rss_path, item_count, output_items,
@@ -1764,7 +1733,10 @@ async def sync_series(
     missing = [
         episode
         for episode in filtered
-        if not media_path(config, paths, episode["bvid"]).exists()
+        if not media_is_valid(
+            media_path(config, paths, episode["bvid"]),
+            ffprobe_bin=getattr(paths, "ffprobe_bin", "ffprobe"),
+        )
     ]
     to_download = missing
     if max_downloads_per_run >= 0:
@@ -1824,7 +1796,10 @@ async def sync_series(
             ep for ep in rss_episodes
             if ep["bvid"] in target_bvids
             and (
-                media_path(config, paths, ep["bvid"]).exists()
+                media_is_valid(
+                    media_path(config, paths, ep["bvid"]),
+                    ffprobe_bin=getattr(paths, "ffprobe_bin", "ffprobe"),
+                )
                 or (
                     ep.get("_existing_enclosure_url")
                     and is_safe_enclosure_url(ep["_existing_enclosure_url"])
@@ -1895,6 +1870,7 @@ async def run(args: argparse.Namespace) -> int:
         json_root=Path(args.json_root),
         rss_root=Path(args.rss_root),
         media_base_url=args.media_base_url,
+        ffprobe_bin=getattr(args, "ffprobe_bin", "ffprobe"),
     )
     credential = load_cookie_file(args.cookie_file)
     dry_run = not args.apply
@@ -2071,6 +2047,7 @@ def apply_config_defaults(args: argparse.Namespace, snapshot: ConfigSnapshot) ->
         "log_dir": str(snapshot.app.paths.log_dir),
         "log_level": snapshot.sync.logging.level,
         "publisher_snapshot": snapshot if snapshot.publish.publish.enabled else None,
+        "ffprobe_bin": snapshot.app.executables.ffprobe,
     }
     for name, value in defaults.items():
         if getattr(args, name, None) is None:

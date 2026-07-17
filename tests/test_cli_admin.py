@@ -54,7 +54,11 @@ def reset_admin_config_snapshot(tmp_path: Path):
         rss_users=SimpleNamespace(users={}),
         manual_media=ManualMedia(),
     )
-    yield
+    with patch(
+        "bilibili_podcast.media_security._probe_media_fd",
+        lambda *args, **kwargs: None,
+    ):
+        yield
     cli_admin._CONFIG = None
 
 
@@ -1121,7 +1125,7 @@ def test_paid_attach_media_success(tmp_path: Path) -> None:
         cli_admin.cmd_paid_attach_media(ns)
         assert target.exists(), f"target file not created: {target}"
         assert target.read_text() == "fake audio content"
-        assert oct(target.stat().st_mode)[-3:] == "644"
+        assert oct(target.stat().st_mode)[-3:] == "400"
     finally:
         if original_dirs is None:
             del os.environ["BILIBILI_PODCAST_MANUAL_MEDIA_DIRS"]
@@ -1973,7 +1977,7 @@ def test_generate_rss_atomically_replaces_existing_file(tmp_path: Path, monkeypa
     generate_rss(cfg, paths, {"name": "A"}, [], "__MEDIA_PLACEHOLDER__", dry_run=False)
 
     assert target.read_text(encoding="utf-8").startswith("<?xml")
-    assert target.stat().st_mode & 0o777 == 0o644
+    assert target.stat().st_mode & 0o777 == 0o600
     assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
 
 

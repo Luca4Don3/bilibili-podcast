@@ -1,11 +1,13 @@
 """Public unified configuration API."""
 
 from .manager import (
-    ConfigError, ConfigManager, LegacyConfigError, UnsafeConfigError, get_config,
+    ActiveUpgradeError, ConfigError, ConfigManager, LegacyConfigError,
+    UnsafeConfigError, get_config,
 )
-from .models import ConfigSnapshot, SeriesConfig
+from .models import ConfigSnapshot, SeriesConfig, SystemConfigSnapshot
 
 __all__ = [
-    "ConfigError", "ConfigManager", "ConfigSnapshot", "LegacyConfigError",
+    "ActiveUpgradeError", "ConfigError", "ConfigManager", "ConfigSnapshot",
+    "SystemConfigSnapshot", "LegacyConfigError",
     "SeriesConfig", "UnsafeConfigError", "get_config",
 ]
