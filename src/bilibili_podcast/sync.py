@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from .utils.series_config import SeriesConfig
+from .api_backends import BilibiliApiBackend, create_backend
 from .config_store import from_args as make_store
 from .utils.paid_content import has_paid_state, is_paid_content
 from .config import ConfigError, ConfigManager, ConfigSnapshot
@@ -335,10 +336,9 @@ def should_skip_series(config: SeriesConfig, state: dict, force: bool) -> tuple[
     return False, "", allowed_at
 
 
-def load_cookie_file(cookie_file: Optional[str]):
+def load_cookie_file(cookie_file: Optional[str]) -> Optional[dict]:
     if not cookie_file:
         return None
-    from bilibili_api import Credential
 
     values = {}
     with private_cookie_copy(cookie_file) as private_cookie:
@@ -350,17 +350,22 @@ def load_cookie_file(cookie_file: Optional[str]):
     bili_jct = values.get("bili_jct")
     dedeuserid = values.get("DedeUserID") or values.get("DedeUserID__ckMd5")
     buvid3 = values.get("buvid3")
-    if not all([sessdata, bili_jct, dedeuserid, buvid3]):
-        raise ValueError("cookie file must contain SESSDATA, bili_jct, DedeUserID, and buvid3")
+    if not all([sessdata, bili_jct, dedeuserid]):
+        raise ValueError("cookie file must contain SESSDATA, bili_jct, and DedeUserID")
 
-    return Credential(
-        sessdata=sessdata,
-        bili_jct=bili_jct,
-        dedeuserid=dedeuserid,
-        buvid3=buvid3,
-        buvid4=values.get("buvid4", ""),
-        ac_time_value=values.get("ac_time_value", ""),
-    )
+    # 统一凭证 dict：供各后端按需使用；buvid3 缺失时不写入该键
+    credential: dict = {
+        "sessdata": sessdata,
+        "bili_jct": bili_jct,
+        "dedeuserid": dedeuserid,
+    }
+    if buvid3:
+        credential["buvid3"] = buvid3
+    if values.get("buvid4"):
+        credential["buvid4"] = values["buvid4"]
+    if values.get("ac_time_value"):
+        credential["ac_time_value"] = values["ac_time_value"]
+    return credential
 
 
 def load_browser_cookies(cookie_file: Optional[str]) -> list[dict]:
@@ -554,14 +559,10 @@ def is_bilibili_rate_limited(error: Exception) -> bool:
     return "-799" in text or "请求过于频繁" in text or "rate limit" in text.lower()
 
 
-async def fetch_space_episodes(config: SeriesConfig, credential) -> tuple[dict, list[dict], int]:
-    from bilibili_api import request_settings, user
-
-    request_settings.set("impersonate", "chrome131")
-    user_obj = user.User(uid=config.uid, credential=credential)
+async def fetch_space_episodes(config: SeriesConfig, backend: BilibiliApiBackend) -> tuple[dict, list[dict], int]:
     LOGGER.debug("api fetch user info series=%s uid=%s", config.series, config.uid)
     try:
-        info = await user_obj.get_user_info()
+        info = await backend.get_user_info(config.uid)
     except Exception as exc:
         LOGGER.warning("api user info failed series=%s uid=%s error=%s", config.series, config.uid, exc)
         info = {
@@ -598,20 +599,15 @@ async def fetch_space_episodes(config: SeriesConfig, credential) -> tuple[dict, 
             request_count + 1,
             max_requests,
         )
-        video_list = await user_obj.get_videos(
-            pn=page_number,
-            ps=size,
-            order=user.VideoOrder.PUBDATE,
-        )
+        items = await backend.get_user_videos(config.uid, pn=page_number, ps=size)
         request_count += 1
-        items = video_list.get("list", {}).get("vlist", [])
         added = 0
         for item in items:
-            bvid = item.get("bvid") or item.get("bv_id")
+            bvid = item.get("bvid")
             if not bvid or bvid in seen_bvids:
                 continue
             seen_bvids.add(bvid)
-            episodes.append(media_item_to_episode(item))
+            episodes.append(item)
             added += 1
         return added
 
@@ -649,26 +645,14 @@ async def fetch_space_episodes(config: SeriesConfig, credential) -> tuple[dict, 
     return info, episodes, len(episodes)
 
 
-async def fetch_series_episodes(config: SeriesConfig, credential) -> tuple[dict, list[dict], int]:
-    from bilibili_api import channel_series, request_settings
-
-    request_settings.set("impersonate", "chrome131")
-
+async def fetch_series_episodes(config: SeriesConfig, backend: BilibiliApiBackend) -> tuple[dict, list[dict], int]:
     sid = config.source.get("sid")
     if not sid:
         raise ValueError("source.sid is required for series fetch mode")
 
     playlist_type = str(config.source.get("type", "season")).strip().lower()
-    if playlist_type == "series":
-        series_type = channel_series.ChannelSeriesType.SERIES
-    else:
-        series_type = channel_series.ChannelSeriesType.SEASON
-
-    series = channel_series.ChannelSeries(
-        id_=sid,
-        type_=series_type,
-        credential=credential,
-    )
+    if playlist_type not in ("series", "season"):
+        raise ValueError(f"unsupported source.type: {playlist_type}")
 
     LOGGER.info(
         "api fetch series series=%s sid=%s playlist_type=%s",
@@ -676,20 +660,20 @@ async def fetch_series_episodes(config: SeriesConfig, credential) -> tuple[dict,
     )
 
     try:
-        meta = await series.get_meta()
+        meta = await backend.get_series_meta(sid, playlist_type)
     except Exception as exc:
         LOGGER.warning("api series meta failed series=%s sid=%s error=%s", config.series, sid, exc)
         meta = {}
 
     if playlist_type == "season":
         info = {
-            "name": meta.get("upper", {}).get("name", config.author),
-            "face": config.cover_art or meta.get("cover", ""),
-            "sign": meta.get("intro", config.description),
+            "name": meta.get("name") or config.author,
+            "face": config.cover_art or meta.get("face", ""),
+            "sign": meta.get("sign") or config.description,
         }
         LOGGER.debug(
-            "api series meta series=%s name=%s total=%s",
-            config.series, info["name"], meta.get("total", "?"),
+            "api series meta series=%s name=%s",
+            config.series, info["name"],
         )
     else:
         info = {
@@ -717,29 +701,15 @@ async def fetch_series_episodes(config: SeriesConfig, credential) -> tuple[dict,
             config.series, sid, page_number, page_size,
             request_count + 1, max_requests,
         )
-        video_list = await series.get_videos(
-            pn=page_number,
-            ps=page_size,
-            sort=channel_series.ChannelOrder.DEFAULT,
-        )
+        items = await backend.get_series_videos(sid, playlist_type, pn=page_number, ps=page_size)
         request_count += 1
-        items = video_list.get("archives", [])
         added = 0
         for item in items:
             bvid = item.get("bvid")
             if not bvid or bvid in seen_bvids:
                 continue
             seen_bvids.add(bvid)
-            episodes.append({
-                "bvid": bvid,
-                "title": item.get("title", ""),
-                "description": "",
-                "duration": item.get("duration", 0),
-                "image": item.get("pic", ""),
-                "pubdate": item.get("pubdate", 0),
-                "link": f"https://www.bilibili.com/video/{bvid}",
-                "raw": item,
-            })
+            episodes.append(item)
             added += 1
         return added
 
@@ -767,6 +737,57 @@ async def fetch_series_episodes(config: SeriesConfig, credential) -> tuple[dict,
         config.series, sid, len(episodes), request_count, stopped_by_rate_limit,
     )
     return info, episodes, len(episodes)
+
+
+async def _api_fetch_episodes(
+    config: SeriesConfig,
+    credential,
+    strategy: str,
+    browser_fallback: bool,
+    browser_fallback_allowed_now: bool,
+    cookie_file: Optional[str],
+    browser_user_data_root: str,
+) -> tuple[dict, list[dict], int, str]:
+    """按策略抓取条目：创建后端并保证 close()，返回 (info, episodes, count, fetch_source)。
+
+    仅在确实需要 API 时创建后端（browser_first 且非系列时不创建），
+    create_backend 失败时按原语义直接抛出（调用方决定是否降级 playwright）。
+    """
+    if config.source.get("sid"):
+        backend = await create_backend(config.api_backend, credential)
+        try:
+            up_info, episodes, fetched_count = await fetch_series_episodes(config, backend)
+        finally:
+            await backend.close()
+        up_info["_bilibili_podcast_source"] = "series"
+        return up_info, episodes, fetched_count, "series"
+    if strategy == "browser_first":
+        if not browser_fallback or not browser_fallback_allowed_now:
+            raise RuntimeError("browser_first requires browser_fallback and an available browser cooldown window")
+        up_info, episodes, fetched_count = await fetch_space_episodes_with_playwright(
+            config,
+            cookie_file,
+            browser_user_data_root,
+        )
+        return up_info, episodes, fetched_count, "playwright"
+    backend = await create_backend(config.api_backend, credential)
+    try:
+        try:
+            up_info, episodes, fetched_count = await fetch_space_episodes(config, backend)
+            return up_info, episodes, fetched_count, "api"
+        except Exception as exc:
+            if not browser_fallback or not browser_fallback_allowed_now:
+                raise
+            LOGGER.warning("api fetch failed, using playwright series=%s error=%s", config.series, exc)
+            up_info, episodes, fetched_count = await fetch_space_episodes_with_playwright(
+                config,
+                cookie_file,
+                browser_user_data_root,
+            )
+            up_info["_bilibili_podcast_api_error"] = str(exc)
+            return up_info, episodes, fetched_count, "playwright"
+    finally:
+        await backend.close()
 
 
 async def fetch_space_episodes_with_playwright(
@@ -1644,7 +1665,6 @@ async def sync_series(
 ) -> dict:
     series_start = time.time()
     strategy = fetch_strategy(config)
-    fetch_source = "api"
     LOGGER.info(
         "series start series=%s uid=%s title=%s strategy=%s apply=%s",
         config.series,
@@ -1653,33 +1673,15 @@ async def sync_series(
         strategy,
         not dry_run,
     )
-    if config.source.get("sid"):
-        up_info, episodes, fetched_count = await fetch_series_episodes(config, credential)
-        fetch_source = "series"
-        up_info["_bilibili_podcast_source"] = "series"
-    elif strategy == "browser_first":
-        if not browser_fallback or not browser_fallback_allowed_now:
-            raise RuntimeError("browser_first requires browser_fallback and an available browser cooldown window")
-        up_info, episodes, fetched_count = await fetch_space_episodes_with_playwright(
-            config,
-            cookie_file,
-            browser_user_data_root,
-        )
-        fetch_source = "playwright"
-    else:
-        try:
-            up_info, episodes, fetched_count = await fetch_space_episodes(config, credential)
-        except Exception as exc:
-            if not browser_fallback or not browser_fallback_allowed_now:
-                raise
-            LOGGER.warning("api fetch failed, using playwright series=%s error=%s", config.series, exc)
-            up_info, episodes, fetched_count = await fetch_space_episodes_with_playwright(
-                config,
-                cookie_file,
-                browser_user_data_root,
-            )
-            up_info["_bilibili_podcast_api_error"] = str(exc)
-            fetch_source = "playwright"
+    up_info, episodes, fetched_count, fetch_source = await _api_fetch_episodes(
+        config=config,
+        credential=credential,
+        strategy=strategy,
+        browser_fallback=browser_fallback,
+        browser_fallback_allowed_now=browser_fallback_allowed_now,
+        cookie_file=cookie_file,
+        browser_user_data_root=browser_user_data_root,
+    )
     filtered, excluded = apply_filters(config, episodes)
     filtered = limit_episodes(config, filtered)
     target = config.keep_last if config.keep_last > 0 else sync_int(config, "page_size", 20)

@@ -4,11 +4,11 @@ from .server import create_app
 
 
 class _ResolverProxy:
-    async def resolve_url(self, url: str) -> dict:
+    async def resolve_url(self, url: str, backend=None) -> dict:
         import importlib
 
         module = importlib.import_module(f"{__name__}.resolver")
-        return await module.resolve_url(url)
+        return await module.resolve_url(url, backend)
 
     def __getattr__(self, name: str):
         import importlib

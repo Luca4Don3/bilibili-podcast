@@ -155,7 +155,7 @@ QUALITY_ALIASES = {"low": "64K", "medium": "132K", "high": "192K"}
 SERIES_TOP_FIELDS = {
     "series", "enabled", "title", "description", "author", "cover_art",
     "category", "subcategories", "explicit", "lang", "source", "sync",
-    "filters", "paid_preview", "cron",
+    "filters", "paid_preview", "cron", "api_backend",
 }
 SERIES_SOURCE_FIELDS = {"space_url", "uid", "type", "sid"}
 SERIES_FILTER_FIELDS = {

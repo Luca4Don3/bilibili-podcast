@@ -1,17 +1,16 @@
 """Bilibili URL resolver — parse B站 URLs into structured draft configs.
 
 Parses space URLs, season/series URLs, or plain UIDs/sids using the
-existing bilibili-api library and returns a structured draft dict.
-Does NOT write to DB or any files — pure read-only resolution.
+api_backends 抽象层（默认 bilibili-api 后端，可传入自定义后端）and returns
+a structured draft dict. Does NOT write to DB or any files — pure read-only
+resolution.
 """
 
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse, parse_qs
 
-import bilibili_api
-
+from ..api_backends import BilibiliApiBackend, create_backend
 from ..utils.bilibili_url import parse_space_source
 
 _SEASON_RE = re.compile(
@@ -26,8 +25,11 @@ _MEDIA_RE = re.compile(
 _SID_RE = re.compile(r"^\d+$")
 
 
-async def resolve_url(url: str) -> dict:
+async def resolve_url(url: str, backend: BilibiliApiBackend | None = None) -> dict:
     """Parse a Bilibili URL/UID/sid and return structured draft info.
+
+    backend 为 None 时内部创建默认后端（bilibili-api）并在结束时 close；
+    由调用方传入 backend 时其生命周期由调用方负责（不 close）。
 
     Returns dict with keys:
         series: suggested series slug (editable)
@@ -41,41 +43,48 @@ async def resolve_url(url: str) -> dict:
     """
     url = url.strip()
 
-    # Determine source type from URL pattern
-    m = _SEASON_RE.match(url)
-    if m:
-        return await _resolve_season(m.group(1))
+    owns_backend = backend is None
+    if owns_backend:
+        backend = await create_backend("bilibili-api", None)
+    try:
+        # Determine source type from URL pattern
+        m = _SEASON_RE.match(url)
+        if m:
+            return await _resolve_season(m.group(1), backend)
 
-    m = _SERIES_RE.match(url)
-    if m:
-        return await _resolve_series(m.group(1))
+        m = _SERIES_RE.match(url)
+        if m:
+            return await _resolve_series(m.group(1), backend)
 
-    space_source = parse_space_source(url)
-    if space_source:
-        return await _resolve_space(
-            str(space_source["uid"]),
-            space_source["space_url"],
-        )
+        space_source = parse_space_source(url)
+        if space_source:
+            return await _resolve_space(
+                str(space_source["uid"]),
+                space_source["space_url"],
+                backend,
+            )
 
-    m = _MEDIA_RE.match(url)
-    if m:
-        # Single video — try to extract UID from video info
-        return await _resolve_video(m.group(1))
+        m = _MEDIA_RE.match(url)
+        if m:
+            # Single video — try to extract UID from video info
+            return await _resolve_video(m.group(1), backend)
 
-    # Plain sid — user must specify type
-    if _SID_RE.match(url):
-        return {
-            "error": "纯数字 ID 无法判断类型。请用完整 URL（含 space/season/series 路径），或先选择合集/系列模式。",
-        }
+        # Plain sid — user must specify type
+        if _SID_RE.match(url):
+            return {
+                "error": "纯数字 ID 无法判断类型。请用完整 URL（含 space/season/series 路径），或先选择合集/系列模式。",
+            }
 
-    return {"error": f"无法识别的 URL: {url}"}
+        return {"error": f"无法识别的 URL: {url}"}
+    finally:
+        if owns_backend and backend is not None:
+            await backend.close()
 
 
-async def _resolve_space(uid: str, space_url: str) -> dict:
+async def _resolve_space(uid: str, space_url: str, backend: BilibiliApiBackend) -> dict:
     """Resolve a UP主 space URL."""
     try:
-        user = bilibili_api.user.User(int(uid))
-        info = await user.get_user_info()
+        info = await backend.get_user_info(int(uid))
         name = info.get("name", "")
         face = info.get("face", "")
         sign = info.get("sign", "")
@@ -85,15 +94,13 @@ async def _resolve_space(uid: str, space_url: str) -> dict:
     # Fetch recent videos
     videos = []
     try:
-        page = 1
-        resp = await user.get_videos(ps=5, pn=page)
-        vlist = resp.get("list", {}).get("vlist", [])
+        vlist = await backend.get_user_videos(int(uid), pn=1, ps=5)
         for v in vlist:
             videos.append({
                 "bvid": v.get("bvid", ""),
                 "title": v.get("title", ""),
-                "created": v.get("created", 0),
-                "length": _format_duration(v.get("length", "0:00")),
+                "created": v.get("pubdate", 0),
+                "length": _format_duration(v.get("duration", 0)),
             })
     except Exception:
         pass
@@ -115,68 +122,67 @@ async def _resolve_space(uid: str, space_url: str) -> dict:
     }
 
 
-async def _resolve_season(sid: str) -> dict:
+async def _resolve_season(sid: str, backend: BilibiliApiBackend) -> dict:
     """Resolve a bangumi season."""
     # season requires different API
-    return await _resolve_series_or_season("season", sid)
+    return await _resolve_series_or_season("season", sid, backend)
 
 
-async def _resolve_series(sid: str) -> dict:
+async def _resolve_series(sid: str, backend: BilibiliApiBackend) -> dict:
     """Resolve a series (manual playlist)."""
-    return await _resolve_series_or_season("series", sid)
+    return await _resolve_series_or_season("series", sid, backend)
 
 
-async def _resolve_series_or_season(source_type: str, sid: str) -> dict:
+async def _resolve_series_or_season(
+    source_type: str, sid: str, backend: BilibiliApiBackend,
+) -> dict:
     """Resolve a season or series by ID."""
     sid_int = int(sid)
 
     if source_type == "season":
         try:
-            season = bilibili_api.season.Season(season_id=sid_int)
-            meta = await season.get_meta()
-            name = meta.get("title", "") or meta.get("series_title", "") or f"Season {sid}"
-            up_name = meta.get("up_name", "")
-            cover = meta.get("cover", "")
-            desc = meta.get("description", "") or meta.get("evaluate", "")
-            uid = meta.get("up_id", 0)
+            meta = await backend.get_series_meta(sid_int, "season")
+            name = meta.get("name", "") or meta.get("title", "") or f"Season {sid}"
+            up_name = meta.get("author", "")
+            cover = meta.get("face", "")
+            desc = meta.get("sign", "")
+            uid = meta.get("uid") or 0
         except Exception as e:
             return {"error": f"获取合集信息失败 (sid={sid}): {e}"}
 
         videos = []
         try:
-            episodes = await season.get_episodes()
-            for ep in (episodes or [])[:10]:
+            episodes = await backend.get_series_videos(sid_int, "season", pn=1, ps=10)
+            for ep in (episodes or []):
                 videos.append({
                     "bvid": ep.get("bvid", ""),
                     "title": ep.get("title", ""),
-                    "created": 0,
-                    "length": _format_duration(ep.get("duration", "0:00")),
+                    "created": ep.get("pubdate", 0),
+                    "length": _format_duration(ep.get("duration", 0)),
                 })
         except Exception:
             pass
     else:
         # series — use series API
         try:
-            series = bilibili_api.series.Series(sid_int)
-            meta = await series.get_meta()
+            meta = await backend.get_series_meta(sid_int, "series")
             name = meta.get("name", "") or meta.get("title", "") or f"Series {sid}"
-            up_name = meta.get("up_name", "")
-            cover = meta.get("image_url", "") or meta.get("cover", "")
-            desc = meta.get("description", "") or meta.get("subtitle", "")
-            uid = meta.get("uid", 0) or meta.get("up_id", 0)
+            up_name = meta.get("author", "")
+            cover = meta.get("face", "")
+            desc = meta.get("sign", "")
+            uid = meta.get("uid") or 0
         except Exception as e:
             return {"error": f"获取系列信息失败 (sid={sid}): {e}"}
 
         videos = []
         try:
-            result = await series.get_series_videos()
-            arcs = (result or [])[:10]
-            for arc in arcs:
+            arcs = await backend.get_series_videos(sid_int, "series", pn=1, ps=10)
+            for arc in (arcs or []):
                 videos.append({
                     "bvid": arc.get("bvid", ""),
                     "title": arc.get("title", ""),
-                    "created": 0,
-                    "length": _format_duration(str(arc.get("duration", "0:00"))),
+                    "created": arc.get("pubdate", 0),
+                    "length": _format_duration(arc.get("duration", 0)),
                 })
         except Exception:
             pass
@@ -198,16 +204,15 @@ async def _resolve_series_or_season(source_type: str, sid: str) -> dict:
     }
 
 
-async def _resolve_video(bvid: str) -> dict:
+async def _resolve_video(bvid: str, backend: BilibiliApiBackend) -> dict:
     """Resolve from a single video URL — try to find its UP主."""
     try:
-        video = bilibili_api.video.Video(bvid=bvid)
-        info = await video.get_info()
-        uid = info.get("owner", {}).get("mid", 0)
+        uid = await backend.get_video_owner(bvid)
         if uid:
             return await _resolve_space(
                 str(uid),
                 f"https://space.bilibili.com/{uid}",
+                backend,
             )
         return {"error": f"无法从视频 {bvid} 提取 UP 主信息"}
     except Exception as e:

@@ -224,6 +224,7 @@ class SeriesConfig:
     filters: Mapping[str, Any] | dict[str, Any]
     paid_preview: Mapping[str, Any] | dict[str, Any]
     keep_last: int
+    api_backend: str = "bilibili-api"
 
     @property
     def uid(self) -> int:
@@ -270,6 +271,19 @@ class SeriesConfig:
         unknown_top = sorted(set(data) - SERIES_TOP_FIELDS)
         if unknown_top:
             raise ValueError(f"unknown series field: {unknown_top[0]}")
+        from ..api_backends import BACKEND_NAMES, parse_backend_spec
+
+        api_backend = data.get("api_backend", "bilibili-api")
+        if isinstance(api_backend, str):
+            try:
+                backend_names = parse_backend_spec(api_backend)
+            except ValueError as exc:
+                raise ValueError(f"api_backend must be one of: {', '.join(BACKEND_NAMES)}") from exc
+        else:
+            backend_names = list(api_backend)
+        invalid = [name for name in backend_names if name not in BACKEND_NAMES]
+        if invalid:
+            raise ValueError(f"api_backend must be one of: {', '.join(BACKEND_NAMES)}")
         series = data.get("series")
         if not series:
             raise ValueError("series is required")
@@ -405,4 +419,5 @@ class SeriesConfig:
             filters=filters,
             paid_preview=paid_preview,
             keep_last=keep_last,
+            api_backend=api_backend,
         )
