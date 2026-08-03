@@ -972,6 +972,11 @@ GNU General Public License v3.0
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)：可靠的媒体下载与格式处理能力。
 - [bilibili-api-python](https://github.com/Nemo2011/bilibili-api)：Bilibili API 的 Python 封装。
 - [FeedGenerator](https://github.com/lkiesow/python-feedgen)：RSS/Atom feed 生成能力。
+- [FastAPI](https://fastapi.tiangolo.com/)：Web 服务框架。
+- [Uvicorn](https://www.uvicorn.org/)：ASGI 服务器。
+- [Jinja2](https://jinja.palletsprojects.com/)：Web 模板引擎。
+- [itsdangerous](https://itsdangerous.palletsprojects.com/)：会话签名与安全数据序列化。
+- [PyYAML](https://pyyaml.org/)：YAML 配置解析。
 - [Playwright](https://github.com/microsoft/playwright-python)：浏览器回退抓取能力。
 - [FFmpeg](https://ffmpeg.org/)：音视频转码与处理能力。
 
