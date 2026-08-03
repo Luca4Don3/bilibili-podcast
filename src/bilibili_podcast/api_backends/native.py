@@ -13,9 +13,21 @@
                     season  → /pgc/view/web/season 的 result.episodes（全量再切片）
 - get_video_owner    GET /x/web-interface/view?bvid= → data.owner.mid
 
-首次请求前会访问一次 https://space.bilibili.com/ 建立会话指纹（buvid3 / b_nut /
-__at_once 等 cookie）以规避全新会话的 -352 风控；该前置失败仅记录 warning，
-不阻断后续请求。
+会话指纹（防 -352 风控）采用「本地生成 + 页面补充」：构造时即本地生成合法
+格式的 buvid3 / buvid4 / b_nut 指纹 cookie 注入会话（首次请求不再依赖页面
+会话，风控韧性更强）；首次请求前仍访问一次 https://space.bilibili.com/ 作为
+补充（更新 b_nut 等字段、下发 __at_once 等本地未覆盖的 cookie），该前置失败
+仅记录 warning，不阻断后续请求。
+
+buvid 指纹生成来源：bilibili-API-collect 文档 docs/misc/buvid3_4.md（原页面
+已随仓库归档下线，采用 Wayback Machine 存档副本，见 _generate_buvid_fingerprints
+注释）：
+- buvid3 = 大写 UUID（去横线）+ 毫秒时间戳尾部数字 + "infoc"，社区通用格式带
+  "XZ02" 前缀（真实浏览器 cookie 两种形态均存在，B 站按 UUID 段校验）；
+- buvid4 = 大写 UUID（带横线）+ 毫秒尾部数字 + "-" + 9 位随机数 + "-666" +
+  base64 随机串（对应 /x/frontend/finger/spi 接口 b_4 字段结构）；
+- b_nut = UNIX 秒级时间戳（文档明确为秒级，与部分资料描述的毫秒不同，以文档
+  为准；指纹仅需格式合法与一致）。
 
 WBI 签名实现来源：bilibili-API-collect 文档 docs/misc/sign/wbi.md
 （https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/sign/wbi.html）
@@ -29,11 +41,13 @@ WBI 签名实现来源：bilibili-API-collect 文档 docs/misc/sign/wbi.md
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import random
 import time
 import urllib.parse
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from .base import BackendCredential, BackendError, NetworkError, RateLimitError, UnsupportedError
@@ -44,8 +58,9 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("bilibili_podcast.api_backends.native")
 
 _BASE_URL = "https://api.bilibili.com"
-# 会话前置页面：首次请求前访问一次 space 主页，让服务端下发指纹 cookie
-# （buvid3 / b_nut / __at_once 等），避免全新会话触发 -352 风控
+# 会话前置页面：首次请求前访问一次 space 主页作为指纹补充手段（本地已注入
+# buvid3/buvid4/b_nut，页面访问用于更新 b_nut、下发 __at_once 等额外 cookie），
+# 避免全新会话触发 -352 风控
 _WEB_URL = "https://space.bilibili.com"
 _TIMEOUT_SECONDS = 15.0
 
@@ -81,6 +96,35 @@ _FALLBACK_SUB_KEY = "4932caff0ff746eab6f01bf08b70ac45"
 
 # WBI 签名接口附加的鼠标风控参数用到的随机字母表（与 bilibili_api 的 _enc_dm 一致）
 _DM_ALPHABET = "ABCDEFGHIJK"
+
+
+def _generate_buvid_fingerprints() -> dict[str, str]:
+    """本地生成合法格式的会话指纹 cookie（buvid3 / buvid4 / b_nut）。
+
+    来源：bilibili-API-collect 文档 docs/misc/buvid3_4.md（页面已随仓库归档下线，
+    采用 Wayback Machine 存档副本
+    https://web.archive.org/web/20250902163850/https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/buvid3_4.html
+    与示例：Set-Cookie 的 buvid3=<uuid>-infoc、
+    b_nut=1721975923；spi 接口 b_4=F6E0FD4B-...-E461D8D1F5AB79044-024072309-666onEZSnlHVPjoRp4kDYg==）：
+    - buvid3：大写 UUID（去横线）+ 毫秒时间戳尾部数字 + "infoc"；社区通用格式
+      带 "XZ02" 前缀（浏览器真实 cookie 两种形态都存在），本实现采用带前缀格式；
+    - buvid4：大写 UUID（带横线）+ 毫秒尾部 5 位数字 + "-" + 9 位随机数 + "-666"
+      + base64 随机串（16 字节 → 24 字符含填充，与 b_4 示例同长）；
+    - b_nut：UNIX 秒级时间戳（文档明确，非毫秒；指纹一致性与格式合法即可）。
+
+    B 站仅校验指纹的格式与一致性（页面访问补充时不会因本地指纹触发异常
+    响应），不要求特定取值；返回的字典可直接合并进会话 cookie。
+    """
+    uuid_hex = str(uuid.uuid4()).replace("-", "").upper()
+    uuid_dash = str(uuid.uuid4()).upper()
+    ms_tail = str(int(time.time() * 1000))[-7:]
+    rand9 = f"{random.randrange(0, 10**9):09d}"
+    b64 = base64.b64encode(random.randbytes(16)).decode("ascii")
+    return {
+        "buvid3": f"XZ02{uuid_hex}{ms_tail}infoc",
+        "buvid4": f"{uuid_dash}{ms_tail[-5:]}-{rand9}-666{b64}",
+        "b_nut": str(int(time.time())),
+    }
 
 
 def get_mixin_key(raw_key: str) -> str:
@@ -170,6 +214,10 @@ class NativeBackend:
                 value = credential.get(key)
                 if value:
                     cookies[cookie_name] = value
+        # 本地生成会话指纹并合并：用户凭证 buvid3 优先（覆盖本地生成），
+        # 本地生成补齐 buvid4 / b_nut 等字段，首次请求不依赖页面会话
+        for name, value in _generate_buvid_fingerprints().items():
+            cookies.setdefault(name, value)
         self._session: CurlAsyncSession = AsyncSession(
             cookies=cookies or None,
             timeout=_TIMEOUT_SECONDS,
@@ -190,11 +238,13 @@ class NativeBackend:
             LOGGER.warning("关闭 native 后端会话失败 error=%s", exc)
 
     async def _ensure_ready(self) -> None:
-        """首次请求前访问一次 space 页面，建立会话指纹（buvid3/b_nut/__at_once）。
+        """本地指纹已注入（buvid3/buvid4/b_nut），页面访问仅作补充手段。
 
-        B 站风控对全新会话的 API 请求（尤其 WBI 签名接口）常返回 -352；先访问
-        一次页面让服务端下发指纹 cookie 即可放行（bilibili_api 同样依赖页面会话）。
-        失败不阻断：记录 warning 后继续，接口本身失败时按既有异常语义处理。
+        构造时已本地生成合法格式的指纹 cookie 注入会话，首次请求不再依赖页面
+        会话；仍访问一次 space 页面作为补充（更新 b_nut 等字段、下发 __at_once
+        等本地未覆盖的 cookie），进一步降低 -352 风控概率（bilibili_api 同样
+        依赖页面会话）。失败不阻断：记录 warning 后继续，接口本身失败时按既有
+        异常语义处理。
         """
         if self._ready:
             return
@@ -202,7 +252,7 @@ class NativeBackend:
         try:
             await self._session.get(_WEB_URL, headers=_HEADERS)
         except Exception as exc:
-            LOGGER.warning("native 建立会话指纹失败，接口可能触发风控 error=%s", exc)
+            LOGGER.warning("native 补充会话指纹失败（本地指纹已注入），接口可能触发风控 error=%s", exc)
 
     @staticmethod
     def _enc_dm(params: dict[str, Any]) -> dict[str, Any]:

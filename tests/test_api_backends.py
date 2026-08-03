@@ -907,6 +907,158 @@ def test_native_wbi_keys_from_nav_and_fallback():
     assert backend2._wbi_keys == (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
 
 
+# ---------------------------------------------------------------- native buvid 会话指纹
+
+
+def test_native_buvid_fingerprint_formats():
+    """本地生成指纹符合合法格式：buvid3 带 XZ02 前缀的大写 UUID + 数字 + infoc；
+    buvid4 为带横线大写 UUID + 数字段 + -666 + base64 串；b_nut 为秒级时间戳。"""
+    import re
+
+    from bilibili_podcast.api_backends.native import _generate_buvid_fingerprints
+
+    fp = _generate_buvid_fingerprints()
+    assert re.fullmatch(r"XZ02[0-9A-F]{32}\d{1,10}infoc", fp["buvid3"])
+    assert re.fullmatch(
+        r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}"
+        r"\d{5}-\d{9}-666[A-Za-z0-9+/]{22}==",
+        fp["buvid4"],
+    )
+    assert re.fullmatch(r"\d{10}", fp["b_nut"])
+
+
+def test_native_buvid_fingerprint_uniqueness():
+    """多次调用生成的指纹各不相同（UUID 随机）。"""
+    from bilibili_podcast.api_backends.native import _generate_buvid_fingerprints
+
+    fp1 = _generate_buvid_fingerprints()
+    fp2 = _generate_buvid_fingerprints()
+    assert fp1["buvid3"] != fp2["buvid3"]
+    assert fp1["buvid4"] != fp2["buvid4"]
+
+
+def test_native_buvid_credential_overrides_local(monkeypatch):
+    """用户凭证 buvid3 优先于本地生成的指纹；buvid4/b_nut 由本地补齐。"""
+    from bilibili_podcast.api_backends.native import NativeBackend
+
+    captured: dict = {}
+
+    class _FakeAsyncSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeAsyncSession)
+    backend = NativeBackend(
+        {"sessdata": "s", "bili_jct": "j", "dedeuserid": "d", "buvid3": "USER-BUVID3-123"}
+    )
+    cookies = captured["cookies"]
+    assert cookies["buvid3"] == "USER-BUVID3-123"  # 用户凭证覆盖本地生成
+    assert "buvid4" in cookies and "b_nut" in cookies  # 本地指纹补齐缺失字段
+    assert cookies["SESSDATA"] == "s"  # 既有 cookie 传递不受影响
+
+
+def test_native_buvid_injected_without_credential(monkeypatch):
+    """无凭证（匿名会话）时本地指纹仍注入会话。"""
+    from bilibili_podcast.api_backends.native import NativeBackend
+
+    captured: dict = {}
+
+    class _FakeAsyncSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("curl_cffi.requests.AsyncSession", _FakeAsyncSession)
+    NativeBackend(None)
+    cookies = captured["cookies"]
+    assert cookies["buvid3"].startswith("XZ02")
+    assert "buvid4" in cookies and "b_nut" in cookies
+
+
+# ---------------------------------------------------------------- BackendChain 会话统计
+
+
+def test_chain_stats_counts_calls_failures_switches(monkeypatch):
+    """统计：首个后端失败切换后，失败/切走/成功调用计数正确。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=RateLimitError())
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    assert chain.stats == {}  # 未构造的后端不记录
+    asyncio.run(chain.get_series_meta(1, "series"))
+    assert chain.stats["first"] == {"calls": 0, "failures": 1, "switches": 1}
+    assert chain.stats["second"] == {"calls": 1, "failures": 0, "switches": 0}
+
+    # 切换持久：第二次调用仍走 second，first 计数不变
+    asyncio.run(chain.get_series_meta(1, "series"))
+    assert chain.stats["second"]["calls"] == 2
+    assert chain.stats["first"] == {"calls": 0, "failures": 1, "switches": 1}
+
+    asyncio.run(chain.close())
+
+
+def test_chain_stats_returns_copy(monkeypatch):
+    """stats 返回副本，外部修改不影响内部统计。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first")
+    _install_chain_factory(monkeypatch, [first])
+    chain = BackendChain(["first"])
+    asyncio.run(chain.get_user_info(1))
+
+    chain.stats["first"]["calls"] = 999
+    assert chain.stats["first"]["calls"] == 1
+
+    asyncio.run(chain.close())
+
+
+def test_chain_stats_construction_failure_not_recorded(monkeypatch):
+    """构造失败的后端不进入统计（未构造不记录）。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    second = _ChainBackend("second")
+
+    async def factory(name, credential):
+        if name == "first":
+            raise BackendError("first 依赖未安装")
+        return second
+
+    from bilibili_podcast import api_backends as pkg
+
+    monkeypatch.setattr(pkg, "_create_single_backend", factory)
+    chain = BackendChain(["first", "second"])
+    asyncio.run(chain.get_series_meta(1, "series"))
+
+    assert "first" not in chain.stats  # 构造失败未记录
+    assert chain.stats["second"] == {"calls": 1, "failures": 0, "switches": 0}
+    asyncio.run(chain.close())
+
+
+def test_chain_close_logs_stats_summary(monkeypatch, caplog):
+    """close() 在 debug 级输出统计汇总（不含凭证字段）。"""
+    import logging
+
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first")
+    _install_chain_factory(monkeypatch, [first])
+    chain = BackendChain(["first"])
+    asyncio.run(chain.get_user_info(1))
+
+    with caplog.at_level(logging.DEBUG, logger="bilibili_podcast.api_backends.chain"):
+        asyncio.run(chain.close())
+    assert "后端链会话统计汇总" in caplog.text
+    assert '"calls": 1' in caplog.text
+
+
 # ---------------------------------------------------------------- parse_backend_spec
 
 

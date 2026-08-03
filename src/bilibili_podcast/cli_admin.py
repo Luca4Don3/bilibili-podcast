@@ -1057,6 +1057,120 @@ def cmd_filters_import(args: argparse.Namespace) -> None:
     print(f"✅ 已从 {args.file} 导入 {count} 条 {args.type} 规则到 {args.series}")
 
 
+# ── API 后端链检查 ────────────────────────────────────────────────────────
+
+# 探测用的公开示例视频 BVID（无登录即可访问，仅用于验证真实链路可用）
+_PROBE_BVID = "BV1GJ411x7h7"
+
+
+def _api_backend_spec_for_series(db_path: str, series: str) -> str:
+    """读取系列配置的 api_backend（逗号分隔的降级链）。
+
+    系列的 api_backend 来自 <config_root>/series.d/<series>.yaml（YAML 配置，
+    SeriesConfig.from_yaml 已做 parse_backend_spec 与名称校验）；DB 中无该字段，
+    缺失时回退默认 "native"。系列不存在时抛出 ValueError（中文消息）。
+    """
+    with db.transaction(db_path) as conn:
+        cfg = _load_full_config(conn, series)
+    if not cfg:
+        raise ValueError(f"系列不存在: {series}")
+    yaml_path = Path(_require_config().root) / "series.d" / f"{series}.yaml"
+    if yaml_path.exists():
+        from .config.models import SeriesConfig
+
+        return SeriesConfig.from_yaml(yaml_path).api_backend
+    return "native"
+
+
+def cmd_api_backends_check(args: argparse.Namespace) -> None:
+    """检查 API 后端链：逐名构造验证依赖；--probe 时对链发起一次真实探测请求。
+
+    - 无 series：检查全局默认链（native）；有 series：读取该系列配置的
+      api_backend（含逗号分隔降级链）；
+    - 构造检查不发起真实请求，只验证名称合法性、依赖是否可用；
+    - --probe：对每个后端发起一次 get_video_owner 真实请求（固定公开示例视频），
+      验证 WBI 签名等真实链路可用；探测失败不中断其他后端；
+    - 全程不输出凭证。
+    """
+    import asyncio
+
+    from .api_backends import BACKEND_NAMES, _create_single_backend, parse_backend_spec
+
+    # 仅 series 检查需要 DB/配置；全局检查（无 series）不要求配置文件存在
+    db_path = _get_db(args) if args.series else None
+
+    # 1. 确定待检查的后端链（parse_backend_spec 校验逗号分隔与空值）
+    if args.series:
+        try:
+            spec = _api_backend_spec_for_series(db_path, args.series)
+        except ValueError as exc:
+            print(f"❌ {exc}")
+            sys.exit(EXIT_VALIDATION)
+    else:
+        spec = "native"
+    try:
+        names = parse_backend_spec(spec)
+    except ValueError as exc:
+        print(f"❌ {exc}")
+        sys.exit(EXIT_VALIDATION)
+    invalid = [name for name in names if name not in BACKEND_NAMES]
+    if invalid:
+        print(f"❌ 未知的 API 后端名称：{'、'.join(invalid)}（可选：{'、'.join(BACKEND_NAMES)}）")
+        sys.exit(EXIT_VALIDATION)
+
+    # 2. 凭证：cookie 文件存在才加载；缺失/损坏仅提示，不阻断检查与匿名探测。
+    #    无 series 且无配置文件时允许匿名检查（不强制要求配置存在）。
+    credential = None
+    cookie_file = getattr(args, "cookie_file", None)
+    if not cookie_file:
+        try:
+            cookie_file = str(_require_config().sync.paths.cookie_file)
+        except Exception:
+            cookie_file = None
+    if cookie_file:
+        try:
+            from .sync import load_cookie_file
+
+            credential = load_cookie_file(cookie_file)
+        except (OSError, ValueError) as exc:
+            print(f"⚠️ cookie 文件不可用，将匿名检查/探测: {exc}")
+
+    title = f"（系列 {args.series}）" if args.series else "（全局默认）"
+    print(f"🔍 检查后端链: {' -> '.join(names)} {title}")
+
+    async def _run() -> None:
+        results: list[tuple[str, bool, str]] = []
+        for name in names:
+            try:
+                backend = await _create_single_backend(name, credential)
+            except Exception as exc:
+                # 构造失败（依赖未安装等）：记录依赖状态，继续下一个
+                results.append((name, False, f"构造失败（依赖不可用）: {type(exc).__name__}: {exc}"))
+                continue
+            try:
+                if args.probe:
+                    owner = await backend.get_video_owner(_PROBE_BVID)
+                    results.append(
+                        (name, True, f"探测成功（公开示例视频 {_PROBE_BVID}，UP 主 mid={owner}）")
+                    )
+                else:
+                    results.append((name, True, "构造成功（依赖可用，未发起真实请求）"))
+            except Exception as exc:
+                # 探测失败不中断其他后端；摘要截断避免过长输出
+                results.append((name, False, f"探测失败: {type(exc).__name__}: {str(exc)[:120]}"))
+            finally:
+                await backend.close()
+
+        for name, ok, detail in results:
+            print(f"  {'✅' if ok else '❌'} {name}: {detail}")
+        if all(ok for _, ok, _ in results):
+            print("\n✅ 后端链全部构造成功（OK）。")
+        else:
+            print("\n⚠️ 部分后端不可用，可考虑调整 api_backend 配置顺序。")
+
+    asyncio.run(_run())
+
+
 def cmd_preview(args: argparse.Namespace) -> None:
     """Run dry-run preview for a series."""
     db_path = _get_db(args)
@@ -2774,6 +2888,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_rebuild.add_argument("--media-base-url")
     p_rebuild.set_defaults(handler=cmd_paid_rebuild_rss)
 
+    # api-backends — 后端链检查
+    p_api = sub.add_parser("api-backends", help="检查 API 后端链（构造状态与真实链路探测）")
+    api_sub = p_api.add_subparsers(dest="api_backends_sub", required=True)
+    p_ab_check = api_sub.add_parser("check", help="检查后端链（缺省为全局默认链 native；--probe 发起真实探测）")
+    p_ab_check.add_argument("series", nargs="?", help="系列标识（缺省检查全局默认链 native）")
+    p_ab_check.add_argument("--probe", action="store_true", help="对链发起一次真实探测请求（公开示例视频 BV1GJ411x7h7）")
+    p_ab_check.add_argument("--cookie-file", help="Netscape cookie 文件路径（可选，匿名探测则省略）")
+    p_ab_check.set_defaults(handler=cmd_api_backends_check)
+
     return parser
 
 
@@ -2804,10 +2927,14 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        _CONFIG = ConfigManager().load()
-        apply_admin_config_defaults(args, _CONFIG)
-        from .services import systemd_scheduler
-        systemd_scheduler.configure(_CONFIG)
+        # api-backends check（无 series）为免配置命令：允许在无配置文件时匿名检查默认链
+        need_config = not (args.command == "api-backends" and not getattr(args, "series", None))
+        if need_config:
+            _CONFIG = ConfigManager().load()
+            apply_admin_config_defaults(args, _CONFIG)
+            from .services import systemd_scheduler
+
+            systemd_scheduler.configure(_CONFIG)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return exc.exit_code

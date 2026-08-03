@@ -491,11 +491,21 @@ pip install "bilibili-podcast[api-backends]"
 每日从 `x/web-interface/nav` 获取并缓存，接口失败时回退到公开备用值。它不依赖
 第三方 B 站库，可独立使用，也适合与其他后端组链作为首选或兜底。
 
+`native` 会话指纹防风控采用「本地生成 + 页面补充」：构造时即本地生成合法格式的
+`buvid3` / `buvid4` / `b_nut` 指纹 cookie 注入会话（首次请求不再依赖页面会话，
+风控韧性更强）；首次请求前仍访问一次 B 站页面作为补充（失败仅 warning，不阻断）。
+本地指纹生成参考 bilibili-API-collect 的 `docs/misc/buvid3_4.md`（页面已随仓库
+归档下线，采用 Wayback Machine 存档）；其中 `buvid3` 格式为 `XZ02` + 大写 UUID +
+时间戳尾部数字 + `infoc`，`buvid4` 为 UUID 变形 + 数字段 + `-666` + base64 串，
+`b_nut` 为 UNIX 秒级时间戳。
+
 #### 降级链（防单 API 被 B 站封禁）
 
 `api_backend` 支持逗号分隔的多个后端名称，按顺序组成降级链：单个后端
 失败（限流 / 网络错误 / 不支持 / 依赖未安装）时自动切换到下一个，全部
-失败才报错。切换是持久的，不会每次调用都从头重试已失败的后端。
+失败才报错。切换是持久的，不会每次调用都从头重试已失败的后端。降级链会
+按后端记录调用统计（成功次数 / 失败次数 / 被切走次数），`close()` 时以
+debug 日志输出汇总（不含凭证），便于排查降级路径。
 
 ```yaml
 api_backend: "native,yutto,bilix"   # 推荐：自研直连优先，第三方库兜底
@@ -508,6 +518,25 @@ api_backend: "native"               # 单后端写法同样支持（默认值）
 - 限流（B 站 -799）、网络/超时、后端不支持、依赖未安装均触发自动切换；
 - bilibili-api 官方已关停且不再随主依赖安装；默认与推荐使用 `native`（全类型，自研直连）或 `yutto`（全类型）、`bilix`（仅空间/系列）；
 - 建议把最可靠的后端放第一位，例如 `"native,yutto,bilix"`。
+
+#### 后端链检查（api-backends check）
+
+管理 CLI 提供后端链检查命令，用于排查后端配置与真实链路是否可用：
+
+```bash
+# 检查全局默认链（native）的构造状态（不发起真实请求）
+bilibili-podcast-admin api-backends check
+
+# 检查指定系列配置的 api_backend 降级链（逐名构造，验证依赖是否可用）
+bilibili-podcast-admin api-backends check my-series
+
+# --probe：对链发起一次真实探测请求（固定公开示例视频 BV1GJ411x7h7），
+# 验证 WBI 签名等真实链路可用；探测失败不中断其他后端
+bilibili-podcast-admin api-backends check my-series --probe
+
+# 可携带 cookie 文件（可选；缺省匿名探测，不会输出任何凭证）
+bilibili-podcast-admin api-backends check my-series --probe --cookie-file /path/to/cookies.txt
+```
 
 ### `source` — 数据来源
 

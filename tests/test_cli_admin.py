@@ -2010,3 +2010,137 @@ def test_generate_rss_failure_preserves_existing_file(tmp_path: Path, monkeypatc
 
     assert target.read_text(encoding="utf-8") == "old"
     assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
+
+
+# ── api-backends 检查命令 ────────────────────────────────────────────────
+
+
+def test_api_backends_check_parser() -> None:
+    """api-backends check 子命令解析：series 可选、--probe 与 --cookie-file 支持。"""
+    p = cli_admin.build_parser()
+    ns = p.parse_args(["api-backends", "check"])
+    assert ns.handler == cli_admin.cmd_api_backends_check
+    assert ns.series is None
+    assert ns.probe is False
+    ns = p.parse_args(["api-backends", "check", "my-series", "--probe"])
+    assert ns.series == "my-series"
+    assert ns.probe is True
+
+
+def test_api_backends_check_construction_only(monkeypatch, capsys) -> None:
+    """无 --probe：逐名构造（不真实请求），输出构造成功与链整体 OK。"""
+    from bilibili_podcast import api_backends as pkg
+
+    created: list[str] = []
+    closed: list[str] = []
+
+    class _FakeBackend:
+        def __init__(self, name):
+            self.name = name
+
+        async def get_video_owner(self, bvid):  # 不应被调用（无 --probe）
+            raise AssertionError("构造检查不应发起真实请求")
+
+        async def close(self):
+            closed.append(self.name)
+
+    async def fake_create(name, credential):
+        created.append(name)
+        return _FakeBackend(name)
+
+    monkeypatch.setattr(pkg, "_create_single_backend", fake_create)
+    ns = SimpleNamespace(config_db=None, series=None, probe=False, cookie_file=None)
+    cli_admin.cmd_api_backends_check(ns)
+
+    out = capsys.readouterr().out
+    assert "检查后端链: native （全局默认）" in out
+    assert "native: 构造成功（依赖可用，未发起真实请求）" in out
+    assert "后端链全部构造成功（OK）" in out
+    assert created == ["native"]
+    assert closed == ["native"]
+
+
+def test_api_backends_check_probe_path(monkeypatch, capsys) -> None:
+    """--probe：每个后端发起一次真实探测；失败摘要输出且不中断其他后端。"""
+    from bilibili_podcast import api_backends as pkg
+
+    probed: list[str] = []
+
+    class _OkBackend:
+        async def get_video_owner(self, bvid):
+            probed.append(("ok", bvid))
+            return 123456
+
+        async def close(self):
+            pass
+
+    class _FailBackend:
+        async def get_video_owner(self, bvid):
+            probed.append(("fail", bvid))
+            raise RuntimeError("探测网络超时")
+
+        async def close(self):
+            pass
+
+    async def fake_create(name, credential):
+        return _OkBackend() if name == "native" else _FailBackend()
+
+    monkeypatch.setattr(pkg, "_create_single_backend", fake_create)
+    monkeypatch.setattr(
+        cli_admin, "_api_backend_spec_for_series", lambda db, series: "native,yutto"
+    )
+    ns = SimpleNamespace(config_db=None, series="s1", probe=True, cookie_file=None)
+    cli_admin.cmd_api_backends_check(ns)
+
+    out = capsys.readouterr().out
+    assert "探测成功（公开示例视频 BV1GJ411x7h7，UP 主 mid=123456）" in out
+    assert "yutto: 探测失败: RuntimeError: 探测网络超时" in out
+    assert "部分后端不可用" in out
+    assert probed == [("ok", "BV1GJ411x7h7"), ("fail", "BV1GJ411x7h7")]
+
+
+def test_api_backends_check_construction_failure_summary(monkeypatch, capsys) -> None:
+    """构造失败（依赖未安装）输出依赖状态摘要，且不阻断后续后端。"""
+    from bilibili_podcast import api_backends as pkg
+
+    async def fake_create(name, credential):
+        if name == "bilix":
+            raise pkg.BackendError('bilix 后端未安装，请执行 pip install "bilibili-podcast[api-backends]"')
+
+        class _Fake:
+            async def close(self):
+                pass
+
+        return _Fake()
+
+    monkeypatch.setattr(pkg, "_create_single_backend", fake_create)
+    monkeypatch.setattr(cli_admin, "_api_backend_spec_for_series", lambda db, series: "native,bilix")
+    ns = SimpleNamespace(config_db=None, series="s1", probe=False, cookie_file=None)
+    cli_admin.cmd_api_backends_check(ns)
+
+    out = capsys.readouterr().out
+    assert "native: 构造成功（依赖可用，未发起真实请求）" in out
+    assert "构造失败（依赖不可用）" in out and "bilix" in out
+    assert "部分后端不可用" in out
+
+
+def test_api_backends_check_unknown_series(tmp_path: Path, capsys) -> None:
+    """未知系列：输出中文错误并以 EXIT_VALIDATION 退出。"""
+    from bilibili_podcast import db
+
+    db.migrate(str(tmp_path / "bilibili-podcast.db"))  # 初始化空库（无任何系列）
+    ns = SimpleNamespace(config_db=None, series="no-such-series", probe=False, cookie_file=None)
+    with pytest.raises(SystemExit) as exc:
+        cli_admin.cmd_api_backends_check(ns)
+    assert exc.value.code == cli_admin.EXIT_VALIDATION
+    assert "系列不存在: no-such-series" in capsys.readouterr().out
+
+
+def test_api_backends_check_invalid_backend_name(monkeypatch, capsys) -> None:
+    """非法后端名称：解析后校验 BACKEND_NAMES，输出未知名称错误并退出。"""
+    monkeypatch.setattr(cli_admin, "_api_backend_spec_for_series", lambda db, series: "native,evil")
+    ns = SimpleNamespace(config_db=None, series="s1", probe=False, cookie_file=None)
+    with pytest.raises(SystemExit) as exc:
+        cli_admin.cmd_api_backends_check(ns)
+    assert exc.value.code == cli_admin.EXIT_VALIDATION
+    assert "未知的 API 后端名称：evil" in capsys.readouterr().out
