@@ -13,8 +13,11 @@ from pathlib import Path, PurePosixPath
 
 RESERVED = "bili" + "pod"
 ACKNOWLEDGEMENT = (
-    "- "
+    "- ["
     + RESERVED.capitalize()
+    + "](https://github.com/sunrisewestern/"
+    + RESERVED
+    + ")"
     + "：感谢原作者及贡献者以 GPLv3 提供基础实现；本仓库来源基线为提交 "
     + "`d16ce56604d1fbe3b0504ce2db964b0e29ffd9f0`，其后进行了项目重命名、配置迁移、安全、发布与部署方面的派生修改。"
 )

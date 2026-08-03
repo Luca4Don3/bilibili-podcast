@@ -968,7 +968,7 @@ GNU General Public License v3.0
 
 本项目站在许多优秀开源项目的肩膀上，特别感谢：
 
-- Bilipod：感谢原作者及贡献者以 GPLv3 提供基础实现；本仓库来源基线为提交 `d16ce56604d1fbe3b0504ce2db964b0e29ffd9f0`，其后进行了项目重命名、配置迁移、安全、发布与部署方面的派生修改。
+- [Bilipod](https://github.com/sunrisewestern/bilipod)：感谢原作者及贡献者以 GPLv3 提供基础实现；本仓库来源基线为提交 `d16ce56604d1fbe3b0504ce2db964b0e29ffd9f0`，其后进行了项目重命名、配置迁移、安全、发布与部署方面的派生修改。
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)：可靠的媒体下载与格式处理能力。
 - [bilibili-api-python](https://github.com/Nemo2011/bilibili-api)：Bilibili API 的 Python 封装。
 - [FeedGenerator](https://github.com/lkiesow/python-feedgen)：RSS/Atom feed 生成能力。
