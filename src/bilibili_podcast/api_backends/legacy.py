@@ -51,7 +51,7 @@ def _episode_from_archives_item(item: dict) -> dict:
 
 
 class LegacyBackend:
-    """基于 bilibili-api 的默认后端（延迟 import，不引入硬依赖）。"""
+    """基于 bilibili-api 的已弃用后端（延迟 import，不引入硬依赖）。"""
 
     def __init__(self, credential: BackendCredential | None = None):
         from bilibili_api import request_settings
