@@ -1987,6 +1987,7 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
     _require_series(db_path, args.series)
     import asyncio
     from bilibili_podcast.sync import fetch_space_episodes, fetch_series_episodes, load_cookie_file
+    from bilibili_podcast.api_backends import create_backend
     from bilibili_podcast.db import transaction
     from bilibili_podcast.utils.series_config import SeriesConfig
     from bilibili_podcast.services.config_service import ConfigService
@@ -2064,10 +2065,16 @@ def cmd_paid_refresh_metadata(args: argparse.Namespace) -> None:
         return
 
     try:
-        if config.source.get("sid"):
-            info, episodes, count = asyncio.run(fetch_series_episodes(config, credential))
-        else:
-            info, episodes, count = asyncio.run(fetch_space_episodes(config, credential))
+        async def _fetch_episodes():
+            backend = await create_backend(config.api_backend, credential)
+            try:
+                if config.source.get("sid"):
+                    return await fetch_series_episodes(config, backend)
+                return await fetch_space_episodes(config, backend)
+            finally:
+                await backend.close()
+
+        info, episodes, count = asyncio.run(_fetch_episodes())
     except Exception as e:
         print(f"❌ API 获取失败: {e}")
         sys.exit(EXIT_SYNC_FAIL)

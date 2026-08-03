@@ -35,6 +35,10 @@ authors = [{ name = "bilibili-podcast Maintainers" }]
 browser = [
   "playwright>=1.60,<2",
 ]
+api-backends = [
+  "bilix>=0.18.9",
+  "yutto>=2.2.0",
+]
 dev = [
   "pip-audit>=2.10.1",
   "pytest>=9.1.1",

@@ -466,6 +466,23 @@ ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BI
 | `subcategories` | list | 否 | iTunes 子分类列表 |
 | `explicit` | bool | 否 | 是否包含 explicit 内容，默认 `false` |
 | `lang` | string | 否 | 语言代码，默认 `"zh-CN"` |
+| `api_backend` | string | 否 | 使用的 B 站 API 后端：`bilibili-api`（默认）/ `bilix` / `yutto`，见下方说明 |
+
+### API 后端（api_backend）
+
+| 后端 | 支持范围 | 说明 |
+|------|----------|------|
+| `bilibili-api` | 空间 / 系列 / 剧集 | 默认后端，随主依赖安装 |
+| `bilix` | 空间 / 系列 | 不支持剧集（season）类型 |
+| `yutto` | 空间 / 系列 / 剧集 | 覆盖全部类型 |
+
+可选后端（`bilix` / `yutto`）需额外安装：
+
+```bash
+pip install "bilibili-podcast[api-backends]"
+```
+
+未安装对应后端时，配置该值会在运行时报出明确的中文错误提示。
 
 ### `source` — 数据来源
 
