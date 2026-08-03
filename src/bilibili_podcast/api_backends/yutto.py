@@ -150,7 +150,15 @@ class YuttoBackend:
                 SeriesId(str(sid)),
                 MId(str(mid)),
             )
-            return {"name": details.get("title", ""), "face": "", "sign": ""}
+            # get_collection_details 不含 UP 主昵称字段，author 留空；
+            # uid 复用 _get_series_mid 拿到的 mid。
+            return {
+                "name": details.get("title", ""),
+                "face": "",
+                "sign": "",
+                "author": "",
+                "uid": int(mid) if mid else None,
+            }
         if series_type == "season":
             from yutto.api import bangumi
             from yutto.types import SeasonId
@@ -164,7 +172,14 @@ class YuttoBackend:
             pages = bangumi_list.get("pages") or []
             if pages:
                 cover = (pages[0].get("metadata") or {}).get("thumb", "")
-            return {"name": bangumi_list.get("title", ""), "face": cover, "sign": ""}
+            # get_bangumi_list 不含 UP 主昵称/mid 字段，author/uid 留空
+            return {
+                "name": bangumi_list.get("title", ""),
+                "face": cover,
+                "sign": "",
+                "author": "",
+                "uid": None,
+            }
         raise UnsupportedError(f"yutto 后端不支持的抓取类型：{series_type}")
 
     async def get_series_videos(self, sid: int, series_type: str, pn: int, ps: int) -> list[dict]:
@@ -193,3 +208,21 @@ class YuttoBackend:
             pages = bangumi_list.get("pages") or []
             return [_episode_from_bangumi_item(item) for item in _slice_page(pages, pn, ps)]
         raise UnsupportedError(f"yutto 后端不支持的抓取类型：{series_type}")
+
+    async def get_video_owner(self, bvid: str) -> int | None:
+        """返回视频所属 UP 主 mid。
+
+        当前版本 yutto 的 _UgcVideoInfo 无 owner 字段，回退直接请求
+        x/web-interface/view 接口（与 get_ugc_video_info 底层同源）取
+        data.owner.mid；网络失败抛 httpx 异常（降级链可切换），无法提取返回 None。
+        """
+        from yutto.utils.fetcher import Fetcher
+
+        url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+        json_data = await Fetcher.fetch_json(self._ctx, self._client, url)
+        if json_data is None:
+            return None
+        data = json_data.get("data") or {}
+        owner = data.get("owner") or {}
+        mid = owner.get("mid")
+        return int(mid) if mid else None

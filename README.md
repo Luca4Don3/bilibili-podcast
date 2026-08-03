@@ -466,15 +466,16 @@ ssh <deploy-host> 'sudo env BILIBILI_PODCAST_CONFIG_ROOT=<server_path>/config BI
 | `subcategories` | list | 否 | iTunes 子分类列表 |
 | `explicit` | bool | 否 | 是否包含 explicit 内容，默认 `false` |
 | `lang` | string | 否 | 语言代码，默认 `"zh-CN"` |
-| `api_backend` | string | 否 | 使用的 B 站 API 后端：`bilibili-api`（默认）/ `bilix` / `yutto`，见下方说明 |
+| `api_backend` | string | 否 | 使用的 B 站 API 后端：`bilibili-api`（默认）/ `bilix` / `yutto` / `native`，支持逗号分隔降级链，见下方说明 |
 
 ### API 后端（api_backend）
 
 | 后端 | 支持范围 | 说明 |
 |------|----------|------|
-| `bilibili-api` | 空间 / 系列 / 剧集 | 默认后端，随主依赖安装 |
+| `bilibili-api` | 空间 / 系列 / 剧集 | 默认后端，随主依赖安装；官方已关停，仅建议作为备选 |
 | `bilix` | 空间 / 系列 | 不支持剧集（season）类型 |
 | `yutto` | 空间 / 系列 / 剧集 | 覆盖全部类型 |
+| `native` | 空间 / 系列 / 剧集 | 自研直连后端，直接调用 B 站公开接口（含 WBI 签名），不依赖任何第三方 B 站库；复用主依赖 `curl_cffi`，无额外安装 |
 
 可选后端（`bilix` / `yutto`）需额外安装：
 
@@ -483,6 +484,31 @@ pip install "bilibili-podcast[api-backends]"
 ```
 
 未安装对应后端时，配置该值会在运行时报出明确的中文错误提示。
+
+`native` 为内置自研后端：WBI 签名实现参考
+[bilibili-API-collect](https://socialsisteryi.github.io/bilibili-API-collect/docs/misc/sign/wbi.html)
+文档（重排映射表 `MIXIN_KEY_ENC_TAB` 与 `wts`/`w_rid` 生成方式）；`img_key`/`sub_key`
+每日从 `x/web-interface/nav` 获取并缓存，接口失败时回退到公开备用值。它不依赖
+第三方 B 站库，可独立使用，也适合与其他后端组链作为首选或兜底。
+
+#### 降级链（防单 API 被 B 站封禁）
+
+`api_backend` 支持逗号分隔的多个后端名称，按顺序组成降级链：单个后端
+失败（限流 / 网络错误 / 不支持 / 依赖未安装）时自动切换到下一个，全部
+失败才报错。切换是持久的，不会每次调用都从头重试已失败的后端。
+
+```yaml
+api_backend: "yutto,bilix"          # 推荐：yutto 优先，bilix 兜底
+api_backend: "bilibili-api,yutto"   # 保留旧默认作为首选，yutto 兜底
+api_backend: "native,yutto,bilix"   # 推荐：自研直连优先，第三方库兜底
+api_backend: "bilix"                # 单后端写法同样支持
+```
+
+说明：
+- 逗号分隔会自动去空白、去重，名称顺序即降级顺序；
+- 限流（B 站 -799）、网络/超时、后端不支持、依赖未安装均触发自动切换；
+- bilibili-api 官方已关停，推荐使用 `native`（全类型，自研直连）或 `yutto`（全类型）、`bilix`（仅空间/系列）；
+- 建议把最可靠的后端放第一位，例如 `"native,yutto,bilix"`。
 
 ### `source` — 数据来源
 

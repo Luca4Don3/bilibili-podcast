@@ -174,11 +174,15 @@ class BilixBackend:
         if data.get("code") != 0:
             raise RuntimeError(f"bilix 系列元数据接口返回错误：{data.get('message')}")
         meta = data.get("data", {}).get("meta", {})
-        # x/series/series 的 meta 以接口实际返回为准，缺失字段回落为空字符串
+        mid = meta.get("mid")
+        # x/series/series 的 meta 以接口实际返回为准，缺失字段回落为空字符串；
+        # 该接口不含 UP 主昵称字段，author 留空；uid 取 meta.mid。
         return {
             "name": meta.get("name", ""),
             "face": meta.get("cover", ""),
             "sign": meta.get("intro", ""),
+            "author": "",
+            "uid": int(mid) if mid else None,
         }
 
     async def _fetch_series_all(self, sid: int) -> list[dict]:
@@ -226,3 +230,9 @@ class BilixBackend:
         episodes = await self._fetch_series_all(sid)
         start = (pn - 1) * ps
         return episodes[start : start + ps]
+
+    async def get_video_owner(self, bvid: str) -> int | None:
+        raise UnsupportedError(
+            "bilix 后端无法获取视频所属 UP 主（VideoInfo 无 owner/mid 字段），"
+            "请使用 bilibili-api 或 yutto 后端"
+        )

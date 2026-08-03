@@ -204,13 +204,19 @@ async def _fetch_up_face_url(uid: int) -> str | None:
     """Try to fetch UP主 avatar URL from B站 API. Returns None on failure."""
     if not uid or uid <= 0:
         return None
+    from ..api_backends import create_backend
+
+    backend = await create_backend("bilibili-api", None)
     try:
-        from bilibili_api import user
-        u = user.User(uid)
-        info = await u.get_user_info()
+        info = await backend.get_user_info(uid)
         return info.get("face")
     except Exception:
         return None
+    finally:
+        try:
+            await backend.close()
+        except Exception:
+            pass
 
 
 # ── Routes ──────────────────────────────────────────────────────────────

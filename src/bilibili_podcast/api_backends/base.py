@@ -44,8 +44,32 @@ class UnsupportedError(BackendError):
     """当前后端不支持该操作时抛出（例如 bilix 后端不支持剧集 season 类型）。"""
 
 
+class NetworkError(BackendError):
+    """网络/超时类错误统一包装（连接失败、超时、HTTP 状态错误），供降级链识别切换。"""
+
+
 BackendCredential = dict[str, str]
 """后端凭证：键为 sessdata / bili_jct / dedeuserid / buvid3（buvid3 可能缺失）。"""
+
+
+def parse_backend_spec(spec: str) -> list[str]:
+    """把逗号分隔的后端配置解析为名称列表。
+
+    - 去空白、去空项、去重（保持首次出现顺序）；
+    - 空串或解析后为空列表抛出 ValueError（中文消息）。
+    """
+    names: list[str] = []
+    for raw in spec.split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError(
+            "api_backend 配置不能为空，请至少指定一个后端名称（可选：bilibili-api、bilix、yutto、native）"
+        )
+    return names
 
 
 @runtime_checkable
@@ -65,14 +89,23 @@ class BilibiliApiBackend(Protocol):
         ...
 
     async def get_series_meta(self, sid: int, series_type: str) -> dict:
-        """返回系列/剧集元数据 {"name", "face", "sign"}。
+        """返回系列/剧集元数据 {"name", "face", "sign", "author", "uid"}。
 
-        series_type 取值 "series"（系列）或 "season"（剧集）。
+        - series_type 取值 "series"（系列）或 "season"（剧集）；
+        - author 为 UP 主昵称，后端无法提供时为空字符串；
+        - uid 为 UP 主 mid，后端无法提供时为 None。
         """
         ...
 
     async def get_series_videos(self, sid: int, series_type: str, pn: int, ps: int) -> list[dict]:
         """返回系列/剧集条目的统一 episode 列表，支持 pn/ps 分页。"""
+        ...
+
+    async def get_video_owner(self, bvid: str) -> int | None:
+        """返回视频所属 UP 主的 mid；无法获取时返回 None。
+
+        不支持该操作的后端应抛出 UnsupportedError（供降级链切换）。
+        """
         ...
 
     async def close(self) -> None:

@@ -271,10 +271,18 @@ class SeriesConfig:
         unknown_top = sorted(set(data) - SERIES_TOP_FIELDS)
         if unknown_top:
             raise ValueError(f"unknown series field: {unknown_top[0]}")
-        from ..api_backends import BACKEND_NAMES
+        from ..api_backends import BACKEND_NAMES, parse_backend_spec
 
         api_backend = data.get("api_backend", "bilibili-api")
-        if api_backend not in BACKEND_NAMES:
+        if isinstance(api_backend, str):
+            try:
+                backend_names = parse_backend_spec(api_backend)
+            except ValueError as exc:
+                raise ValueError(f"api_backend must be one of: {', '.join(BACKEND_NAMES)}") from exc
+        else:
+            backend_names = list(api_backend)
+        invalid = [name for name in backend_names if name not in BACKEND_NAMES]
+        if invalid:
             raise ValueError(f"api_backend must be one of: {', '.join(BACKEND_NAMES)}")
         series = data.get("series")
         if not series:

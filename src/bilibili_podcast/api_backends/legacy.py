@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from .base import BackendCredential, UnsupportedError
+from .base import BackendCredential, NetworkError, UnsupportedError
 
 LOGGER = logging.getLogger("bilibili_podcast.api_backends.legacy")
 
@@ -117,14 +117,18 @@ class LegacyBackend:
         series = self._make_series(sid, series_type)
         meta = await series.get_meta()
         if series_type == "season":
+            # season 的 get_meta 原始结构含 data.upper.name / data.upper.mid
+            upper = meta.get("upper") or {}
             return {
-                "name": meta.get("upper", {}).get("name", ""),
+                "name": upper.get("name", ""),
                 "face": meta.get("cover", ""),
                 "sign": meta.get("intro", ""),
+                "author": upper.get("name", ""),
+                "uid": upper.get("mid"),
             }
         # series 类型下旧逻辑不使用 meta 字段（info 直接取自配置），
         # 因此返回空字段，由 sync 层回退到 config.author 等默认值。
-        return {"name": "", "face": "", "sign": ""}
+        return {"name": "", "face": "", "sign": "", "author": "", "uid": None}
 
     async def get_series_videos(self, sid: int, series_type: str, pn: int, ps: int) -> list[dict]:
         from bilibili_api import channel_series
@@ -137,3 +141,28 @@ class LegacyBackend:
         )
         items = video_list.get("archives", [])
         return [_episode_from_archives_item(item) for item in items]
+
+    async def get_video_owner(self, bvid: str) -> int | None:
+        """返回视频所属 UP 主 mid；解析失败时抛异常（由 resolver / 降级链处理）。
+
+        网络类异常包装为 NetworkError 供降级链识别切换；其余异常原样抛出。
+        """
+        from bilibili_api import video
+
+        try:
+            video_obj = video.Video(bvid=bvid, credential=self._credential)
+            info = await video_obj.get_info()
+        except Exception as exc:
+            if isinstance(exc, (OSError, ConnectionError, TimeoutError)):
+                raise NetworkError(f"legacy 获取视频信息失败（BV={bvid}）：{exc}") from exc
+            try:
+                import requests  # noqa: F401
+
+                if isinstance(exc, requests.RequestException):
+                    raise NetworkError(f"legacy 获取视频信息失败（BV={bvid}）：{exc}") from exc
+            except ImportError:
+                pass
+            raise
+        owner = info.get("owner") or {}
+        mid = owner.get("mid")
+        return int(mid) if mid else None

@@ -13,9 +13,11 @@ import pytest
 from bilibili_podcast.api_backends import (
     BACKEND_NAMES,
     BackendError,
+    NetworkError,
     RateLimitError,
     UnsupportedError,
     create_backend,
+    parse_backend_spec,
 )
 from bilibili_podcast.sync import (
     fetch_series_episodes,
@@ -246,23 +248,46 @@ def test_create_backend_unknown_name():
         asyncio.run(create_backend("nope", None))
 
 
-@pytest.mark.parametrize("name,module", [("bilix", "bilix"), ("yutto", "yutto"), ("bilibili-api", "bilibili_api")])
+@pytest.mark.parametrize("name,module", [("bilix", "bilix"), ("yutto", "yutto"), ("bilibili-api", "bilibili_api"), ("native", "curl_cffi")])
 def test_create_backend_missing_dependency(name, module, monkeypatch):
+    """依赖未安装时 create_backend 不立即失败（惰性构造），首次调用方法时才抛 BackendError。"""
     monkeypatch.setitem(sys.modules, module, None)
+    chain = asyncio.run(create_backend(name, None))
     with pytest.raises(BackendError):
-        asyncio.run(create_backend(name, None))
+        asyncio.run(chain.get_user_info(1))
 
 
 def test_create_backend_legacy_works(monkeypatch):
-    """legacy 后端在依赖可用时正常构造（monkeypatch 假 bilibili_api 顶层模块）。"""
+    """legacy 后端在依赖可用时正常构造（monkeypatch 假 bilibili_api 顶层模块），返回 BackendChain。"""
     import bilibili_api
 
     monkeypatch.setattr(bilibili_api, "request_settings", types.SimpleNamespace(set=lambda *a, **k: None))
-    backend = asyncio.run(create_backend("bilibili-api", None))
+    chain = asyncio.run(create_backend("bilibili-api", None))
     try:
-        assert type(backend).__name__ == "LegacyBackend"
+        assert type(chain).__name__ == "BackendChain"
     finally:
-        asyncio.run(backend.close())
+        asyncio.run(chain.close())
+
+
+def test_create_backend_native_works():
+    """native 后端正常构造（curl_cffi 为主依赖已安装），返回 BackendChain。"""
+    chain = asyncio.run(create_backend("native", None))
+    try:
+        assert type(chain).__name__ == "BackendChain"
+    finally:
+        asyncio.run(chain.close())
+
+
+def test_create_backend_comma_spec_returns_chain():
+    """逗号分隔配置解析为降级链；非法名 ValueError 列出可用名。"""
+    chain = asyncio.run(create_backend(" yutto , bilix,yutto ", None))
+    assert chain._names == ["yutto", "bilix"]
+    with pytest.raises(ValueError, match="未知的 API 后端名称"):
+        asyncio.run(create_backend("yutto,nope", None))
+    with pytest.raises(ValueError, match="不能为空"):
+        asyncio.run(create_backend("", None))
+    with pytest.raises(ValueError, match="不能为空"):
+        asyncio.run(create_backend([], None))
 
 
 # ---------------------------------------------------------------- legacy 字段映射
@@ -297,14 +322,22 @@ def test_legacy_backend_field_mapping(monkeypatch):
             self.type_ = type_
 
         async def get_meta(self):
-            return {"upper": {"name": "UP"}, "cover": "c", "intro": "i"}
+            return {"upper": {"name": "UP", "mid": 777}, "cover": "c", "intro": "i"}
 
         async def get_videos(self, pn, ps, sort):
             return {"archives": [{"bvid": "BV9", "title": "S", "duration": 5, "pic": "p", "pubdate": 1}]}
 
+    class FakeVideo:
+        def __init__(self, bvid, credential=None):
+            self.bvid = bvid
+
+        async def get_info(self):
+            return {"owner": {"mid": 555}}
+
     monkeypatch.setattr(bilibili_api, "request_settings", types.SimpleNamespace(set=lambda *a, **k: None))
     monkeypatch.setattr(bilibili_api, "Credential", lambda **kw: types.SimpleNamespace(**kw))
     monkeypatch.setattr(bilibili_api, "user", types.SimpleNamespace(User=FakeUser, VideoOrder=types.SimpleNamespace(PUBDATE="pubdate")))
+    monkeypatch.setattr(bilibili_api, "video", types.SimpleNamespace(Video=FakeVideo))
     monkeypatch.setattr(
         bilibili_api,
         "channel_series",
@@ -333,8 +366,12 @@ def test_legacy_backend_field_mapping(monkeypatch):
     assert eps[1]["duration"] == 34
     assert eps[1]["pubdate"] == 222
 
-    assert asyncio.run(backend.get_series_meta(9, "season")) == {"name": "UP", "face": "c", "sign": "i"}
-    assert asyncio.run(backend.get_series_meta(9, "series")) == {"name": "", "face": "", "sign": ""}
+    assert asyncio.run(backend.get_series_meta(9, "season")) == {
+        "name": "UP", "face": "c", "sign": "i", "author": "UP", "uid": 777,
+    }
+    assert asyncio.run(backend.get_series_meta(9, "series")) == {
+        "name": "", "face": "", "sign": "", "author": "", "uid": None,
+    }
     with pytest.raises(UnsupportedError):
         asyncio.run(backend.get_series_meta(9, "weird"))
 
@@ -342,6 +379,8 @@ def test_legacy_backend_field_mapping(monkeypatch):
     assert s_eps[0]["bvid"] == "BV9"
     assert s_eps[0]["duration"] == 5
     assert s_eps[0]["pubdate"] == 1
+
+    assert asyncio.run(backend.get_video_owner("BV1")) == 555
 
 
 # ---------------------------------------------------------------- bilix 字段映射
@@ -457,6 +496,11 @@ def test_bilix_series_support_and_season_rejected():
 
     meta = asyncio.run(backend.get_series_meta(9, "series"))
     assert meta["name"] == "List"
+    assert meta["author"] == ""
+    assert meta["uid"] == 42
+
+    with pytest.raises(UnsupportedError):
+        asyncio.run(backend.get_video_owner("BV1"))
 
     # 第 2 页（ps=1）取全量列表第 2 条
     eps = asyncio.run(backend.get_series_videos(9, "series", pn=2, ps=1))
@@ -597,6 +641,7 @@ def test_yutto_series_and_season_mapping(monkeypatch):
 
     meta = asyncio.run(backend.get_series_meta(9, "series"))
     assert meta["name"] == "Coll"
+    assert meta["uid"] == 42
 
     eps = asyncio.run(backend.get_series_videos(9, "series", pn=2, ps=1))
     assert [ep["bvid"] for ep in eps] == ["BV2"]
@@ -604,6 +649,8 @@ def test_yutto_series_and_season_mapping(monkeypatch):
     meta = asyncio.run(backend.get_series_meta(9, "season"))
     assert meta["name"] == "Anime"
     assert meta["face"] == "t"
+    assert meta["author"] == ""
+    assert meta["uid"] is None
 
     eps = asyncio.run(backend.get_series_videos(9, "season", pn=1, ps=100))
     assert eps[0]["bvid"] == "BV9"
@@ -611,6 +658,593 @@ def test_yutto_series_and_season_mapping(monkeypatch):
 
     with pytest.raises(UnsupportedError):
         asyncio.run(backend.get_series_videos(9, "weird", 1, 100))
+
+
+def test_yutto_get_video_owner(monkeypatch):
+    """yutto 后端 get_video_owner：回退请求 view 接口取 data.owner.mid。"""
+    _install_fake_yutto(monkeypatch, fetcher_json={"data": {"owner": {"mid": 555}}})
+    backend = _yutto_backend()
+    assert asyncio.run(backend.get_video_owner("BV1")) == 555
+
+    _install_fake_yutto(monkeypatch, fetcher_json={"data": {}})
+    assert asyncio.run(backend.get_video_owner("BV1")) is None
+
+
+# ---------------------------------------------------------------- native 字段映射
+
+
+class _NativeFakeRes:
+    """假响应：固定 status_code 与 JSON payload。"""
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class _NativeFakeSession:
+    """按完整 URL 返回固定响应的假 curl_cffi session，记录所有请求。"""
+
+    def __init__(self, routes, status_code=200):
+        self.routes = routes  # {完整 URL: payload}
+        self.status_code = status_code
+        self.calls = []  # [(url, params, headers)]
+
+    async def get(self, url, params=None, headers=None):
+        self.calls.append((url, dict(params or {}), headers))
+        payload = self.routes.get(url)
+        if payload is None:
+            payload = {"code": 0, "data": {}}
+        return _NativeFakeRes(payload, self.status_code)
+
+    async def close(self):
+        pass
+
+
+def _native_backend(session, wbi_keys=("7cd084941338484aae1ad9425b84077c", "4932caff0ff746eab6f01bf08b70ac45")):
+    """绕过 __init__ 注入假 session 构造 NativeBackend（预置 WBI key 跳过 nav）。"""
+    from bilibili_podcast.api_backends.native import NativeBackend
+
+    backend = NativeBackend.__new__(NativeBackend)
+    backend._session = session
+    backend._wbi_keys = wbi_keys
+    backend._ready = True
+    backend._series_cache = {}
+    return backend
+
+
+def test_native_wbi_sign_vectors():
+    """WBI 签名与公开文档示例向量一致（mixin_key、w_rid、中文/空格编码）。"""
+    import hashlib
+
+    from bilibili_podcast.api_backends.native import get_mixin_key, sign_wbi_params
+
+    img_key = "7cd084941338484aae1ad9425b84077c"
+    sub_key = "4932caff0ff746eab6f01bf08b70ac45"
+    # 文档示例：按重排映射表打乱后截取前 32 位
+    assert get_mixin_key(img_key + sub_key) == "ea1db124af3c7062474693fa704f4ff8"
+    # 文档"计算签名"章节示例：foo/bar/zab + wts=1702204169 → w_rid
+    params = sign_wbi_params({"foo": "114", "bar": "514", "zab": 1919810}, img_key, sub_key, wts=1702204169)
+    assert params["wts"] == 1702204169
+    assert params["w_rid"] == "8f6f2b5b3d485fe1886cec6a0be8c5d4"
+    # 文档示例 3：中文与空格编码（字母大写、空格 %20）
+    params = sign_wbi_params({"foo": "one one four", "bar": "五一四", "baz": 1919810}, img_key, sub_key, wts=1702204169)
+    query = "bar=%E4%BA%94%E4%B8%80%E5%9B%9B&baz=1919810&foo=one%20one%20four&wts=1702204169"
+    assert params["w_rid"] == hashlib.md5((query + "ea1db124af3c7062474693fa704f4ff8").encode("utf-8")).hexdigest()
+
+
+def test_native_get_user_info_field_mapping():
+    """acc/info → {name, face, sign}；请求自动附加 wbi 签名。"""
+    url = "https://api.bilibili.com/x/space/wbi/acc/info"
+    session = _NativeFakeSession({url: {"code": 0, "data": {"name": "UP", "face": "face", "sign": "签名"}}})
+    backend = _native_backend(session)
+    assert asyncio.run(backend.get_user_info(1)) == {"name": "UP", "face": "face", "sign": "签名"}
+    _, params, headers = session.calls[0]
+    assert params["mid"] == 1
+    assert "w_rid" in params and "wts" in params  # wbi 签名已附加
+    assert headers["Referer"] == "https://www.bilibili.com"
+
+
+def test_native_get_user_videos_field_mapping():
+    """arc/search vlist → 统一 episode；兼容 description/intro、length/duration、created/pubtime。"""
+    url = "https://api.bilibili.com/x/space/wbi/arc/search"
+    vlist = [
+        {"bvid": "BV1", "title": "T1", "description": "D1", "length": 12, "pic": "P1", "created": 111},
+        {"bvid": "BV2", "title": "T2", "intro": "I2", "duration": 34, "cover": "P2", "pubtime": 222},
+    ]
+    session = _NativeFakeSession({url: {"code": 0, "data": {"list": {"vlist": vlist}}}})
+    backend = _native_backend(session)
+    eps = asyncio.run(backend.get_user_videos(1, 1, 30))
+    assert eps[0] == {
+        "bvid": "BV1",
+        "title": "T1",
+        "description": "D1",
+        "duration": 12,
+        "image": "P1",
+        "pubdate": 111,
+        "link": "https://www.bilibili.com/video/BV1",
+        "raw": vlist[0],
+    }
+    assert eps[1]["description"] == "I2"
+    assert eps[1]["duration"] == 34
+    assert eps[1]["pubdate"] == 222
+    _, params, _ = session.calls[0]
+    assert params["order"] == "pubdate"
+    assert params["pn"] == 1 and params["ps"] == 30
+
+
+def test_native_series_meta_mapping():
+    """series → x/series/series 的 data.meta；season → pgc result（up_info.uname）。"""
+    session = _NativeFakeSession({
+        "https://api.bilibili.com/x/series/series": {"code": 0, "data": {"meta": {"mid": 42, "name": "合集", "cover": "c", "intro": "i"}}},
+        "https://api.bilibili.com/pgc/view/web/season": {"code": 0, "result": {"title": "番剧", "cover": "cv", "evaluate": "e", "up_info": {"uname": "UP", "mid": 7}}},
+    })
+    backend = _native_backend(session)
+    assert asyncio.run(backend.get_series_meta(9, "series")) == {
+        "name": "合集", "face": "c", "sign": "i", "author": "", "uid": 42,
+    }
+    assert asyncio.run(backend.get_series_meta(9, "season")) == {
+        "name": "番剧", "face": "cv", "sign": "e", "author": "UP", "uid": 7,
+    }
+    with pytest.raises(UnsupportedError):
+        asyncio.run(backend.get_series_meta(9, "weird"))
+
+
+def test_native_series_videos_pagination():
+    """series/season 均一次拿全量再按 pn/ps 切片；缓存避免重复请求。"""
+    session = _NativeFakeSession({
+        "https://api.bilibili.com/x/series/series": {"code": 0, "data": {"meta": {"mid": 42, "total": 5}}},
+        "https://api.bilibili.com/x/series/archives": {
+            "code": 0,
+            "data": {"archives": [{"bvid": f"BV{i}", "title": f"T{i}", "duration": 10, "pic": "", "pubdate": i} for i in range(1, 6)]},
+        },
+        "https://api.bilibili.com/pgc/view/web/season": {
+            "code": 0,
+            "result": {"episodes": [{"bvid": f"BV{i}", "title": f"T{i}", "duration": 10, "cover": "", "pub_time": i} for i in range(1, 6)]},
+        },
+    })
+    backend = _native_backend(session)
+    # series 第 2 页 ps=2 → BV3/BV4（archives 全量 5 条再切片）
+    eps = asyncio.run(backend.get_series_videos(9, "series", pn=2, ps=2))
+    assert [ep["bvid"] for ep in eps] == ["BV3", "BV4"]
+    # 缓存生效：再次分页不再请求
+    eps = asyncio.run(backend.get_series_videos(9, "series", pn=1, ps=10))
+    assert [ep["bvid"] for ep in eps] == ["BV1", "BV2", "BV3", "BV4", "BV5"]
+    assert len(session.calls) == 2  # series 元数据 + archives 各一次
+    # season 第 3 页 ps=2 → BV5；pub_time → pubdate
+    eps = asyncio.run(backend.get_series_videos(9, "season", pn=3, ps=2))
+    assert [ep["bvid"] for ep in eps] == ["BV5"]
+    assert eps[0]["pubdate"] == 5
+    with pytest.raises(UnsupportedError):
+        asyncio.run(backend.get_series_videos(9, "weird", 1, 100))
+
+
+def test_native_get_video_owner():
+    """view 接口 → data.owner.mid；owner 缺失返回 None。"""
+    url = "https://api.bilibili.com/x/web-interface/view"
+    backend = _native_backend(_NativeFakeSession({url: {"code": 0, "data": {"owner": {"mid": 555}}}}))
+    assert asyncio.run(backend.get_video_owner("BV1")) == 555
+    backend = _native_backend(_NativeFakeSession({url: {"code": 0, "data": {}}}))
+    assert asyncio.run(backend.get_video_owner("BV1")) is None
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"code": -799, "message": "请求过于频繁，请稍后重试"}, RateLimitError),
+        ({"code": -412, "message": "请求被拦截"}, RateLimitError),
+        ({"code": 412, "message": "请求被拦截"}, RateLimitError),
+        ({"code": 403, "message": "权限不足"}, RateLimitError),
+        ({"code": -404, "message": "啥都木有"}, BackendError),
+        ({"code": 0, "data": {}}, None),
+    ],
+)
+def test_native_error_code_mapping(payload, expected):
+    """code!=0 统一转异常：-799/请求过于频繁、-412/412/403 → RateLimitError；其他 → BackendError。"""
+    url = "https://api.bilibili.com/x/space/wbi/acc/info"
+    backend = _native_backend(_NativeFakeSession({url: payload}))
+    if expected is None:
+        assert asyncio.run(backend.get_user_info(1)) == {"name": "", "face": "", "sign": ""}
+    else:
+        with pytest.raises(expected):
+            asyncio.run(backend.get_user_info(1))
+
+
+def test_native_network_error_wrapped():
+    """session.get 抛网络异常 → NetworkError。"""
+
+    class _BoomSession:
+        async def get(self, url, params=None, headers=None):
+            raise ConnectionError("connection refused")
+
+        async def close(self):
+            pass
+
+    backend = _native_backend(_BoomSession())
+    with pytest.raises(NetworkError, match="connection refused"):
+        asyncio.run(backend.get_user_info(1))
+
+
+def test_native_http_status_errors():
+    """HTTP 412 → RateLimitError（风控）；HTTP 500 → NetworkError。"""
+    backend = _native_backend(_NativeFakeSession({}, status_code=412))
+    with pytest.raises(RateLimitError):
+        asyncio.run(backend.get_user_info(1))
+    backend = _native_backend(_NativeFakeSession({}, status_code=500))
+    with pytest.raises(NetworkError):
+        asyncio.run(backend.get_user_info(1))
+
+
+def test_native_wbi_keys_from_nav_and_fallback():
+    """nav 的 img_url/sub_url 解析出 img_key/sub_key；nav 失败回退公开备用常量。"""
+    from bilibili_podcast.api_backends.native import NativeBackend, _FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY
+
+    nav = "https://api.bilibili.com/x/web-interface/nav"
+    acc = "https://api.bilibili.com/x/space/wbi/acc/info"
+    session = _NativeFakeSession({
+        nav: {"code": 0, "data": {"wbi_img": {"img_url": "https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png", "sub_url": "https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"}}},
+        acc: {"code": 0, "data": {"name": "UP"}},
+    })
+    backend = NativeBackend.__new__(NativeBackend)
+    backend._session = session
+    backend._wbi_keys = None
+    backend._ready = True
+    backend._series_cache = {}
+    assert asyncio.run(backend.get_user_info(1))["name"] == "UP"
+    assert backend._wbi_keys == ("7cd084941338484aae1ad9425b84077c", "4932caff0ff746eab6f01bf08b70ac45")
+    # nav 未返回有效 wbi_img（未注册 URL → 空 data）→ 回退备用常量
+    session2 = _NativeFakeSession({acc: {"code": 0, "data": {"name": "UP"}}})
+    backend2 = NativeBackend.__new__(NativeBackend)
+    backend2._session = session2
+    backend2._wbi_keys = None
+    backend2._ready = True
+    backend2._series_cache = {}
+    assert asyncio.run(backend2.get_user_info(1))["name"] == "UP"
+    assert backend2._wbi_keys == (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
+
+
+# ---------------------------------------------------------------- parse_backend_spec
+
+
+def test_parse_backend_spec():
+    from bilibili_podcast.api_backends import parse_backend_spec
+
+    assert parse_backend_spec("yutto, bilix ,yutto") == ["yutto", "bilix"]
+    assert parse_backend_spec("bilibili-api") == ["bilibili-api"]
+    assert parse_backend_spec(" , yutto , ") == ["yutto"]
+    with pytest.raises(ValueError, match="不能为空"):
+        parse_backend_spec("")
+    with pytest.raises(ValueError, match="不能为空"):
+        parse_backend_spec(" , , ")
+
+
+# ---------------------------------------------------------------- BackendChain 降级链
+
+
+class _ChainBackend:
+    """可配置抛错/记录 close 与调用的假后端，用于 BackendChain 测试。"""
+
+    def __init__(self, name, *, error=None, owner=42):
+        self.name = name
+        self.error = error
+        self.owner = owner
+        self.closed = False
+        self.meta_calls = 0
+
+    async def get_user_info(self, uid):
+        return {"name": self.name, "face": "", "sign": ""}
+
+    async def get_user_videos(self, uid, pn, ps):
+        return []
+
+    async def get_series_meta(self, sid, series_type):
+        self.meta_calls += 1
+        if self.error:
+            raise self.error
+        return {"name": self.name, "face": "", "sign": "", "author": self.name, "uid": 1}
+
+    async def get_series_videos(self, sid, series_type, pn, ps):
+        if self.error:
+            raise self.error
+        return []
+
+    async def get_video_owner(self, bvid):
+        if self.error:
+            raise self.error
+        return self.owner
+
+    async def close(self):
+        self.closed = True
+
+
+def _install_chain_factory(monkeypatch, backends):
+    """替换包的 _create_single_backend 为按名称返回假后端的工厂。"""
+    from bilibili_podcast import api_backends as pkg
+
+    async def factory(name, credential):
+        for b in backends:
+            if b.name == name:
+                return b
+        raise BackendError(f"未知后端：{name}")
+
+    monkeypatch.setattr(pkg, "_create_single_backend", factory)
+    return backends
+
+
+def test_chain_switches_on_rate_limit(monkeypatch):
+    """第一个后端 RateLimitError → 切换到第二个成功；成功后端保持不重置。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=RateLimitError())
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    meta = asyncio.run(chain.get_series_meta(1, "series"))
+    assert meta["name"] == "second"
+    assert first.meta_calls == 1  # 每次调用只试一次当前后端
+    assert second.meta_calls == 1
+
+    # 切换持久：第二次调用仍走 second，first 不再被尝试
+    asyncio.run(chain.get_series_meta(1, "series"))
+    assert first.meta_calls == 1
+    assert second.meta_calls == 2
+
+    asyncio.run(chain.close())
+    assert first.closed and second.closed
+
+
+def test_chain_switches_on_unsupported_error(monkeypatch):
+    """UnsupportedError 同样触发降级切换。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=UnsupportedError("不支持"))
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    assert asyncio.run(chain.get_video_owner("BV1")) == 42
+
+
+def test_chain_all_fail_raises_last(monkeypatch):
+    """全部后端失败：抛最后一个异常（保留原始信息）。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=RateLimitError("第一限流"))
+    second = _ChainBackend("second", error=NetworkError("第二网络错误"))
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    with pytest.raises(NetworkError, match="第二网络错误"):
+        asyncio.run(chain.get_series_meta(1, "series"))
+
+
+def test_chain_construction_failure_skips(monkeypatch):
+    """构造失败（BackendError）记录 warning 并跳到下一个后端。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    second = _ChainBackend("second")
+
+    async def factory(name, credential):
+        if name == "first":
+            raise BackendError("first 后端依赖未安装")
+        return second
+
+    from bilibili_podcast import api_backends as pkg
+
+    monkeypatch.setattr(pkg, "_create_single_backend", factory)
+    chain = BackendChain(["first", "second"])
+
+    meta = asyncio.run(chain.get_series_meta(1, "series"))
+    assert meta["name"] == "second"
+    # first 构造失败未记录进已构造列表，close 只关闭 second
+    asyncio.run(chain.close())
+    assert second.closed
+
+
+def test_chain_all_construction_fail_raises(monkeypatch):
+    """所有后端构造失败：抛最后一个构造异常。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    async def factory(name, credential):
+        raise BackendError(f"{name} 不可用")
+
+    from bilibili_podcast import api_backends as pkg
+
+    monkeypatch.setattr(pkg, "_create_single_backend", factory)
+    chain = BackendChain(["first", "second"])
+
+    with pytest.raises(BackendError, match="second 不可用"):
+        asyncio.run(chain.get_user_info(1))
+
+
+def test_chain_non_switchable_error_raises(monkeypatch):
+    """非可切换异常（如 RuntimeError）直接上抛，不触发降级。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=RuntimeError("boom"))
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(chain.get_series_meta(1, "series"))
+    assert second.meta_calls == 0
+
+
+def test_chain_success_keeps_active_index(monkeypatch):
+    """首个后端成功时保持 active_index=0，不重置、不重试。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first")
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    assert asyncio.run(chain.get_series_meta(1, "series"))["name"] == "first"
+    assert asyncio.run(chain.get_series_meta(1, "series"))["name"] == "first"
+    assert first.meta_calls == 2
+    assert second.meta_calls == 0
+
+
+def test_chain_empty_names_raises():
+    from bilibili_podcast.api_backends import BackendChain
+
+    with pytest.raises(ValueError, match="至少需要一个后端名称"):
+        BackendChain([])
+
+
+# ---------------------------------------------------------------- resolver / server 迁移
+
+
+class _ResolverFakeBackend:
+    """resolver 测试用假后端：固定返回并记录调用。"""
+
+    def __init__(self):
+        self.closed = False
+        self.calls = []
+
+    async def get_user_info(self, uid):
+        self.calls.append(("user_info", uid))
+        return {"name": "UP1", "face": "face-url", "sign": "签名"}
+
+    async def get_user_videos(self, uid, pn, ps):
+        self.calls.append(("user_videos", uid, pn, ps))
+        return [{"bvid": "BV1", "title": "T1", "pubdate": 111, "duration": 65}]
+
+    async def get_series_meta(self, sid, series_type):
+        self.calls.append(("series_meta", sid, series_type))
+        return {"name": "合集名", "face": "cover", "sign": "描述", "author": "UP2", "uid": 99}
+
+    async def get_series_videos(self, sid, series_type, pn, ps):
+        self.calls.append(("series_videos", sid, series_type, pn, ps))
+        return [{"bvid": "BV2", "title": "T2", "pubdate": 222, "duration": 100}]
+
+    async def get_video_owner(self, bvid):
+        self.calls.append(("video_owner", bvid))
+        return 123
+
+    async def close(self):
+        self.closed = True
+
+
+def test_resolver_space_mapping():
+    """space 解析：user_info + user_videos 字段映射（created=pubdate, length=duration）。"""
+    from bilibili_podcast.web import resolver
+
+    backend = _ResolverFakeBackend()
+    result = asyncio.run(resolver.resolve_url("https://space.bilibili.com/123456", backend))
+
+    assert result["author"] == "UP1"
+    assert result["title"] == "UP1"
+    assert result["cover_art"] == "face-url"
+    assert result["description"] == "签名"
+    assert result["source"] == {"type": "space", "uid": 123456, "space_url": "https://space.bilibili.com/123456", "sid": None}
+    assert result["videos"] == [{"bvid": "BV1", "title": "T1", "created": 111, "length": 65}]
+    assert backend.closed is False  # 传入后端由调用方负责生命周期
+
+
+def test_resolver_season_mapping():
+    """season 解析：统一 meta 格式映射到旧输出字段（title/author/cover_art/description/uid）。"""
+    from bilibili_podcast.web import resolver
+
+    backend = _ResolverFakeBackend()
+    result = asyncio.run(resolver.resolve_url("https://www.bilibili.com/bangumi/play/ss123", backend))
+
+    assert result["title"] == "合集名"
+    assert result["author"] == "UP2"
+    assert result["cover_art"] == "cover"
+    assert result["description"] == "描述"
+    assert result["source"]["uid"] == 99
+    assert result["source"]["type"] == "season"
+    assert result["source"]["sid"] == 123
+    assert result["videos"] == [{"bvid": "BV2", "title": "T2", "created": 222, "length": 100}]
+    assert ("series_videos", 123, "season", 1, 10) in backend.calls
+
+
+def test_resolver_series_mapping():
+    """series 解析：同样的字段映射，source.type 为 series。"""
+    from bilibili_podcast.web import resolver
+
+    backend = _ResolverFakeBackend()
+    result = asyncio.run(resolver.resolve_url("https://www.bilibili.com/series/123", backend))
+
+    assert result["author"] == "UP2"
+    assert result["source"]["type"] == "series"
+    assert ("series_meta", 123, "series") in backend.calls
+
+
+def test_resolver_video_mapping():
+    """视频解析：get_video_owner 拿到 mid 后转 space 解析。"""
+    from bilibili_podcast.web import resolver
+
+    backend = _ResolverFakeBackend()
+    result = asyncio.run(resolver.resolve_url("https://www.bilibili.com/video/BV1xx", backend))
+
+    assert ("video_owner", "BV1xx") in backend.calls
+    assert result["author"] == "UP1"
+    assert result["source"]["uid"] == 123
+
+
+def test_resolver_video_no_owner_returns_error():
+    """get_video_owner 返回 None 时按现有错误语义返回 error dict。"""
+    from bilibili_podcast.web import resolver
+
+    backend = _ResolverFakeBackend()
+
+    async def no_owner(bvid):
+        return None
+
+    backend.get_video_owner = no_owner
+    result = asyncio.run(resolver.resolve_url("https://www.bilibili.com/video/BV1xx", backend))
+    assert "无法从视频 BV1xx 提取 UP 主信息" in result["error"]
+
+
+def test_resolver_default_backend_created_and_closed(monkeypatch):
+    """backend 为 None 时内部创建默认 bilibili-api 后端并在结束 finally close。"""
+    import importlib
+
+    mod = importlib.import_module("bilibili_podcast.web.resolver")
+    backend = _ResolverFakeBackend()
+
+    async def fake_create(spec, credential):
+        assert spec == "bilibili-api"
+        return backend
+
+    monkeypatch.setattr(mod, "create_backend", fake_create)
+    result = asyncio.run(mod.resolve_url("https://space.bilibili.com/123456"))
+    assert result["author"] == "UP1"
+    assert backend.closed is True
+
+
+def test_server_fetch_up_face_url(monkeypatch):
+    """server._fetch_up_face_url 走 api_backends 并 finally close。"""
+    from bilibili_podcast.web import server
+
+    class _Fake:
+        def __init__(self):
+            self.closed = False
+
+        async def get_user_info(self, uid):
+            return {"name": "x", "face": "FACE-URL", "sign": ""}
+
+        async def close(self):
+            self.closed = True
+
+    fake = _Fake()
+
+    async def fake_create(spec, credential):
+        assert spec == "bilibili-api"
+        return fake
+
+    from bilibili_podcast import api_backends as pkg
+
+    monkeypatch.setattr(pkg, "create_backend", fake_create)
+    assert asyncio.run(server._fetch_up_face_url(123)) == "FACE-URL"
+    assert fake.closed is True
+    assert asyncio.run(server._fetch_up_face_url(0)) is None
 
 
 # ---------------------------------------------------------------- 限流识别
@@ -667,4 +1301,4 @@ source:
 
 
 def test_backend_names_constant():
-    assert BACKEND_NAMES == ("bilibili-api", "bilix", "yutto")
+    assert BACKEND_NAMES == ("bilibili-api", "bilix", "yutto", "native")
