@@ -1,7 +1,7 @@
 """Bilibili URL resolver — parse B站 URLs into structured draft configs.
 
 Parses space URLs, season/series URLs, or plain UIDs/sids using the
-api_backends 抽象层（默认 bilibili-api 后端，可传入自定义后端）and returns
+api_backends 抽象层（默认 native 后端，可传入自定义后端）and returns
 a structured draft dict. Does NOT write to DB or any files — pure read-only
 resolution.
 """
@@ -28,7 +28,7 @@ _SID_RE = re.compile(r"^\d+$")
 async def resolve_url(url: str, backend: BilibiliApiBackend | None = None) -> dict:
     """Parse a Bilibili URL/UID/sid and return structured draft info.
 
-    backend 为 None 时内部创建默认后端（bilibili-api）并在结束时 close；
+    backend 为 None 时内部创建默认后端（native）并在结束时 close；
     由调用方传入 backend 时其生命周期由调用方负责（不 close）。
 
     Returns dict with keys:
@@ -45,7 +45,7 @@ async def resolve_url(url: str, backend: BilibiliApiBackend | None = None) -> di
 
     owns_backend = backend is None
     if owns_backend:
-        backend = await create_backend("bilibili-api", None)
+        backend = await create_backend("native", None)
     try:
         # Determine source type from URL pattern
         m = _SEASON_RE.match(url)

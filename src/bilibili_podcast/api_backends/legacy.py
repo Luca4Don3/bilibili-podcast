@@ -1,4 +1,7 @@
-"""legacy 后端：基于 bilibili-api 的实现（延迟 import）。
+"""legacy 后端：基于 bilibili-api 的实现（延迟 import，已弃用）。
+
+bilibili-api 已收到 B 站侵权告知并永久关停，且不再随本包主依赖安装；
+本后端仅保留供迁移期使用，如需启用需手动安装 bilibili-api。
 
 行为与旧 sync.py 中的直接调用完全一致：
 - get_user_info 失败时抛异常，由 sync 层捕获降级为配置默认值；

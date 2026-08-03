@@ -1210,7 +1210,7 @@ def test_resolver_default_backend_created_and_closed(monkeypatch):
     backend = _ResolverFakeBackend()
 
     async def fake_create(spec, credential):
-        assert spec == "bilibili-api"
+        assert spec == "native"
         return backend
 
     monkeypatch.setattr(mod, "create_backend", fake_create)
@@ -1236,7 +1236,7 @@ def test_server_fetch_up_face_url(monkeypatch):
     fake = _Fake()
 
     async def fake_create(spec, credential):
-        assert spec == "bilibili-api"
+        assert spec == "native"
         return fake
 
     from bilibili_podcast import api_backends as pkg
@@ -1263,7 +1263,7 @@ def test_rate_limit_error_detected():
 
 def test_series_config_api_backend_default():
     config = _config()
-    assert config.api_backend == "bilibili-api"
+    assert config.api_backend == "native"
 
 
 def test_series_config_from_yaml_valid_api_backend(tmp_path: Path):
