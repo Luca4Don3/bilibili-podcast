@@ -30,6 +30,8 @@
 - [部署架构](#部署架构)
 - [环境变量](#环境变量)
 - [依赖安装](#依赖安装)
+- [版本发布与升级](#版本发布与升级)
+- [法律声明](#法律声明)
 
 ## 快速开始
 
@@ -894,6 +896,68 @@ pip-audit
 
 ---
 
+## 版本发布与升级
+
+正式版本通过 GitHub Release 提供 source artifact、wheel、sdist、`SHA256SUMS`、CycloneDX SBOM 和构建证明。部署仍使用现有的 immutable release 链，不包含自动在线升级器。
+
+固定升级顺序如下；`<release_sha>`、`<artifact_sha256>`、`<install_root>`、`<config_root>` 和 `<plan_id>` 必须替换为本次发布的实际值：
+
+```bash
+# 1. 下载 Release assets 后，先在离线目录校验全部文件
+sha256sum --check SHA256SUMS
+tar -xzf bilibili-podcast-wheelhouse-v1.0.0.tar.gz
+(cd wheelhouse && sha256sum --check ../wheelhouse.SHA256SUMS)
+
+# 2. 准备 immutable source release 与独立 venv，不切换当前版本
+scripts/deploy-release.sh --apply prepare \
+  --root <install_root> \
+  --commit <release_sha> \
+  --artifact bilibili-podcast-source-v1.0.0.tar.gz \
+  --artifact-sha256 <artifact_sha256> \
+  --wheelhouse wheelhouse \
+  --wheel-manifest wheelhouse.SHA256SUMS \
+  --python python3
+
+# 3. 使用候选 venv 规划、应用并完成配置升级；当前 schema 版本仍为 4
+<install_root>/venvs/<release_sha>/bin/bilibili-podcast-config \
+  --root <config_root> upgrade --prepare
+<install_root>/venvs/<release_sha>/bin/bilibili-podcast-config \
+  --root <config_root> upgrade --apply --plan-id <plan_id>
+<install_root>/venvs/<release_sha>/bin/bilibili-podcast-config \
+  --root <config_root> finalize --apply --plan-id <plan_id>
+
+# 4. 原子切换 release symlink；脚本不会 reload 或 restart 服务
+scripts/deploy-release.sh --apply activate \
+  --root <install_root> \
+  --commit <release_sha> \
+  --config-root <config_root> \
+  --python python3
+
+# 5. 在独立变更窗口中显式重启服务，并按项目运维门禁验证
+systemctl restart <service_unit>
+```
+
+若配置升级在 finalize 前失败，使用同一候选 CLI 与 plan 回滚；若激活后的应用验证失败，将 `current` / `current-venv` 原子切回上一套已校验 release/venv，再独立重启服务。任何回滚都必须先确认目标、影响与现有备份：
+
+```bash
+<install_root>/venvs/<release_sha>/bin/bilibili-podcast-config \
+  --root <config_root> rollback --apply --plan-id <plan_id>
+```
+
+只有未来修改 TOML、SQLite schema、文件布局或系统状态契约时，才新增连续迁移步骤并提高 `LATEST_VERSION`；单纯代码、依赖或发布流程变更不得虚增 schema 版本。
+
+---
+
+## 法律声明
+
+Copyright (C) 2026 bilibili-podcast contributors.
+
+本项目是依据 GNU General Public License v3.0 发布的派生作品；相对来源基线的主要修改包括项目重命名、统一配置与连续迁移、SQLite 状态管理、安全加固、内建 RSS 发布和 immutable release 部署。
+
+本项目为社区维护的非官方项目，与哔哩哔哩及其关联公司不存在隶属、授权、认可或赞助关系。“哔哩哔哩”、Bilibili 及相关标识可能是其权利人的商标。本项目不授予任何商标权；用户获取、转换、存储和分发内容时，必须自行确认授权并遵守适用法律、平台条款及内容权利人的版权要求。
+
+---
+
 ## License
 
 GNU General Public License v3.0
@@ -904,7 +968,7 @@ GNU General Public License v3.0
 
 本项目站在许多优秀开源项目的肩膀上，特别感谢：
 
-- bilibili-podcast：为 Bilibili 内容的播客化工作提供了重要参考与基础。
+- Bilipod：感谢原作者及贡献者以 GPLv3 提供基础实现；本仓库来源基线为提交 `d16ce56604d1fbe3b0504ce2db964b0e29ffd9f0`，其后进行了项目重命名、配置迁移、安全、发布与部署方面的派生修改。
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp)：可靠的媒体下载与格式处理能力。
 - [bilibili-api-python](https://github.com/Nemo2011/bilibili-api)：Bilibili API 的 Python 封装。
 - [FeedGenerator](https://github.com/lkiesow/python-feedgen)：RSS/Atom feed 生成能力。

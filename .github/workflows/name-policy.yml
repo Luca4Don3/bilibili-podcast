@@ -1,0 +1,34 @@
+name: Name policy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan pull request commits
+        if: github.event_name == 'pull_request'
+        run: >-
+          python scripts/check_name_policy.py commits
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"
+      - name: Scan pushed commits
+        if: github.event_name == 'push'
+        run: >-
+          python scripts/check_name_policy.py commits
+          --base "${{ github.event.before }}"
+          --head "${{ github.sha }}"
+      - name: Scan ordinary refs and tag messages
+        run: python scripts/check_name_policy.py refs

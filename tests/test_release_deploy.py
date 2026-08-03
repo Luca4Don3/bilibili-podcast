@@ -65,12 +65,13 @@ def _prepare_command(
     python: Path,
     *,
     apply: bool,
+    commit: str = COMMIT,
 ) -> list[str]:
     command = [str(SCRIPT)]
     if apply:
         command.append("--apply")
     command.extend([
-        "prepare", "--root", str(root), "--commit", COMMIT,
+        "prepare", "--root", str(root), "--commit", commit,
         "--artifact", str(artifact), "--artifact-sha256", _sha256(artifact),
         "--wheelhouse", str(wheelhouse),
         "--wheel-manifest", str(manifest),
@@ -135,6 +136,46 @@ def test_release_prepare_rejects_checksum_mismatch_without_writes(tmp_path: Path
     assert result.returncode == 3
     assert "SHA-256 mismatch" in result.stderr
     assert not root.exists()
+
+
+def test_activation_can_roll_back_to_a_prepared_release(tmp_path: Path) -> None:
+    artifact, wheelhouse, manifest, python = _inputs(tmp_path)
+    root = tmp_path / "install"
+    config_root = tmp_path / "config"
+    config_root.mkdir()
+    previous = "a" * 40
+    candidate = "b" * 40
+
+    for commit in (previous, candidate):
+        subprocess.run(
+            _prepare_command(
+                root,
+                artifact,
+                wheelhouse,
+                manifest,
+                python,
+                apply=True,
+                commit=commit,
+            ),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    for commit in (previous, candidate, previous):
+        subprocess.run(
+            [
+                str(SCRIPT), "--apply", "activate", "--root", str(root),
+                "--commit", commit, "--config-root", str(config_root),
+                "--python", str(python),
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    assert os.readlink(root / "current") == str(root / "releases" / previous)
+    assert os.readlink(root / "current-venv") == str(root / "venvs" / previous)
 
 
 def test_release_dry_run_rejects_unsafe_archive_without_writes(tmp_path: Path) -> None:
