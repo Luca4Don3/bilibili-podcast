@@ -30,8 +30,30 @@ _DIRECTORY_FLAGS = (
 _OPEN_LOCK = threading.RLock()
 
 
+def _expand_root_alias(path: Path) -> Path:
+    """展开根目录下的系统符号链接前缀（macOS 的 /var、/tmp、/etc → /private/...）。
+
+    仅跟随根级稳定系统别名（由系统而非用户可写位置控制）；路径其余组件仍由
+    open_directory 逐级拒绝符号链接，安全语义不变。Linux 上这些目录不是符号
+    链接，此函数不改变任何路径。
+    """
+    text = str(path)
+    if not text.startswith("/"):
+        return path
+    first_end = text.find("/", 1)
+    first = text if first_end < 0 else text[:first_end]
+    try:
+        if os.path.islink(first) and os.path.isdir(first):
+            resolved = os.path.realpath(first)
+            if resolved != first:
+                return Path(resolved + text[len(first):])
+    except OSError:
+        pass
+    return path
+
+
 def _path_parts(path: Path) -> tuple[str, tuple[str, ...]]:
-    expanded = path.expanduser()
+    expanded = _expand_root_alias(path.expanduser())
     if expanded.is_absolute():
         anchor = expanded.anchor or os.sep
         parts = expanded.parts[1:]
