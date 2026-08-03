@@ -224,7 +224,7 @@ class SeriesConfig:
     filters: Mapping[str, Any] | dict[str, Any]
     paid_preview: Mapping[str, Any] | dict[str, Any]
     keep_last: int
-    api_backend: str = "bilibili-api"
+    api_backend: str = "native"
 
     @property
     def uid(self) -> int:
@@ -273,7 +273,7 @@ class SeriesConfig:
             raise ValueError(f"unknown series field: {unknown_top[0]}")
         from ..api_backends import BACKEND_NAMES, parse_backend_spec
 
-        api_backend = data.get("api_backend", "bilibili-api")
+        api_backend = data.get("api_backend", "native")
         if isinstance(api_backend, str):
             try:
                 backend_names = parse_backend_spec(api_backend)

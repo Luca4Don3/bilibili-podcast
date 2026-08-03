@@ -7,7 +7,6 @@ requires-python = ">=3.13,<3.15"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 dependencies = [
-  "bilibili-api-python @ git+https://github.com/Nemo2011/bilibili-api.git@87110fe2db7af77425057e163f064700087a3c35",
   "feedgen==1.0.0",
   "PyYAML>=6.0",
   "requests>=2.27.1",

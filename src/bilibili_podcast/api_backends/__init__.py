@@ -40,7 +40,10 @@ async def _create_single_backend(name: str, credential: BackendCredential | None
         try:
             return LegacyBackend(credential)
         except ImportError as exc:
-            raise BackendError("legacy 后端（bilibili-api 依赖）未安装或已损坏") from exc
+            raise BackendError(
+                "legacy 后端依赖（bilibili-api）未安装；该库已停止维护，"
+                "如需使用请手动安装（不推荐），或改用 native/yutto 后端"
+            ) from exc
     if name == "bilix":
         try:
             import bilix  # noqa: F401  提前验证依赖是否可用

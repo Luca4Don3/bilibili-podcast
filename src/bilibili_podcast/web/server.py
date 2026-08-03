@@ -206,7 +206,7 @@ async def _fetch_up_face_url(uid: int) -> str | None:
         return None
     from ..api_backends import create_backend
 
-    backend = await create_backend("bilibili-api", None)
+    backend = await create_backend("native", None)
     try:
         info = await backend.get_user_info(uid)
         return info.get("face")

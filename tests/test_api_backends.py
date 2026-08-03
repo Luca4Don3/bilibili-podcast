@@ -259,6 +259,7 @@ def test_create_backend_missing_dependency(name, module, monkeypatch):
 
 def test_create_backend_legacy_works(monkeypatch):
     """legacy 后端在依赖可用时正常构造（monkeypatch 假 bilibili_api 顶层模块），返回 BackendChain。"""
+    pytest.importorskip("bilibili_api")
     import bilibili_api
 
     monkeypatch.setattr(bilibili_api, "request_settings", types.SimpleNamespace(set=lambda *a, **k: None))
@@ -295,6 +296,7 @@ def test_create_backend_comma_spec_returns_chain():
 
 def test_legacy_backend_field_mapping(monkeypatch):
     """legacy 后端：替换 bilibili_api 底层对象，验证统一格式字段映射。"""
+    pytest.importorskip("bilibili_api")
     import bilibili_api
 
     from bilibili_podcast.api_backends.legacy import LegacyBackend
@@ -1203,14 +1205,14 @@ def test_resolver_video_no_owner_returns_error():
 
 
 def test_resolver_default_backend_created_and_closed(monkeypatch):
-    """backend 为 None 时内部创建默认 bilibili-api 后端并在结束 finally close。"""
+    """backend 为 None 时内部创建默认 native 后端并在结束 finally close。"""
     import importlib
 
     mod = importlib.import_module("bilibili_podcast.web.resolver")
     backend = _ResolverFakeBackend()
 
     async def fake_create(spec, credential):
-        assert spec == "bilibili-api"
+        assert spec == "native"
         return backend
 
     monkeypatch.setattr(mod, "create_backend", fake_create)
@@ -1236,7 +1238,7 @@ def test_server_fetch_up_face_url(monkeypatch):
     fake = _Fake()
 
     async def fake_create(spec, credential):
-        assert spec == "bilibili-api"
+        assert spec == "native"
         return fake
 
     from bilibili_podcast import api_backends as pkg
@@ -1263,7 +1265,7 @@ def test_rate_limit_error_detected():
 
 def test_series_config_api_backend_default():
     config = _config()
-    assert config.api_backend == "bilibili-api"
+    assert config.api_backend == "native"
 
 
 def test_series_config_from_yaml_valid_api_backend(tmp_path: Path):
