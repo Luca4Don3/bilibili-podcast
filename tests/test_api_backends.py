@@ -1477,3 +1477,78 @@ def test_legacy_season_duration_ms_to_seconds_and_series_unchanged():
     series_item = {"bvid": "BV2", "title": "U", "duration": 1203, "pic": "p", "pubdate": 2}
     assert _episode_from_archives_item(series_item, season=False)["duration"] == 1203
     assert _episode_from_archives_item(series_item)["duration"] == 1203  # 默认非 season
+
+
+class _RetryFakeResp:
+    def __init__(self, status=200, payload=None):
+        self.status_code = status
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _RetrySession:
+    def __init__(self, failures_before_success=0, fail_status=None, always_fail=False):
+        self.calls = 0
+        self.failures_before_success = failures_before_success
+        self.fail_status = fail_status
+        self.always_fail = always_fail
+
+    async def get(self, *args, **kwargs):
+        self.calls += 1
+        if self.always_fail:
+            raise TimeoutError("network down")
+        if self.calls <= self.failures_before_success:
+            if self.fail_status:
+                return _RetryFakeResp(status=self.fail_status)
+            raise ConnectionError("connection reset")
+        return _RetryFakeResp(payload={"code": 0, "data": {}})
+
+
+def _retry_backend(session):
+    from bilibili_podcast.api_backends.native import NativeBackend
+
+    backend = NativeBackend.__new__(NativeBackend)
+    backend._session = session
+    backend._ready = True
+    backend._wbi_keys = ("k", "s")
+    return backend
+
+
+def test_native_network_error_retries_then_succeeds():
+    from bilibili_podcast.api_backends import native as m
+
+    session = _RetrySession(failures_before_success=1)
+    backend = _retry_backend(session)
+    result = asyncio.run(backend._request("/x/t", {}))
+    assert result == {"code": 0, "data": {}}
+    assert session.calls == 2  # 1 次失败 + 1 次成功
+
+
+def test_native_5xx_retries_then_succeeds():
+    session = _RetrySession(failures_before_success=1, fail_status=502)
+    backend = _retry_backend(session)
+    result = asyncio.run(backend._request("/x/t", {}))
+    assert result == {"code": 0, "data": {}}
+    assert session.calls == 2
+
+
+def test_native_persistent_network_error_raises_after_retries():
+    from bilibili_podcast.api_backends.base import NetworkError
+
+    session = _RetrySession(always_fail=True)
+    backend = _retry_backend(session)
+    with pytest.raises(NetworkError):
+        asyncio.run(backend._request("/x/t", {}))
+    assert session.calls == 3  # 初始 + 2 次退避重试
+
+
+def test_native_rate_limit_403_not_retried():
+    from bilibili_podcast.api_backends.base import RateLimitError
+
+    session = _RetrySession(failures_before_success=5, fail_status=403)
+    backend = _retry_backend(session)
+    with pytest.raises(RateLimitError):
+        asyncio.run(backend._request("/x/t", {}))
+    assert session.calls == 1  # 风控不重试

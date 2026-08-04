@@ -1100,19 +1100,23 @@ def cmd_api_backends_check(args: argparse.Namespace) -> None:
     db_path = _get_db(args) if args.series else None
 
     # 1. 确定待检查的后端链（parse_backend_spec 校验逗号分隔与空值）
-    if args.series:
+    if getattr(args, "all", False):
+        # --all：巡检全部可用后端（多重兼容体检），不依赖任何配置
+        names = list(BACKEND_NAMES)
+    else:
+        if args.series:
+            try:
+                spec = _api_backend_spec_for_series(db_path, args.series)
+            except ValueError as exc:
+                print(f"❌ {exc}")
+                sys.exit(EXIT_VALIDATION)
+        else:
+            spec = "native"
         try:
-            spec = _api_backend_spec_for_series(db_path, args.series)
+            names = parse_backend_spec(spec)
         except ValueError as exc:
             print(f"❌ {exc}")
             sys.exit(EXIT_VALIDATION)
-    else:
-        spec = "native"
-    try:
-        names = parse_backend_spec(spec)
-    except ValueError as exc:
-        print(f"❌ {exc}")
-        sys.exit(EXIT_VALIDATION)
     invalid = [name for name in names if name not in BACKEND_NAMES]
     if invalid:
         print(f"❌ 未知的 API 后端名称：{'、'.join(invalid)}（可选：{'、'.join(BACKEND_NAMES)}）")
@@ -1135,7 +1139,10 @@ def cmd_api_backends_check(args: argparse.Namespace) -> None:
         except (OSError, ValueError) as exc:
             print(f"⚠️ cookie 文件不可用，将匿名检查/探测: {exc}")
 
-    title = f"（系列 {args.series}）" if args.series else "（全局默认）"
+    if getattr(args, "all", False):
+        title = "（全部后端巡检）"
+    else:
+        title = f"（系列 {args.series}）" if args.series else "（全局默认）"
     print(f"🔍 检查后端链: {' -> '.join(names)} {title}")
 
     async def _run() -> None:
@@ -2893,6 +2900,7 @@ def build_parser() -> argparse.ArgumentParser:
     api_sub = p_api.add_subparsers(dest="api_backends_sub", required=True)
     p_ab_check = api_sub.add_parser("check", help="检查后端链（缺省为全局默认链 native；--probe 发起真实探测）")
     p_ab_check.add_argument("series", nargs="?", help="系列标识（缺省检查全局默认链 native）")
+    p_ab_check.add_argument("--all", action="store_true", help="巡检全部可用后端（多重兼容体检，不依赖配置）")
     p_ab_check.add_argument("--probe", action="store_true", help="对链发起一次真实探测请求（公开示例视频 BV1GJ411x7h7）")
     p_ab_check.add_argument("--cookie-file", help="Netscape cookie 文件路径（可选，匿名探测则省略）")
     p_ab_check.set_defaults(handler=cmd_api_backends_check)

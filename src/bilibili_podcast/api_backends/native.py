@@ -42,6 +42,7 @@ WBI 签名实现来源：bilibili-API-collect 文档 docs/misc/sign/wbi.md
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import logging
 import random
@@ -58,6 +59,9 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("bilibili_podcast.api_backends.native")
 
 _BASE_URL = "https://api.bilibili.com"
+# 网络类临时错误（连接失败/超时/5xx）的最大重试次数与退避间隔（秒）
+_MAX_NETWORK_RETRIES = 2
+_RETRY_BACKOFF_SECONDS = (1.0, 2.0)
 # 会话前置页面：首次请求前访问一次 space 主页作为指纹补充手段（本地已注入
 # buvid3/buvid4/b_nut，页面访问用于更新 b_nut、下发 __at_once 等额外 cookie），
 # 避免全新会话触发 -352 风控
@@ -327,16 +331,32 @@ class NativeBackend:
             img_key, sub_key = await self._get_wbi_keys()
             sign_wbi_params(request_params, img_key, sub_key)
         url = f"{_BASE_URL}{path}"
-        try:
-            response = await self._session.get(url, params=request_params, headers=_HEADERS)
-        except Exception as exc:
-            # curl_cffi 的网络/超时异常统一包装（连接失败、超时、HTTP 状态错误）
-            raise NetworkError(f"native 请求 B 站接口失败（{path}）：{exc}") from exc
-        status = getattr(response, "status_code", None)
-        if status is not None and status >= 400:
-            if status in (403, 412):
-                raise RateLimitError(f"native 接口触发风控（{path}，HTTP {status}）")
-            raise NetworkError(f"native 请求 B 站接口返回 HTTP {status}（{path}）")
+        response = None
+        for attempt in range(_MAX_NETWORK_RETRIES + 1):
+            try:
+                response = await self._session.get(url, params=request_params, headers=_HEADERS)
+            except Exception as exc:
+                # 连接/超时等网络类临时错误：退避重试；限流与风控在响应层处理，不在此重试
+                last_exc = exc
+                if attempt < _MAX_NETWORK_RETRIES:
+                    LOGGER.debug("native 网络请求失败，退避重试 path=%s attempt=%s error=%s", path, attempt + 1, exc)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                    continue
+                raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
+            status = getattr(response, "status_code", None)
+            if status is not None and status >= 400:
+                if status in (403, 412):
+                    raise RateLimitError(f"native 接口触发风控（{path}，HTTP {status}）")
+                if status >= 500 and attempt < _MAX_NETWORK_RETRIES:
+                    # 服务端 5xx：短退避后重试
+                    LOGGER.debug("native 接口 5xx，退避重试 path=%s attempt=%s", path, attempt + 1)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                    continue
+                raise NetworkError(f"native 请求 B 站接口返回 HTTP {status}（{path}）")
+            break
+        else:
+            # for-else 不会执行（循环内已 raise）；此处仅为类型检查器保留
+            raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
         try:
             data = response.json()
         except Exception as exc:
