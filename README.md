@@ -534,9 +534,42 @@ bilibili-podcast-admin api-backends check my-series
 # 验证 WBI 签名等真实链路可用；探测失败不中断其他后端
 bilibili-podcast-admin api-backends check my-series --probe
 
+# --all：巡检全部可用后端（多重兼容体检，不依赖任何配置）
+bilibili-podcast-admin api-backends check --all --probe
+
 # 可携带 cookie 文件（可选；缺省匿名探测，不会输出任何凭证）
 bilibili-podcast-admin api-backends check my-series --probe --cookie-file /path/to/cookies.txt
 ```
+
+#### 多后端兼容架构（防单点依赖/防下架）
+
+B 站 API 生态存在被官方投诉下架的风险（本项目原依赖的 bilibili-api 即因此永久关停）。
+为避免重蹈覆辙，本项目采用**自研为主、多后端共存、自动降级**的兼容架构：
+
+```
+┌────────────────────────────────────────────────────────┐
+│                 api_backend 配置（逗号分隔降级链）          │
+│           例："native,yutto,bilix"                        │
+└──────────────┬──────────────────────┬───────────────────┘
+               ▼                      ▼
+      ┌─── 自研实现（本地） ───┐   ┌─ 第三方库（可选安装）─┐
+      │ native：WBI 签名 +    │   │ yutto（GPL-3.0）     │
+      │ 公开接口直连，零依赖   │   │ bilix（Apache-2.0）   │
+      └──────────────────────┘   └──────────────────────┘
+               │                     （任何第三方库被下架/封禁，
+               ▼                     移除该后端即可，自研不受影响）
+      BackendChain：限流/风控/网络错误/不支持/缺依赖 → 自动切换下一个
+```
+
+- **自研 native 是默认后端**：仅依赖项目已有 curl_cffi，不依赖任何第三方 B 站库，
+  不存在“上游被下架”的问题；第三方库被下架时移除对应名称即可，无需改代码。
+- **第三方库仅作备份**：yutto/bilix 通过 `[api-backends]` extras 可选安装，
+  与自研组成降级链；单一库被封禁（-352/-799 频发）时自动切换。
+- **多重兼容体检**：`api-backends check --all --probe` 一次巡检全部后端，
+  快速定位被封禁/失效的后端并调整链顺序。
+- **接口被封应急**：系列同步日志出现 RateLimitError/风控提示时，先运行
+  `api-backends check --probe` 定位，再调整 `api_backend` 顺序或移除问题后端；
+  降级链在检测到风控时会自动跳过问题后端，无需人工干预即可继续同步。
 
 ### `source` — 数据来源
 
