@@ -113,7 +113,10 @@ class BackendChain:
             self._active_index = index
             self._stats[name]["calls"] += 1
             return result
-        assert last_error is not None
+        if last_error is None:
+            # 防御性守卫：正常流程下所有退出路径都已 raise 或 return，
+            # 此分支仅在循环逻辑被未来重构破坏时兜底（禁 assert，-O 下仍生效）
+            raise RuntimeError("BackendChain: 所有后端已耗尽但未记录任何错误")
         # 全部后端都失败：抛出最后一个异常（保留原始 traceback 链）
         raise last_error
 

@@ -1590,3 +1590,13 @@ def test_yutto_get_series_mid_raises_backend_error_on_bad_payload(monkeypatch, f
     backend = _yutto_backend()
     with pytest.raises(BackendError, match="yutto 获取系列元数据"):
         asyncio.run(backend.get_series_meta(9, "series"))
+
+
+def test_bilix_series_missing_mid_degrades_gracefully():
+    """bilix 系列元数据缺少 mid 时降级为 bvid 条目，禁止裸 KeyError 穿透。"""
+    client = _FakeClient(series_payload={"code": 0, "data": {"meta": {}}})
+    api = types.SimpleNamespace(get_list_info=AsyncMock(return_value=("List", "UP", ["BV1", "BV2"])))
+    backend = _bilix_backend(client, api)
+    eps = asyncio.run(backend.get_series_videos(9, "series", pn=1, ps=10))
+    assert [ep["bvid"] for ep in eps] == ["BV1", "BV2"]  # 降级为 bvid 占位
+    assert eps[0]["title"] == "BV1"
