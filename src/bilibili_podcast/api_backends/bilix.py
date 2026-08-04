@@ -139,6 +139,10 @@ class BilixBackend:
             vlist = data.get("data", {}).get("list", {}).get("vlist", [])
             return [_episode_from_vlist_item(item) for item in vlist]
         except Exception as exc:
+            # 编程错误（参数/类型/键值问题）直接上抛，不进入降级路径掩盖根因；
+            # 其余（接口错误、网络、超时等）走降级
+            if isinstance(exc, (TypeError, ValueError, KeyError, AttributeError)):
+                raise
             text = str(exc)
             if "-799" in text or "请求过于频繁" in text or "rate limit" in text.lower():
                 raise RateLimitError(f"bilix 空间视频接口限流：{exc}") from exc

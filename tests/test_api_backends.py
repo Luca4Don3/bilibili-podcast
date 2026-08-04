@@ -563,6 +563,7 @@ def _yutto_backend():
     backend = YuttoBackend.__new__(YuttoBackend)  # 绕过 __init__
     backend._ctx = None
     backend._client = None
+    backend._series_mid_cache = {}
     return backend
 
 

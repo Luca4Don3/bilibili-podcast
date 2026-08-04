@@ -332,32 +332,34 @@ class NativeBackend:
             sign_wbi_params(request_params, img_key, sub_key)
         url = f"{_BASE_URL}{path}"
         response = None
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_NETWORK_RETRIES + 1):
+        # 网络类（连接/超时）与 5xx 服务端错误分别独立计数重试，
+        # 各自上限 _MAX_NETWORK_RETRIES，混合场景不会叠加超限。
+        network_attempts = 0
+        server_attempts = 0
+        while True:
             try:
                 response = await self._session.get(url, params=request_params, headers=_HEADERS)
             except Exception as exc:
                 # 连接/超时等网络类临时错误：退避重试；限流与风控在响应层处理，不在此重试
                 last_exc = exc
-                if attempt < _MAX_NETWORK_RETRIES:
-                    LOGGER.debug("native 网络请求失败，退避重试 path=%s attempt=%s error=%s", path, attempt + 1, exc)
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                if network_attempts < _MAX_NETWORK_RETRIES:
+                    LOGGER.debug("native 网络请求失败，退避重试 path=%s attempt=%s error=%s", path, network_attempts + 1, exc)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[network_attempts])
+                    network_attempts += 1
                     continue
                 raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
             status = getattr(response, "status_code", None)
             if status is not None and status >= 400:
                 if status in (403, 412):
                     raise RateLimitError(f"native 接口触发风控（{path}，HTTP {status}）")
-                if status >= 500 and attempt < _MAX_NETWORK_RETRIES:
+                if status >= 500 and server_attempts < _MAX_NETWORK_RETRIES:
                     # 服务端 5xx：短退避后重试
-                    LOGGER.debug("native 接口 5xx，退避重试 path=%s attempt=%s", path, attempt + 1)
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                    LOGGER.debug("native 接口 5xx，退避重试 path=%s attempt=%s", path, server_attempts + 1)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[server_attempts])
+                    server_attempts += 1
                     continue
                 raise NetworkError(f"native 请求 B 站接口返回 HTTP {status}（{path}）")
             break
-        else:
-            # for-else 不会执行（循环内已 raise）；此处仅为类型检查器保留
-            raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
         try:
             data = response.json()
         except Exception as exc:
@@ -432,7 +434,13 @@ class NativeBackend:
         mid = meta.get("mid")
         if not mid:
             raise BackendError(f"native 获取系列元数据缺少 mid（sid={sid}）")
-        total = int(meta.get("total") or 200)
+        try:
+            total = int(meta.get("total") or 0)
+        except (TypeError, ValueError):
+            # total 非数字（接口异常格式）时回退默认页大小，避免崩溃
+            total = 200
+        if total <= 0:
+            total = 200
         data = await self._request(
             "/x/series/archives",
             {"mid": mid, "series_id": sid, "ps": max(total, 1)},
