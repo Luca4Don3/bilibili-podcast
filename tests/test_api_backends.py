@@ -327,7 +327,7 @@ def test_legacy_backend_field_mapping(monkeypatch):
             return {"upper": {"name": "UP", "mid": 777}, "cover": "c", "intro": "i"}
 
         async def get_videos(self, pn, ps, sort):
-            return {"archives": [{"bvid": "BV9", "title": "S", "duration": 5, "pic": "p", "pubdate": 1}]}
+            return {"archives": [{"bvid": "BV9", "title": "S", "duration": 5000, "pic": "p", "pubdate": 1}]}
 
     class FakeVideo:
         def __init__(self, bvid, credential=None):
@@ -379,7 +379,7 @@ def test_legacy_backend_field_mapping(monkeypatch):
 
     s_eps = asyncio.run(backend.get_series_videos(9, "season", 1, 100))
     assert s_eps[0]["bvid"] == "BV9"
-    assert s_eps[0]["duration"] == 5
+    assert s_eps[0]["duration"] == 5  # 5000ms → 5 秒
     assert s_eps[0]["pubdate"] == 1
 
     assert asyncio.run(backend.get_video_owner("BV1")) == 555
@@ -1456,3 +1456,24 @@ source:
 
 def test_backend_names_constant():
     assert BACKEND_NAMES == ("bilibili-api", "bilix", "yutto", "native")
+
+
+def test_native_season_duration_ms_to_seconds():
+    """pgc 剧集接口的 duration 为毫秒，统一格式必须转换为秒。"""
+    from bilibili_podcast.api_backends.native import _episode_from_season_item
+
+    item = {"bvid": "BV1", "title": "T", "duration": 1203160, "cover": "c", "pub_time": 1675566000}
+    ep = _episode_from_season_item(item)
+    assert ep["duration"] == 1203  # 毫秒 → 秒（整除）
+    assert ep["pubdate"] == 1675566000
+
+
+def test_legacy_season_duration_ms_to_seconds_and_series_unchanged():
+    """legacy 剧集 duration 毫秒→秒；合集（series）duration 保持秒原值。"""
+    from bilibili_podcast.api_backends.legacy import _episode_from_archives_item
+
+    season_item = {"bvid": "BV1", "title": "S", "duration": 1203160, "pic": "p", "pubdate": 1}
+    assert _episode_from_archives_item(season_item, season=True)["duration"] == 1203
+    series_item = {"bvid": "BV2", "title": "U", "duration": 1203, "pic": "p", "pubdate": 2}
+    assert _episode_from_archives_item(series_item, season=False)["duration"] == 1203
+    assert _episode_from_archives_item(series_item)["duration"] == 1203  # 默认非 season

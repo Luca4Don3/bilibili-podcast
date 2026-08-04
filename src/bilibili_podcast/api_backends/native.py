@@ -188,13 +188,18 @@ def _episode_from_archives_item(item: dict) -> dict:
 
 
 def _episode_from_season_item(item: dict) -> dict:
-    """把 pgc/view/web/season 的 episodes 条目转换为统一 episode 格式。"""
+    """把 pgc/view/web/season 的 episodes 条目转换为统一 episode 格式。
+
+    pgc 接口的 duration 为毫秒，统一格式约定为秒（与空间/系列接口一致），
+    这里除以 1000 取整。
+    """
     bvid = item.get("bvid", "")
+    duration_ms = item.get("duration", 0) or 0
     return {
         "bvid": bvid,
         "title": item.get("title", ""),
         "description": "",
-        "duration": item.get("duration", 0),
+        "duration": max(int(duration_ms) // 1000, 0),
         "image": item.get("cover", ""),
         "pubdate": item.get("pub_time", 0),
         "link": f"https://www.bilibili.com/video/{bvid}",
