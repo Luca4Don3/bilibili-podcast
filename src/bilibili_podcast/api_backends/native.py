@@ -62,6 +62,8 @@ _BASE_URL = "https://api.bilibili.com"
 # 网络类临时错误（连接失败/超时/5xx）的最大重试次数与退避间隔（秒）
 _MAX_NETWORK_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+# WBI key 每日轮换；缓存超过该时长自动重新获取（长驻实例防过期签名失败）
+_WBI_KEY_TTL_SECONDS = 6 * 3600
 # 会话前置页面：首次请求前访问一次 space 主页作为指纹补充手段（本地已注入
 # buvid3/buvid4/b_nut，页面访问用于更新 b_nut、下发 __at_once 等额外 cookie），
 # 避免全新会话触发 -352 风控
@@ -235,6 +237,7 @@ class NativeBackend:
         )
         # 进程内缓存 img_key/sub_key：nav 成功一次后复用；nav 失败回退备用常量
         self._wbi_keys: tuple[str, str] | None = None
+        self._wbi_keys_fetched_at: float = 0.0
         # 会话前置标志：首次请求前访问一次 space 页面建立指纹 cookie
         self._ready = False
         # 系列/剧集全量结果缓存：(type, sid) -> episode 列表，避免分页重复请求
@@ -281,9 +284,15 @@ class NativeBackend:
         return params
 
     async def _get_wbi_keys(self) -> tuple[str, str]:
-        """获取/缓存 WBI img_key/sub_key；nav 请求失败时回退到公开备用常量。"""
+        """获取/缓存 WBI img_key/sub_key；nav 请求失败时回退到公开备用常量。
+
+        WBI key 每日轮换：缓存超过 _WBI_KEY_TTL_SECONDS 后自动重新获取，
+        避免长驻实例（如 web 内复用的后端）用过期 key 触发签名失败（-352）。
+        """
         if self._wbi_keys is not None:
-            return self._wbi_keys
+            if time.monotonic() - self._wbi_keys_fetched_at < _WBI_KEY_TTL_SECONDS:
+                return self._wbi_keys
+            LOGGER.debug("native WBI key 缓存过期，重新获取")
         payload: dict = {}
         try:
             response = await self._session.get(
@@ -305,7 +314,9 @@ class NativeBackend:
             self._wbi_keys = (img_key, sub_key)
         else:
             LOGGER.warning("native nav 未返回有效 wbi_img，使用公开备用 key")
-            self._wbi_keys = (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
+            if self._wbi_keys is None:
+                self._wbi_keys = (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
+        self._wbi_keys_fetched_at = time.monotonic()
         return self._wbi_keys
 
     async def _request(

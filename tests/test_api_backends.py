@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -713,6 +714,7 @@ def _native_backend(session, wbi_keys=("7cd084941338484aae1ad9425b84077c", "4932
     backend = NativeBackend.__new__(NativeBackend)
     backend._session = session
     backend._wbi_keys = wbi_keys
+    backend._wbi_keys_fetched_at = time.monotonic()  # 缓存视为新鲜，跳过 nav 刷新
     backend._ready = True
     backend._series_cache = {}
     return backend

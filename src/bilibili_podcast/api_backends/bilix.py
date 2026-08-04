@@ -106,6 +106,7 @@ class BilixBackend:
         self._series_cache: dict[int, list[dict]] = {}
 
     async def close(self) -> None:
+        self._series_cache.clear()
         await self._client.aclose()
 
     async def get_user_info(self, uid: int) -> dict:
