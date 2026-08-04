@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from .base import BackendCredential, UnsupportedError
+from .base import BackendCredential, BackendError, UnsupportedError
 
 if TYPE_CHECKING:
     import httpx
@@ -135,8 +135,16 @@ class YuttoBackend:
 
         url = f"https://api.bilibili.com/x/series/series?series_id={sid}"
         json_data = await Fetcher.fetch_json(self._ctx, self._client, url)
-        assert json_data is not None
-        return int(json_data["data"]["meta"]["mid"])
+        # 显式 None 检查与链式取值：禁止 assert（python -O 下被移除），
+        # 嵌套 KeyError 会以未定型异常穿透降级链，必须转 BackendError。
+        if json_data is None:
+            raise BackendError(f"yutto 获取系列元数据失败（sid={sid}）：响应为空")
+        data = json_data.get("data") or {}
+        meta = data.get("meta") or {}
+        mid = meta.get("mid")
+        if mid is None:
+            raise BackendError(f"yutto 获取系列元数据缺少 mid（sid={sid}）")
+        return int(mid)
 
     async def get_series_meta(self, sid: int, series_type: str) -> dict:
         if series_type == "series":

@@ -1572,3 +1572,21 @@ def test_native_rate_limit_403_not_retried(monkeypatch):
     with pytest.raises(RateLimitError):
         asyncio.run(backend._request("/x/t", {}))
     assert session.calls == 1  # 风控不重试
+
+
+@pytest.mark.parametrize(
+    "fetcher_json",
+    [
+        None,  # 响应为空
+        {"data": {}},  # meta 缺失
+        {"data": {"meta": {}}},  # mid 缺失
+    ],
+)
+def test_yutto_get_series_mid_raises_backend_error_on_bad_payload(monkeypatch, fetcher_json):
+    """yutto 系列元数据异常结构必须转 BackendError（禁 assert，-O 下仍生效）。"""
+    from bilibili_podcast.api_backends.base import BackendError
+
+    _install_fake_yutto(monkeypatch, fetcher_json=fetcher_json)
+    backend = _yutto_backend()
+    with pytest.raises(BackendError, match="yutto 获取系列元数据"):
+        asyncio.run(backend.get_series_meta(9, "series"))
