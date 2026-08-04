@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -563,6 +564,7 @@ def _yutto_backend():
     backend = YuttoBackend.__new__(YuttoBackend)  # 绕过 __init__
     backend._ctx = None
     backend._client = None
+    backend._series_mid_cache = {}
     return backend
 
 
@@ -712,6 +714,7 @@ def _native_backend(session, wbi_keys=("7cd084941338484aae1ad9425b84077c", "4932
     backend = NativeBackend.__new__(NativeBackend)
     backend._session = session
     backend._wbi_keys = wbi_keys
+    backend._wbi_keys_fetched_at = time.monotonic()  # 缓存视为新鲜，跳过 nav 刷新
     backend._ready = True
     backend._series_cache = {}
     return backend
@@ -1572,3 +1575,31 @@ def test_native_rate_limit_403_not_retried(monkeypatch):
     with pytest.raises(RateLimitError):
         asyncio.run(backend._request("/x/t", {}))
     assert session.calls == 1  # 风控不重试
+
+
+@pytest.mark.parametrize(
+    "fetcher_json",
+    [
+        None,  # 响应为空
+        {"data": {}},  # meta 缺失
+        {"data": {"meta": {}}},  # mid 缺失
+    ],
+)
+def test_yutto_get_series_mid_raises_backend_error_on_bad_payload(monkeypatch, fetcher_json):
+    """yutto 系列元数据异常结构必须转 BackendError（禁 assert，-O 下仍生效）。"""
+    from bilibili_podcast.api_backends.base import BackendError
+
+    _install_fake_yutto(monkeypatch, fetcher_json=fetcher_json)
+    backend = _yutto_backend()
+    with pytest.raises(BackendError, match="yutto 获取系列元数据"):
+        asyncio.run(backend.get_series_meta(9, "series"))
+
+
+def test_bilix_series_missing_mid_degrades_gracefully():
+    """bilix 系列元数据缺少 mid 时降级为 bvid 条目，禁止裸 KeyError 穿透。"""
+    client = _FakeClient(series_payload={"code": 0, "data": {"meta": {}}})
+    api = types.SimpleNamespace(get_list_info=AsyncMock(return_value=("List", "UP", ["BV1", "BV2"])))
+    backend = _bilix_backend(client, api)
+    eps = asyncio.run(backend.get_series_videos(9, "series", pn=1, ps=10))
+    assert [ep["bvid"] for ep in eps] == ["BV1", "BV2"]  # 降级为 bvid 占位
+    assert eps[0]["title"] == "BV1"

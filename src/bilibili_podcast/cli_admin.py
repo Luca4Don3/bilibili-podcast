@@ -1066,9 +1066,10 @@ _PROBE_BVID = "BV1GJ411x7h7"
 def _api_backend_spec_for_series(db_path: str, series: str) -> str:
     """读取系列配置的 api_backend（逗号分隔的降级链）。
 
-    系列的 api_backend 来自 <config_root>/series.d/<series>.yaml（YAML 配置，
-    SeriesConfig.from_yaml 已做 parse_backend_spec 与名称校验）；DB 中无该字段，
-    缺失时回退默认 "native"。系列不存在时抛出 ValueError（中文消息）。
+    优先读 <config_root>/series.d/<series>.yaml（SeriesConfig.from_yaml 已做
+    parse_backend_spec 与名称校验）；YAML 缺失时回退 DB 配置（活动配置权威为
+    SQLite）；两者都无时回退默认 "native" 并发出警告。系列不存在时抛出
+    ValueError（中文消息）。
     """
     with db.transaction(db_path) as conn:
         cfg = _load_full_config(conn, series)
@@ -1079,6 +1080,11 @@ def _api_backend_spec_for_series(db_path: str, series: str) -> str:
         from .config.models import SeriesConfig
 
         return SeriesConfig.from_yaml(yaml_path).api_backend
+    # YAML 缺失：回退 DB（load_full_config 的系列配置 dict 可能含 api_backend）
+    db_backend = cfg.get("api_backend")
+    if db_backend:
+        return str(db_backend)
+    print(f"⚠️ 系列 {series} 的 YAML 与 DB 均无 api_backend 配置，回退默认 native")
     return "native"
 
 

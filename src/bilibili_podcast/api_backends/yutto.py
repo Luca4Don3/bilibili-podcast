@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from .base import BackendCredential, UnsupportedError
+from .base import BackendCredential, BackendError, UnsupportedError
 
 if TYPE_CHECKING:
     import httpx
@@ -102,6 +102,9 @@ class YuttoBackend:
             cookies=self._ctx.cookies,
             timeout=_YUTTO_TIMEOUT_SECONDS,
         )
+        # sid → mid 缓存：sync 层分页循环会多次调用 get_series_videos，
+        # 避免每次重复请求 x/series/series 元数据接口
+        self._series_mid_cache: dict[int, int] = {}
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -131,12 +134,25 @@ class YuttoBackend:
 
     async def _get_series_mid(self, sid: int) -> int:
         """获取系列所属 UP 主 mid；yutto 的 collection API 需要 mid 参数。"""
+        cached = self._series_mid_cache.get(sid)
+        if cached is not None:
+            return cached
         from yutto.utils.fetcher import Fetcher
 
         url = f"https://api.bilibili.com/x/series/series?series_id={sid}"
         json_data = await Fetcher.fetch_json(self._ctx, self._client, url)
-        assert json_data is not None
-        return int(json_data["data"]["meta"]["mid"])
+        # 显式 None 检查与链式取值：禁止 assert（python -O 下被移除），
+        # 嵌套 KeyError 会以未定型异常穿透降级链，必须转 BackendError。
+        if json_data is None:
+            raise BackendError(f"yutto 获取系列元数据失败（sid={sid}）：响应为空")
+        data = json_data.get("data") or {}
+        meta = data.get("meta") or {}
+        mid = meta.get("mid")
+        if mid is None:
+            raise BackendError(f"yutto 获取系列元数据缺少 mid（sid={sid}）")
+        mid_int = int(mid)
+        self._series_mid_cache[sid] = mid_int
+        return mid_int
 
     async def get_series_meta(self, sid: int, series_type: str) -> dict:
         if series_type == "series":

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .base import BackendCredential, RateLimitError, UnsupportedError
+from .base import BackendCredential, BackendError, RateLimitError, UnsupportedError
 
 if TYPE_CHECKING:
     import httpx
@@ -106,6 +106,7 @@ class BilixBackend:
         self._series_cache: dict[int, list[dict]] = {}
 
     async def close(self) -> None:
+        self._series_cache.clear()
         await self._client.aclose()
 
     async def get_user_info(self, uid: int) -> dict:
@@ -139,6 +140,10 @@ class BilixBackend:
             vlist = data.get("data", {}).get("list", {}).get("vlist", [])
             return [_episode_from_vlist_item(item) for item in vlist]
         except Exception as exc:
+            # 编程错误（参数/类型/键值问题）直接上抛，不进入降级路径掩盖根因；
+            # 其余（接口错误、网络、超时等）走降级
+            if isinstance(exc, (TypeError, ValueError, KeyError, AttributeError)):
+                raise
             text = str(exc)
             if "-799" in text or "请求过于频繁" in text or "rate limit" in text.lower():
                 raise RateLimitError(f"bilix 空间视频接口限流：{exc}") from exc
@@ -203,7 +208,10 @@ class BilixBackend:
             if series_data.get("code") != 0:
                 raise RuntimeError(f"bilix 系列元数据接口返回错误：{series_data.get('message')}")
             meta = series_data.get("data", {}).get("meta", {})
-            mid = meta["mid"]
+            mid = meta.get("mid")
+            if mid is None:
+                # 元数据缺少 mid 时显式失败（进入 except 降级分支），禁止裸 KeyError 穿透
+                raise BackendError(f"bilix 获取系列元数据缺少 mid（sid={sid}）")
             total = int(meta.get("total", len(bvids)) or len(bvids))
             res2 = await self._client.get(
                 "https://api.bilibili.com/x/series/archives",

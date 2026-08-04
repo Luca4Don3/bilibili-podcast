@@ -62,6 +62,8 @@ _BASE_URL = "https://api.bilibili.com"
 # 网络类临时错误（连接失败/超时/5xx）的最大重试次数与退避间隔（秒）
 _MAX_NETWORK_RETRIES = 2
 _RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+# WBI key 每日轮换；缓存超过该时长自动重新获取（长驻实例防过期签名失败）
+_WBI_KEY_TTL_SECONDS = 6 * 3600
 # 会话前置页面：首次请求前访问一次 space 主页作为指纹补充手段（本地已注入
 # buvid3/buvid4/b_nut，页面访问用于更新 b_nut、下发 __at_once 等额外 cookie），
 # 避免全新会话触发 -352 风控
@@ -235,6 +237,7 @@ class NativeBackend:
         )
         # 进程内缓存 img_key/sub_key：nav 成功一次后复用；nav 失败回退备用常量
         self._wbi_keys: tuple[str, str] | None = None
+        self._wbi_keys_fetched_at: float = 0.0
         # 会话前置标志：首次请求前访问一次 space 页面建立指纹 cookie
         self._ready = False
         # 系列/剧集全量结果缓存：(type, sid) -> episode 列表，避免分页重复请求
@@ -281,9 +284,15 @@ class NativeBackend:
         return params
 
     async def _get_wbi_keys(self) -> tuple[str, str]:
-        """获取/缓存 WBI img_key/sub_key；nav 请求失败时回退到公开备用常量。"""
+        """获取/缓存 WBI img_key/sub_key；nav 请求失败时回退到公开备用常量。
+
+        WBI key 每日轮换：缓存超过 _WBI_KEY_TTL_SECONDS 后自动重新获取，
+        避免长驻实例（如 web 内复用的后端）用过期 key 触发签名失败（-352）。
+        """
         if self._wbi_keys is not None:
-            return self._wbi_keys
+            if time.monotonic() - self._wbi_keys_fetched_at < _WBI_KEY_TTL_SECONDS:
+                return self._wbi_keys
+            LOGGER.debug("native WBI key 缓存过期，重新获取")
         payload: dict = {}
         try:
             response = await self._session.get(
@@ -305,7 +314,9 @@ class NativeBackend:
             self._wbi_keys = (img_key, sub_key)
         else:
             LOGGER.warning("native nav 未返回有效 wbi_img，使用公开备用 key")
-            self._wbi_keys = (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
+            if self._wbi_keys is None:
+                self._wbi_keys = (_FALLBACK_IMG_KEY, _FALLBACK_SUB_KEY)
+        self._wbi_keys_fetched_at = time.monotonic()
         return self._wbi_keys
 
     async def _request(
@@ -332,32 +343,34 @@ class NativeBackend:
             sign_wbi_params(request_params, img_key, sub_key)
         url = f"{_BASE_URL}{path}"
         response = None
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_NETWORK_RETRIES + 1):
+        # 网络类（连接/超时）与 5xx 服务端错误分别独立计数重试，
+        # 各自上限 _MAX_NETWORK_RETRIES，混合场景不会叠加超限。
+        network_attempts = 0
+        server_attempts = 0
+        while True:
             try:
                 response = await self._session.get(url, params=request_params, headers=_HEADERS)
             except Exception as exc:
                 # 连接/超时等网络类临时错误：退避重试；限流与风控在响应层处理，不在此重试
                 last_exc = exc
-                if attempt < _MAX_NETWORK_RETRIES:
-                    LOGGER.debug("native 网络请求失败，退避重试 path=%s attempt=%s error=%s", path, attempt + 1, exc)
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                if network_attempts < _MAX_NETWORK_RETRIES:
+                    LOGGER.debug("native 网络请求失败，退避重试 path=%s attempt=%s error=%s", path, network_attempts + 1, exc)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[network_attempts])
+                    network_attempts += 1
                     continue
                 raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
             status = getattr(response, "status_code", None)
             if status is not None and status >= 400:
                 if status in (403, 412):
                     raise RateLimitError(f"native 接口触发风控（{path}，HTTP {status}）")
-                if status >= 500 and attempt < _MAX_NETWORK_RETRIES:
+                if status >= 500 and server_attempts < _MAX_NETWORK_RETRIES:
                     # 服务端 5xx：短退避后重试
-                    LOGGER.debug("native 接口 5xx，退避重试 path=%s attempt=%s", path, attempt + 1)
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+                    LOGGER.debug("native 接口 5xx，退避重试 path=%s attempt=%s", path, server_attempts + 1)
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS[server_attempts])
+                    server_attempts += 1
                     continue
                 raise NetworkError(f"native 请求 B 站接口返回 HTTP {status}（{path}）")
             break
-        else:
-            # for-else 不会执行（循环内已 raise）；此处仅为类型检查器保留
-            raise NetworkError(f"native 请求 B 站接口失败（{path}）：{last_exc}") from last_exc
         try:
             data = response.json()
         except Exception as exc:
@@ -432,7 +445,13 @@ class NativeBackend:
         mid = meta.get("mid")
         if not mid:
             raise BackendError(f"native 获取系列元数据缺少 mid（sid={sid}）")
-        total = int(meta.get("total") or 200)
+        try:
+            total = int(meta.get("total") or 0)
+        except (TypeError, ValueError):
+            # total 非数字（接口异常格式）时回退默认页大小，避免崩溃
+            total = 200
+        if total <= 0:
+            total = 200
         data = await self._request(
             "/x/series/archives",
             {"mid": mid, "series_id": sid, "ps": max(total, 1)},

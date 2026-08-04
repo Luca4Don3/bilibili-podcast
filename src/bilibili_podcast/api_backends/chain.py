@@ -96,7 +96,13 @@ class BackendChain:
             except Exception as exc:
                 last_error = exc
                 if not _is_switchable_error(exc):
-                    # 非可切换异常（如编程错误）：直接上抛，不触发降级
+                    # 非可切换异常（如编程错误）：上抛前把活跃索引前进一位，
+                    # 避免问题后端被后续调用持续选中（同一错误反复触发）
+                    self._active_index = (index + 1) % len(self._names)
+                    LOGGER.warning(
+                        "API 后端抛出非可切换异常，跳过该后端 backend=%s method=%s error=%s",
+                        name, method, exc,
+                    )
                     raise
                 # 统计：失败与切走各 +1（仅统计已构造且被调用的后端）
                 entry = self._stats.setdefault(name, {"calls": 0, "failures": 0, "switches": 0})
@@ -113,7 +119,10 @@ class BackendChain:
             self._active_index = index
             self._stats[name]["calls"] += 1
             return result
-        assert last_error is not None
+        if last_error is None:
+            # 防御性守卫：正常流程下所有退出路径都已 raise 或 return，
+            # 此分支仅在循环逻辑被未来重构破坏时兜底（禁 assert，-O 下仍生效）
+            raise RuntimeError("BackendChain: 所有后端已耗尽但未记录任何错误")
         # 全部后端都失败：抛出最后一个异常（保留原始 traceback 链）
         raise last_error
 
