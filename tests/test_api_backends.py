@@ -1603,3 +1603,86 @@ def test_bilix_series_missing_mid_degrades_gracefully():
     eps = asyncio.run(backend.get_series_videos(9, "series", pn=1, ps=10))
     assert [ep["bvid"] for ep in eps] == ["BV1", "BV2"]  # 降级为 bvid 占位
     assert eps[0]["title"] == "BV1"
+
+
+def test_chain_non_switchable_error_advances_index(monkeypatch):
+    """非可切换异常上抛后 active_index 前进：下次调用不再命中问题后端。"""
+    from bilibili_podcast.api_backends import BackendChain
+
+    first = _ChainBackend("first", error=RuntimeError("boom"))
+    second = _ChainBackend("second")
+    _install_chain_factory(monkeypatch, [first, second])
+    chain = BackendChain(["first", "second"])
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(chain.get_series_meta(1, "series"))
+    # 异常后索引已前进到第二个后端：再次调用直接从 second 开始
+    meta = asyncio.run(chain.get_series_meta(1, "series"))
+    assert meta["name"] == "second"
+    assert first.meta_calls == 1  # 只有第一次命中 first
+
+
+class _MixedFailSession:
+    """按脚本序列失败：先网络异常 ×n，再 5xx ×n，最后成功。"""
+
+    def __init__(self, net_failures=2, server_failures=2):
+        self.calls = 0
+        self.net_failures = net_failures
+        self.server_failures = server_failures
+
+    async def get(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls <= self.net_failures:
+            raise ConnectionError("network down")
+        if self.calls <= self.net_failures + self.server_failures:
+            return _RetryFakeResp(status=502)
+        return _RetryFakeResp(payload={"code": 0, "data": {}})
+
+
+def test_native_mixed_retry_counters_are_independent(monkeypatch):
+    """网络重试与 5xx 重试独立计数：混合失败不超过各自上限。"""
+    from bilibili_podcast.api_backends import native as m
+
+    async def _no_sleep(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
+    session = _MixedFailSession(net_failures=2, server_failures=2)
+    backend = _retry_backend(session)
+    result = asyncio.run(backend._request("/x/t", {}))
+    assert result == {"code": 0, "data": {}}
+    # 网络 2 次失败 + 5xx 2 次 + 1 次成功 = 5 次调用（网络阶段以首个 5xx 响应为成功）
+    assert session.calls == 5
+
+
+def test_native_wbi_key_expiry_refetches(monkeypatch):
+    """WBI key 缓存过期后自动重新获取（nav 请求）。"""
+    import time
+
+    from bilibili_podcast.api_backends import native as m
+
+    class _NavSession:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url, **kwargs):
+            self.calls += 1
+            if "nav" in url:
+                return _RetryFakeResp(payload={
+                    "code": 0,
+                    "data": {"wbi_img": {
+                        "img_url": "https://i0.hdslb.com/bfs/wbi/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png",
+                        "sub_url": "https://i0.hdslb.com/bfs/wbi/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png",
+                    }},
+                })
+            return _RetryFakeResp(payload={"code": 0, "data": {}})
+
+    session = _NavSession()
+    backend = _retry_backend(session)
+    # 预置过期缓存（7 小时前）
+    backend._wbi_keys = ("oldimg", "oldsub")
+    backend._wbi_keys_fetched_at = time.monotonic() - 7 * 3600
+    result = asyncio.run(backend._request("/x/t", {}, wbi=True))
+    assert result == {"code": 0, "data": {}}
+    assert backend._wbi_keys == ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")  # 已刷新
+    assert session.calls >= 2  # nav + 目标请求
