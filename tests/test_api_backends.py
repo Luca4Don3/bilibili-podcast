@@ -1516,9 +1516,13 @@ def _retry_backend(session):
     return backend
 
 
-def test_native_network_error_retries_then_succeeds():
+def test_native_network_error_retries_then_succeeds(monkeypatch):
     from bilibili_podcast.api_backends import native as m
 
+    async def _no_sleep(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
     session = _RetrySession(failures_before_success=1)
     backend = _retry_backend(session)
     result = asyncio.run(backend._request("/x/t", {}))
@@ -1526,7 +1530,13 @@ def test_native_network_error_retries_then_succeeds():
     assert session.calls == 2  # 1 次失败 + 1 次成功
 
 
-def test_native_5xx_retries_then_succeeds():
+def test_native_5xx_retries_then_succeeds(monkeypatch):
+    from bilibili_podcast.api_backends import native as m
+
+    async def _no_sleep(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
     session = _RetrySession(failures_before_success=1, fail_status=502)
     backend = _retry_backend(session)
     result = asyncio.run(backend._request("/x/t", {}))
@@ -1534,9 +1544,14 @@ def test_native_5xx_retries_then_succeeds():
     assert session.calls == 2
 
 
-def test_native_persistent_network_error_raises_after_retries():
+def test_native_persistent_network_error_raises_after_retries(monkeypatch):
     from bilibili_podcast.api_backends.base import NetworkError
+    from bilibili_podcast.api_backends import native as m
 
+    async def _no_sleep(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
     session = _RetrySession(always_fail=True)
     backend = _retry_backend(session)
     with pytest.raises(NetworkError):
@@ -1544,9 +1559,14 @@ def test_native_persistent_network_error_raises_after_retries():
     assert session.calls == 3  # 初始 + 2 次退避重试
 
 
-def test_native_rate_limit_403_not_retried():
+def test_native_rate_limit_403_not_retried(monkeypatch):
     from bilibili_podcast.api_backends.base import RateLimitError
+    from bilibili_podcast.api_backends import native as m
 
+    async def _no_sleep(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(m.asyncio, "sleep", _no_sleep)
     session = _RetrySession(failures_before_success=5, fail_status=403)
     backend = _retry_backend(session)
     with pytest.raises(RateLimitError):

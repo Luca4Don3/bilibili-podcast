@@ -332,6 +332,7 @@ class NativeBackend:
             sign_wbi_params(request_params, img_key, sub_key)
         url = f"{_BASE_URL}{path}"
         response = None
+        last_exc: Exception | None = None
         for attempt in range(_MAX_NETWORK_RETRIES + 1):
             try:
                 response = await self._session.get(url, params=request_params, headers=_HEADERS)
