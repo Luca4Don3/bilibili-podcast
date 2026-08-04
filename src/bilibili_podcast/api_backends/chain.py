@@ -13,6 +13,7 @@ close() 关闭所有已构造的后端并清空列表。
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -52,8 +53,16 @@ class BackendChain:
         self._credential = credential
         # 已构造的后端：index -> backend（构造失败的后端不记录）
         self._constructed: dict[int, BilibiliApiBackend] = {}
+        # 会话统计：name -> {"calls": 成功调用次数, "failures": 触发切换的失败次数,
+        #                    "switches": 该后端被切走的次数}；未构造的后端不记录
+        self._stats: dict[str, dict[str, int]] = {}
         # 当前活跃后端的索引：成功调用后保持，失败后前进，不重置回 0
         self._active_index = 0
+
+    @property
+    def stats(self) -> dict[str, dict[str, int]]:
+        """返回各已构造后端的调用统计副本（不输出凭证等敏感信息）。"""
+        return {name: dict(entry) for name, entry in self._stats.items()}
 
     async def _create(self, index: int) -> BilibiliApiBackend:
         """按名称构造第 index 个后端（延迟 import，规避循环依赖）。"""
@@ -66,6 +75,7 @@ class BackendChain:
         last_error: Exception | None = None
         index = self._active_index
         while index < len(self._names):
+            name = self._names[index]
             backend = self._constructed.get(index)
             if backend is None:
                 try:
@@ -79,6 +89,8 @@ class BackendChain:
                     index += 1
                     continue
                 self._constructed[index] = backend
+                # 构造成功才登记统计（未构造的后端不记录）
+                self._stats.setdefault(name, {"calls": 0, "failures": 0, "switches": 0})
             try:
                 result = await getattr(backend, method)(*args, **kwargs)
             except Exception as exc:
@@ -86,6 +98,10 @@ class BackendChain:
                 if not _is_switchable_error(exc):
                     # 非可切换异常（如编程错误）：直接上抛，不触发降级
                     raise
+                # 统计：失败与切走各 +1（仅统计已构造且被调用的后端）
+                entry = self._stats.setdefault(name, {"calls": 0, "failures": 0, "switches": 0})
+                entry["failures"] += 1
+                entry["switches"] += 1
                 next_name = self._names[index + 1] if index + 1 < len(self._names) else "（无）"
                 LOGGER.warning(
                     "API 后端调用失败，降级切换 backend=%s method=%s error=%s next=%s",
@@ -93,8 +109,9 @@ class BackendChain:
                 )
                 index += 1
                 continue
-            # 成功：保持当前后端（持久，不重置回 0）
+            # 成功：保持当前后端（持久，不重置回 0），并累计成功调用次数
             self._active_index = index
+            self._stats[name]["calls"] += 1
             return result
         assert last_error is not None
         # 全部后端都失败：抛出最后一个异常（保留原始 traceback 链）
@@ -116,11 +133,16 @@ class BackendChain:
         return await self._call("get_video_owner", bvid)
 
     async def close(self) -> None:
-        """关闭所有已构造的后端并清空列表。"""
+        """关闭所有已构造的后端并清空列表；debug 级输出会话统计汇总（不含凭证）。"""
         for backend in self._constructed.values():
             try:
                 await backend.close()
             except Exception as exc:
                 LOGGER.warning("关闭 API 后端失败 error=%s", exc)
+        LOGGER.debug(
+            "后端链会话统计汇总（不含凭证）: %s",
+            json.dumps(self._stats, ensure_ascii=False),
+        )
         self._constructed.clear()
         self._active_index = 0
+        self._stats.clear()
