@@ -35,14 +35,21 @@ def _episode_from_vlist_item(item: dict) -> dict:
     }
 
 
-def _episode_from_archives_item(item: dict) -> dict:
-    """把 bilibili-api 系列/剧集 archives 条目转换为统一 episode 格式。"""
+def _episode_from_archives_item(item: dict, *, season: bool = False) -> dict:
+    """把 bilibili-api 系列/剧集 archives 条目转换为统一 episode 格式。
+
+    bilibili-api 的 season（剧集，pgc 接口）duration 为毫秒，series（合集）
+    为秒；统一格式约定为秒，season 时除以 1000 取整。
+    """
     bvid = item.get("bvid", "")
+    duration = item.get("duration", 0) or 0
+    if season:
+        duration = max(int(duration) // 1000, 0)
     return {
         "bvid": bvid,
         "title": item.get("title", ""),
         "description": "",
-        "duration": item.get("duration", 0),
+        "duration": duration,
         "image": item.get("pic", ""),
         "pubdate": item.get("pubdate", 0),
         "link": f"https://www.bilibili.com/video/{bvid}",
@@ -143,7 +150,7 @@ class LegacyBackend:
             sort=channel_series.ChannelOrder.DEFAULT,
         )
         items = video_list.get("archives", [])
-        return [_episode_from_archives_item(item) for item in items]
+        return [_episode_from_archives_item(item, season=series_type == "season") for item in items]
 
     async def get_video_owner(self, bvid: str) -> int | None:
         """返回视频所属 UP 主 mid；解析失败时抛异常（由 resolver / 降级链处理）。
